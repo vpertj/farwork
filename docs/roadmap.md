@@ -1,6 +1,6 @@
 # Farwork 路线图
 
-**当前**：M2 纵向切片已交付；M3 是下一批工作。技术栈既定：Rust（hub / connector）+ Svelte（web），数据库 PostgreSQL，移动 App 用 Capacitor 包装静态 Web 产物并后置到 M4。
+**当前**：M2 纵向切片已交付；**M3 部分交付** —— connector ingress + `farwork-agent` + 审批/中断的后端与协议已落地并实测，Web 侧 UI 与后续项未开始。技术栈既定：Rust（hub / connector）+ Svelte（web），数据库 PostgreSQL，移动 App 用 Capacitor 包装静态 Web 产物并后置到 M4。
 
 里程碑状态一览：
 
@@ -8,7 +8,7 @@
 | --- | --- |
 | M1 可行走骨架 | **已被 M2 取代**，代码保留为终端探针（`farwork-server` / `farwork-connector` / `farwork-protocol`） |
 | M2 `/api/v2` 纵向切片 | **已交付**（2026-10-26，commit `2079149`） |
-| M3 ingress / 审批 / 文件 / 终端 / 分享 / 管理台 | 下一批，按 §M3 顺序推进 |
+| M3 ingress / 审批 / 文件 / 终端 / 分享 / 管理台 | **部分交付**：ingress、`farwork-agent`、审批与中断（后端 + 协议）已实测；Web 审批卡及之后的项未开始 |
 | M4 Capacitor Android App（其后 iOS） | 规划中 |
 
 ## M1 · 可行走骨架（已被 M2 取代，保留为终端探针）
@@ -38,7 +38,7 @@ M1 的契约细节保留在 `docs/architecture.md` 附录 A（标注为遗留）
 - **timeline**：`GET /sessions/{id}/snapshot` 建投影；`seq:N` 事件游标补拉；条目按 `order_seq` 排序渲染。语义由新 crate `farwork-timeline`（纯域逻辑）承担，hub 只做持久化与传输。
 - **发消息**：`POST /sessions/{id}/runtime/messages` 持久化到 `timeline_items`，`clientMessageId` 由唯一索引保证幂等。
 - **WS 增量**：`POST /ws-ticket` 换一次性票据 → `/sessions/{id}/ws` 事件流 / `/dashboard/ws` 总览；`snapshotRequired` 时客户端整块重拉。
-- **诚实兜底**：52 条未实现路径统一 `501 not_implemented`，未注册路径 `404`；`GET /connectors` 的 `status` 恒为 `offline`（没有 ingress 就没有在线值）。
+- **诚实兜底**：52 条未实现路径统一 `501 not_implemented`，未注册路径 `404`；`GET /connectors` 的 `status` 当时恒为 `offline`（没有 ingress 就没有在线值）——这条已被 M3 取代：现在 49 条 `501`，`status` 有真实 `online`/`offline`。
 - **CI 硬化**：`rust` job 挂 `postgres:18-alpine` service 并注入 `TEST_DATABASE_URL`，让 hub 集成测试从「静默 SKIP」变成真跑。
 
 ### 已验收
@@ -48,44 +48,66 @@ M1 的契约细节保留在 `docs/architecture.md` 附录 A（标注为遗留）
 - 端到端旅程（`crates/farwork-hub/tests/e2e.rs`）：`/healthz` → 首个 admin 注册（setup token）→ 登录 → 建 connector / 项目 / 会话 → snapshot → 发消息 → `events?after=seq:N` 补拉 → `/sessions/{id}/ws` 收到增量。
 - 重复 `clientMessageId` 不再产生新条目（`WriteOutcome::Unchanged`，无新事件）。
 
-### 明确未含（都是 `501`）
+### 明确未含（当时都是 `501`）
 
-connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终端 · 分享 · 管理台（admin / agents / usage / announcements / pairing）。
+connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终端 · 分享 · 管理台（admin / agents / usage / announcements / pairing）。其中 connector ingress 与审批/中断已由 M3 交付（见下），其余仍未实现。
+
+## M3 · connector ingress + agent（**部分交付**）
+
+目标没变：让 hub 真的连上一台设备、真的把会话交给运行时。本轮交付的是**协议与后端**，`apps/web` 一行 UI 都没写。
+
+### 已交付
+
+- **connector ingress**：`GET /api/v2/connector/ws?token=...`（Ingress Protocol v1，契约见 `docs/architecture.md` §5）。hello → welcome → 心跳 → 断连收敛；`connectors.status` 从「恒为 `offline`」变成真实的 `online`/`offline`。
+- **`farwork-agent`（新 crate）**：主动出站连 hub；身份落盘在 `$FARWORK_HOME/agent.json`（文件 0600、目录 0700，重启不换 id）；按 `session.start` 拉起 `codex app-server --stdio` 并把 JSON-RPC 翻成 ingress 帧；自带 `--runtime echo` 假后端用于自测。
+- **会话真派发**：`POST /sessions/create-and-start` 会下发 `session.start`（首条消息走 `prompt`）；`POST /sessions/{id}/runtime/messages` 在会话有活跃流时把 `session.message` 推给 agent，响应里的 `runtimeDispatched` 才是真实投递结果。
+- **审批与中断（后端）**：`GET /sessions/{id}/runtime/notices`、`POST /sessions/{id}/notices/{id}/respond`（+ `runtime` 别名）、`POST /sessions/{id}/runtime/interrupt` 落地；新增迁移 `0002_connector_ingress.sql`（`session_streams` 让 `streamId` 跨 hub 重启存活，`session_notices` 让审批跨刷新存活）。
+- **诚实兜底更窄了**：`501` 表从 52 条减到 **49 条**（移出 interrupt / notices / notices respond 三条）；REST 与 ingress 两侧仍然「宁可变窄，不伪造成功」。
+
+### 已验证（有证据）
+
+1. **真二进制全链路（codex，失败路径）**：hub + `farwork-agent`（真 codex 二进制）跑通 `connectors.status → online` → `create-and-start` → agent 收到 `session.start` → codex 子进程启动 → codex 因**本机无凭据返回 401** → 这个错误**如实落进 timeline**（一条 `system`/`failed` 条目，不是只写日志）→ 杀掉 agent 后 `connectors.status` 回落 `offline`。
+2. **审批管道往返（echo 假后端）**：hub + `farwork-agent --runtime echo`（需 `FARWORK_HUB_DEV_RUNTIMES=echo`，默认关闭，启动会打 WARN）跑通完整一轮：`create-and-start` 下发 → agent 产生 `command_execution` notice（`status: open`）→ 会话状态 `waiting_approval` → `POST .../notices/{id}/respond` 带 `approve` 返回 200 → connector 回报 `notice.resolved{decision:approve}` → 会话回 `idle`；杀掉 agent 后 `connectors.status` 回落 `offline`。
+   - 注意这条验证的是**审批管道**，不是真实 codex 审批。echo 后端不执行任何东西，它只是把契约跑一遍（`crates/farwork-agent/src/echo.rs`）。
+
+### 未验证（别当成已支持）
+
+- **codex 成功路径**：assistant 文本增量、工具执行、真实审批往返（codex 自己发起 `item/commandExecution/requestApproval`、用户批准、工具真的执行）。
+- **原因**：本机没有 Codex 凭据，成功路径进不去；目前唯一被真实观测到的 codex 行为是「401 如实落 timeline」。
+- 因此「点批准 → 工具真的执行」这条链**没有任何证据**，Web 侧的审批卡也还不存在。
+
+### 已知契约缺陷（记下来，别忘）
+
+`session.message.clientMessageId`：hub 侧发 `null`、agent 侧要求 `String`，省略该字段的 REST 调用者会让这一轮被 agent 当畸形帧静默丢弃（Web UI 恒发 `cmid-<uuid>`，所以页面暂时没暴露；细节见 `docs/architecture.md` §5.4）。修它必须同时改 hub、agent 与文档。
 
 ## M3 · 下一批（按此顺序）
 
 顺序的理由：后面每一项都依赖 ingress 提供的真实连接，先做 UI 只会做出假状态。
 
-### 1. connector ingress + codex app-server 集成
+### 1. Web 审批卡
 
-- hub 增加 connector 入站通道（现无任何路径，`/connectors/{id}/runtimes*` 全是 `501`），connector 侧改为连 hub 并带持久化身份。
-- 接 codex app-server：会话真正被派发、`runtime/state` 与 `capabilities` 有真实值，条目由运行时上报而不是只有用户消息。
-- 验收：`create-and-start` 的响应里 `runtimeDispatched` 变成 `true`；`connectors.status` 出现真实 `online`；重启 hub 后 connector 自动重连。
+- 把 `GET /runtime/notices` + `POST /notices/{id}/respond` 接进会话页：待办审批以卡片呈现（命令 / 文件变更 / 拒绝理由），三个决定对应 `approve` / `approve_for_session` / `reject`；卡片状态只信服务端的 `notice.resolved`，点了按钮先显示「已发送，等待运行时确认」而不是「已批准」。
+- 验收：用 `farwork-agent --runtime echo` 起一个会话 → 页面出现卡片 → 点批准 → 卡片变为已解决且会话回 `idle`；刷新页面后未处理的审批仍然是待办。
 
-### 2. 审批 / 中断
-
-- `/runtime/notices`、`/runtime/notices/{id}/respond`、`/runtime/interrupt`、`/runtime/steer` 落地；审批决策落库可审计。
-- 验收：Agent 提议敏感工具调用 → 前端卡片 → 同意后执行、拒绝则不执行且 Agent 收到原因；中断后会话仍可继续。
-
-### 3. 新建会话表单
+### 2. 新建会话表单
 
 - 前端按 connector + 项目 + runtime + 首条消息一次性创建，取代当前只能在已有会话里发消息的限制。
 - 验收：表单创建后立刻进入会话页并且首次消息已经在 timeline 里，刷新不丢。
 
-### 4. 文件浏览
+### 3. 文件浏览
 
 - `/sessions/{id}/files*` 经 connector 中继；大文件与二进制流式处理，不整块读入内存；写操作一律过审批闸门。
 
-### 5. 终端
+### 4. 终端
 
 - `/sessions/{id}/terminal*` 隧道；复用 M1 的 PTY + base64 字节帧实现，前端复用 xterm.js。
 - 验收：真终端可交互、resize 生效、设备断连以 `exit code -1` 明确区分；随之让 `farwork-server` 退场。
 
-### 6. 分享
+### 5. 分享
 
 - `/sessions/{id}/shares*` 与 `/shares*`：只读/可写分享链接、过期与撤销。
 
-### 7. 管理台
+### 6. 管理台
 
 - `/admin*`、`/agents*`、`/usage*`、`/announcements*`、`/pairing*`：用户管理、运行时清单、用量、公告、设备配对。
 
