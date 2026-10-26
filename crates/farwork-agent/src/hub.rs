@@ -50,6 +50,12 @@ pub struct HubOptions {
     /// The DSH bridge, resolved once at startup. `None` means every `runtime: "dsh"`
     /// session is refused with an explicit error instead of hanging.
     pub dsh_endpoint: Option<crate::dsh::Endpoint>,
+    /// The `selections` every new DSH session starts with, already resolved at
+    /// startup. `None` means DSH's own defaults, exactly as before.
+    pub dsh_selections: Option<serde_json::Value>,
+    /// The Agent mode every new DSH session starts in (`createAndStart.agentPreset`),
+    /// already resolved at startup. `None` leaves the bridge's own default in place.
+    pub dsh_agent_preset: Option<String>,
     pub once: bool,
 }
 
@@ -601,6 +607,8 @@ impl Connector {
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<SessionCmd>,
     ) -> JoinHandle<()> {
         let endpoint = self.opts.dsh_endpoint.clone();
+        let selections = self.opts.dsh_selections.clone();
+        let agent_preset = self.opts.dsh_agent_preset.clone();
         let connector_id = self.identity.agent_id.clone();
         let client_version = self.opts.agent.version.clone();
         tokio::spawn(async move {
@@ -625,6 +633,12 @@ impl Connector {
                 cwd,
                 prompt,
                 client_version,
+                selections,
+                agent_preset,
+                // Durable on purpose: the bridge asks for a checkpoint on every
+                // subscribe, and an in-memory answer means every reconnect replays
+                // every session in full.
+                checkpoint_dir: Some(dsh::sync::default_dir()),
             };
             let session = DshSession::new(options, out, cmd_rx);
             let report = session.run().await;
@@ -673,6 +687,8 @@ mod tests {
             codex_bin: String::from("codex"),
             shell: None,
             dsh_endpoint: None,
+            dsh_selections: None,
+            dsh_agent_preset: None,
             once: true,
         }
     }
@@ -682,6 +698,9 @@ mod tests {
             agent_id: String::from("agt_test"),
             name: String::from("test-host"),
             created_at: String::from("2026-01-01T00:00:00.000000Z"),
+            hub: None,
+            connector_id: None,
+            connector_token: None,
         }
     }
 

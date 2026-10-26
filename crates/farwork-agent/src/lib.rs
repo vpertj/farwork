@@ -13,12 +13,14 @@
 pub mod backoff;
 pub mod cli;
 pub mod codex;
+pub mod credentials;
 pub mod dsh;
 pub mod echo;
 pub mod fsops;
 pub mod hub;
 pub mod identity;
 pub mod ids;
+pub mod pair;
 pub mod protocol;
 pub mod rpc;
 pub mod term;

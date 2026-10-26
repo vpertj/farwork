@@ -11,6 +11,8 @@
 //!   would look like a complete replacement that dropped somebody's history.
 
 use std::collections::{HashMap, HashSet};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -276,18 +278,62 @@ impl SnapshotStage {
     }
 }
 
-/// Checkpoints received from the bridge, keyed by the native session id.
+/// Checkpoints the bridge asks us to keep, keyed by the native session id.
 ///
-/// They are only an optimisation: a missing one costs a full snapshot, never
-/// correctness, so they live in memory for the life of this process.
-#[derive(Debug, Default)]
+/// The bridge drives this: it asks `checkpoint.load` for a session before
+/// deciding how to bring it up to date, and hands us `checkpoint.save` once it
+/// has streamed one. The checkpoint is the *client's* durable state — keeping it
+/// only in memory turns every reconnect into a full inventory replay, which is
+/// exactly what overflows the bridge's own 10k-event queue on an instance with
+/// dozens of sessions.
+///
+/// It is still only an optimisation: an unreadable, corrupt or foreign file is
+/// read as "no checkpoint". A full replay is slow, never wrong.
+#[derive(Debug)]
 pub struct Checkpoints {
+    dir: Option<PathBuf>,
     entries: HashMap<String, Value>,
 }
 
+impl Default for Checkpoints {
+    fn default() -> Self {
+        Self::in_memory()
+    }
+}
+
+/// `$FARWORK_HOME/dsh/sync/checkpoints` — beside the agent identity, and
+/// deliberately not in `~/.agents-anywhere`, which belongs to the DSH plugin.
+pub fn default_dir() -> PathBuf {
+    crate::identity::home()
+        .join("dsh")
+        .join("sync")
+        .join("checkpoints")
+}
+
+const CHECKPOINT_SUFFIX: &str = ".json";
+
 impl Checkpoints {
-    pub fn new() -> Self {
-        Self::default()
+    /// Nothing is persisted: the next connection replays every session in full.
+    pub fn in_memory() -> Self {
+        Self {
+            dir: None,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Read whatever an earlier process left in `dir`; unusable files are
+    /// skipped (one bad file must not blind us to the rest).
+    pub fn open(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        let entries = read_entries(&dir);
+        Self {
+            dir: Some(dir),
+            entries,
+        }
+    }
+
+    pub fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
     }
 
     pub fn load(&self, external_session_id: &str) -> Option<Value> {
@@ -295,12 +341,45 @@ impl Checkpoints {
     }
 
     pub fn save(&mut self, external_session_id: &str, checkpoint: Value) {
+        if !is_usable_id(external_session_id) {
+            // The id names the file, so it is peer-controlled: anything that is
+            // not one plain path component could escape the directory.
+            tracing::warn!(
+                external_session_id,
+                "refusing to name a dsh checkpoint after this session id"
+            );
+            return;
+        }
         self.entries
-            .insert(external_session_id.to_string(), checkpoint);
+            .insert(external_session_id.to_string(), checkpoint.clone());
+        let Some(path) = self.file_for(external_session_id) else {
+            return;
+        };
+        if let Err(error) = write_atomic(&path, &checkpoint) {
+            // Keeping the in-memory copy is still worth it for this process; the
+            // operator has to know the next connection pays a full replay again.
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "dsh checkpoint not persisted; the next connection replays this session in full"
+            );
+        }
     }
 
     pub fn delete(&mut self, external_session_id: &str) -> bool {
-        self.entries.remove(external_session_id).is_some()
+        let removed = self.entries.remove(external_session_id).is_some();
+        if let Some(path) = self.file_for(external_session_id) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "cannot delete a dsh checkpoint file"
+                ),
+            }
+        }
+        removed
     }
 
     pub fn len(&self) -> usize {
@@ -310,6 +389,103 @@ impl Checkpoints {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    fn file_for(&self, external_session_id: &str) -> Option<PathBuf> {
+        let dir = self.dir.as_ref()?;
+        if !is_usable_id(external_session_id) {
+            return None;
+        }
+        Some(dir.join(format!("{external_session_id}{CHECKPOINT_SUFFIX}")))
+    }
+}
+
+/// One checkpoint per session is one file, so the id must be exactly one plain
+/// path component: no separators, no dot-only names, nothing that a peer could
+/// use to point outside the directory.
+fn is_usable_id(external_session_id: &str) -> bool {
+    !external_session_id.is_empty()
+        && external_session_id.len() <= 200
+        && !external_session_id.starts_with('.')
+        && !external_session_id.contains(['/', '\\', '\0'])
+}
+
+fn read_entries(dir: &Path) -> HashMap<String, Value> {
+    let mut entries = HashMap::new();
+    let listing = match std::fs::read_dir(dir) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == ErrorKind::NotFound => return entries,
+        Err(error) => {
+            tracing::warn!(%error, path = %dir.display(), "cannot read the dsh checkpoint directory");
+            return entries;
+        }
+    };
+    for entry in listing.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        // Temp files from an interrupted write do not end in ".json", so a
+        // half-written checkpoint is never mistaken for a whole one.
+        let Some(id) = name.strip_suffix(CHECKPOINT_SUFFIX) else {
+            continue;
+        };
+        if !is_usable_id(id) {
+            continue;
+        }
+        let parsed = std::fs::read(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string()));
+        match parsed {
+            Ok(value) => {
+                entries.insert(id.to_string(), value);
+            }
+            Err(reason) => tracing::warn!(
+                path = %path.display(),
+                %reason,
+                "ignoring an unusable dsh checkpoint file; that session replays in full"
+            ),
+        }
+    }
+    entries
+}
+
+/// Write to a temp file in the same directory, then rename over the target.
+///
+/// A checkpoint that is read while half written would make the bridge resume from
+/// a boundary it never confirmed, so the rename is what makes it safe to have one
+/// at all.
+fn write_atomic(path: &Path, value: &Value) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "checkpoint path has no directory",
+        ));
+    };
+    std::fs::create_dir_all(parent)?;
+    crate::identity::restrict_dir(parent);
+    let stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("checkpoint.json");
+    let temp = parent.join(format!(".{stem}.tmp.{}", std::process::id()));
+    let body = serde_json::to_vec(value)
+        .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+    let written = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&temp)?;
+        crate::identity::restrict_file(&temp);
+        file.write_all(&body)?;
+        file.sync_all()
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -463,16 +639,158 @@ mod tests {
         );
     }
 
+    fn temp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "farwork-agent-checkpoints-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    fn checkpoint(through_seq: i64) -> Value {
+        json!({
+            "historyHash": "e6dec046d543a40bd295808a46743585be1d73269731856f8cf9d44fb61418d9",
+            "projectionVersion": 3,
+            "settled": true,
+            "throughSeq": through_seq,
+            "version": 1,
+        })
+    }
+
     #[test]
-    fn checkpoints_are_kept_per_native_session_and_can_be_deleted() {
-        let mut checkpoints = Checkpoints::new();
+    fn a_checkpoint_survives_the_process_that_saved_it() {
+        let dir = temp_dir("reuse");
+        let mut first = Checkpoints::open(&dir);
+        assert!(first.is_empty());
+        first.save("session-a", checkpoint(8624));
+        drop(first);
+
+        // A fresh store over the same directory is what the next connection gets:
+        // without this the bridge replays all ~30 sessions in full.
+        let second = Checkpoints::open(&dir);
+        assert_eq!(second.load("session-a"), Some(checkpoint(8624)));
+        assert_eq!(second.len(), 1);
+        // A different externalSessionId is a different file, not a shared one.
+        assert_eq!(second.load("session-b"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_a_checkpoint_removes_its_file_too() {
+        let dir = temp_dir("delete");
+        let mut checkpoints = Checkpoints::open(&dir);
+        checkpoints.save("session-a", checkpoint(4));
+        let path = dir.join("session-a.json");
+        assert!(path.exists());
+        assert!(checkpoints.delete("session-a"));
+        assert!(!path.exists(), "the file is what makes it durable");
+        assert!(!checkpoints.delete("session-a"));
         assert!(checkpoints.is_empty());
+        assert_eq!(Checkpoints::open(&dir).load("session-a"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_file_holds_the_bridges_bytes_and_no_temp_file_is_left_behind() {
+        let dir = temp_dir("atomic");
+        let mut checkpoints = Checkpoints::open(&dir);
+        checkpoints.save("session-a", checkpoint(7));
+        let raw = std::fs::read_to_string(dir.join("session-a.json")).expect("file");
+        let parsed: Value = serde_json::from_str(&raw).expect("json");
+        assert_eq!(parsed, checkpoint(7), "the value is stored verbatim");
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .expect("listing")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name != "session-a.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "an atomic replace leaves no partial file: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_checkpoint_directory_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("perms");
+        let mut checkpoints = Checkpoints::open(&dir);
+        checkpoints.save("session-a", checkpoint(1));
+        let file = std::fs::metadata(dir.join("session-a.json")).expect("file");
+        assert_eq!(file.permissions().mode() & 0o777, 0o600);
+        let parent = std::fs::metadata(&dir).expect("dir");
+        assert_eq!(parent.permissions().mode() & 0o777, 0o700);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_or_unparsable_file_reads_as_no_checkpoint() {
+        let dir = temp_dir("corrupt");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("session-broken.json"), "{ this is not json").expect("write");
+        // A file whose name cannot be a session id is not a checkpoint either.
+        std::fs::write(dir.join("notes.txt"), "{}").expect("write");
+        let mut checkpoints = Checkpoints::open(&dir);
+        assert_eq!(checkpoints.load("session-broken"), None);
+        assert!(checkpoints.is_empty());
+        // And the store still works afterwards instead of latching the failure.
+        checkpoints.save("session-ok", checkpoint(2));
+        assert_eq!(
+            Checkpoints::open(&dir).load("session-ok"),
+            Some(checkpoint(2))
+        );
+        assert_eq!(Checkpoints::open(&dir).load("session-broken"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_session_id_that_is_a_path_is_refused_instead_of_escaping_the_directory() {
+        let dir = temp_dir("escape");
+        let mut checkpoints = Checkpoints::open(&dir);
+        for hostile in ["../../etc/passwd", "a/b", ".", "..", ".hidden", ""] {
+            checkpoints.save(hostile, checkpoint(1));
+            assert_eq!(
+                checkpoints.load(hostile),
+                None,
+                "{hostile} must not be stored"
+            );
+        }
+        assert!(checkpoints.is_empty());
+        // Nothing was written anywhere: the store refused before touching a path.
+        let created: Vec<String> = std::fs::read_dir(&dir)
+            .map(|listing| {
+                listing
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(created.is_empty(), "nothing was written: {created:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoints_live_under_farwork_home_and_not_in_the_dsh_plugin_directory() {
+        let dir = default_dir();
+        let text = dir.to_string_lossy().to_string();
+        assert!(text.ends_with("dsh/sync/checkpoints"), "{text}");
+        assert!(
+            !text.contains(".agents-anywhere"),
+            "the plugin's own state directory is not ours to write: {text}"
+        );
+    }
+
+    #[test]
+    fn an_in_memory_store_keeps_working_without_touching_the_disk() {
+        let mut checkpoints = Checkpoints::in_memory();
+        assert_eq!(checkpoints.dir(), None);
         checkpoints.save("ext-1", json!({"throughSeq": 4}));
         assert_eq!(checkpoints.load("ext-1"), Some(json!({"throughSeq": 4})));
-        assert_eq!(checkpoints.load("ext-2"), None);
-        assert_eq!(checkpoints.len(), 1);
         assert!(checkpoints.delete("ext-1"));
-        assert!(!checkpoints.delete("ext-1"));
         assert!(checkpoints.is_empty());
+        // default() is the in-memory store: a session with no directory configured
+        // must not silently write into somebody's home.
+        assert_eq!(Checkpoints::default().dir(), None);
     }
 }

@@ -35,7 +35,10 @@ impl SessionPair {
     }
 }
 
-/// One model or permission entry, kept to the two fields a picker needs.
+/// One catalog entry, kept to the two fields a picker needs.
+///
+/// Models and permissions label entries with `title`; Agent presets label theirs
+/// with `name`, so both are accepted and neither is invented.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogEntry {
     pub id: String,
@@ -50,6 +53,7 @@ impl CatalogEntry {
         }
         let title = value
             .get("title")
+            .or_else(|| value.get("name"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|title| !title.is_empty())
@@ -180,6 +184,62 @@ impl MessageIds {
     }
 }
 
+/// Params of `session.createAndStart`.
+///
+/// `selections` and `agentPreset` are omitted entirely when nothing was
+/// configured: the bridge then applies its own defaults, and an empty object
+/// would be a different request. `agentPreset` is top level, not a selection —
+/// DSH refuses `createAndStart` without an Agent mode of its own choosing.
+pub fn create_and_start_params(
+    session_id: &str,
+    content: &str,
+    client_message_id: &str,
+    cwd: &str,
+    selections: Option<&Value>,
+    agent_preset: Option<&str>,
+) -> Value {
+    let mut params = json!({
+        "sessionId": session_id,
+        "content": content,
+        "clientMessageId": client_message_id,
+        "cwd": cwd,
+    });
+    if let Some(map) = params.as_object_mut() {
+        if let Some(selections) = selections {
+            map.insert(String::from("selections"), selections.clone());
+        }
+        if let Some(agent_preset) = agent_preset {
+            map.insert(String::from("agentPreset"), json!(agent_preset));
+        }
+    }
+    params
+}
+
+/// Params of `runtime.sync.subscribe`.
+///
+/// `checkpointVersion: 1` is what makes the bridge use durable checkpoints at all:
+/// without it no `checkpoint.*` operation ever arrives and every connection is a
+/// full inventory replay.
+pub fn subscribe_params(
+    subscription_id: &str,
+    checkpoint_version: u64,
+    upload_progress_version: u64,
+) -> Value {
+    json!({
+        "subscriptionId": subscription_id,
+        "checkpointVersion": checkpoint_version,
+        "uploadProgressVersion": upload_progress_version,
+    })
+}
+
+/// A fresh subscription name per `runtime.sync.subscribe`.
+///
+/// The bridge scopes batches, acks and checkpoint calls to it, so a resubscribe
+/// has to look like a new subscription rather than the old one continuing.
+pub fn subscription_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
 pub struct DshClient {
     rpc: Arc<RpcClient>,
 }
@@ -222,6 +282,11 @@ impl DshClient {
         self.catalog("catalog.listPermissions", "permissions").await
     }
 
+    /// The Agent modes (presets) the bridge offers; ids are bare words.
+    pub async fn list_agent_presets(&self) -> Result<Vec<CatalogEntry>, RpcError> {
+        self.catalog("catalog.listAgentPresets", "presets").await
+    }
+
     async fn catalog(&self, method: &str, key: &str) -> Result<Vec<CatalogEntry>, RpcError> {
         let result = self.rpc.call(method, json!({})).await?;
         Ok(result
@@ -249,16 +314,20 @@ impl DshClient {
         content: &str,
         client_message_id: &str,
         cwd: &str,
+        selections: Option<&Value>,
+        agent_preset: Option<&str>,
     ) -> Result<Value, RpcError> {
         self.rpc
             .call(
                 "session.createAndStart",
-                json!({
-                    "sessionId": session_id,
-                    "content": content,
-                    "clientMessageId": client_message_id,
-                    "cwd": cwd,
-                }),
+                create_and_start_params(
+                    session_id,
+                    content,
+                    client_message_id,
+                    cwd,
+                    selections,
+                    agent_preset,
+                ),
             )
             .await
     }
@@ -334,10 +403,11 @@ impl DshClient {
             .rpc
             .call(
                 "runtime.sync.subscribe",
-                json!({
-                    "checkpointVersion": checkpoint_version,
-                    "uploadProgressVersion": upload_progress_version,
-                }),
+                subscribe_params(
+                    &subscription_id(),
+                    checkpoint_version,
+                    upload_progress_version,
+                ),
             )
             .await?;
         SubscribeResult::parse(&result)
@@ -380,9 +450,47 @@ mod tests {
         .collect();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].title, "DeepSeek-V4-Pro");
+        // Agent presets label their entries with `name` instead of `title`.
+        let presets: Vec<CatalogEntry> = json!([{ "id": "ptc", "name": "ptc" }])
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(CatalogEntry::from_value)
+            .collect();
+        assert_eq!(presets[0].title, "ptc");
         // A missing title falls back to the id: a picker entry with no label is
         // still clickable, an invented label is not.
         assert_eq!(entries[1].title, "dsh:model:b");
+    }
+
+    #[test]
+    fn create_and_start_omits_selections_unless_they_were_configured() {
+        let params = create_and_start_params("sess_1", "hi", "cm_1", "/w", None, None);
+        assert_eq!(params["sessionId"], "sess_1");
+        assert_eq!(params["cwd"], "/w");
+        assert!(
+            params.get("selections").is_none(),
+            "an unspecified selection must not send the key at all: {params}"
+        );
+
+        let selections = json!({ "permission": "dsh:permission:cmVhZC1vbmx5" });
+        let params = create_and_start_params("sess_1", "hi", "cm_1", "/w", Some(&selections), None);
+        assert_eq!(params["selections"], selections);
+    }
+
+    #[test]
+    fn an_agent_preset_is_a_top_level_param_and_absent_when_unset() {
+        let params = create_and_start_params("sess_1", "hi", "cm_1", "/w", None, Some("ptc"));
+        assert_eq!(params["agentPreset"], json!("ptc"));
+        assert!(
+            params.get("selections").is_none(),
+            "a preset is not a selection: {params}"
+        );
+
+        // Nothing configured: the key must be absent, not null — the bridge then
+        // keeps its own default mode instead of reading an explicit non-choice.
+        let params = create_and_start_params("sess_1", "hi", "cm_1", "/w", None, None);
+        assert!(params.get("agentPreset").is_none(), "{params}");
     }
 
     #[test]
@@ -418,6 +526,24 @@ mod tests {
         assert_eq!(parsed.projection_version, 3);
         assert_eq!(parsed.checkpoint_version, Some(1));
         assert_eq!(parsed.upload_progress_version, None);
+    }
+
+    #[test]
+    fn a_subscribe_names_its_subscription_and_asks_for_durable_checkpoints() {
+        let params = subscribe_params("abc123", 1, 1);
+        assert_eq!(params["subscriptionId"], json!("abc123"));
+        // Without checkpointVersion the bridge never sends a checkpoint operation,
+        // which is why every connection used to replay the entire inventory.
+        assert_eq!(params["checkpointVersion"], json!(1));
+        assert_eq!(params["uploadProgressVersion"], json!(1));
+
+        // 32 hex characters, the shape of the reference connector's uuid4().hex, and
+        // a new one per subscribe: a retry must not look like the old subscription
+        // continuing.
+        let first = subscription_id();
+        assert_eq!(first.len(), 32);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()), "{first}");
+        assert_ne!(first, subscription_id());
     }
 
     #[test]

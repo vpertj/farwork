@@ -61,9 +61,32 @@ pub fn role(raw: Option<&str>) -> Option<Role> {
     }
 }
 
+/// Keys that describe *what kind of thing* a content object is rather than any
+/// of its text. `{"kind":"reasoning","text":""}` is all discriminator and no
+/// content, which is exactly the empty card we must not create.
+const CONTENT_DISCRIMINATORS: [&str; 3] = ["kind", "type", "format"];
+
+/// Whether a projected content value can render anything at all.
+///
+/// The rule is deliberately conservative in both directions: numbers and booleans
+/// are metadata (a `streaming:false` flag is not something to look at), while a
+/// tool call is worth a row as soon as it carries a non-blank name or input — so
+/// tool/artifact rows survive even before they produce output text.
+fn has_displayable_content(value: &Value) -> bool {
+    match value {
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(items) => items.iter().any(has_displayable_content),
+        Value::Object(map) => map.iter().any(|(key, child)| {
+            !CONTENT_DISCRIMINATORS.contains(&key.as_str()) && has_displayable_content(child)
+        }),
+        // Null, numbers and booleans carry no text of their own.
+        _ => false,
+    }
+}
+
 /// One `timeline.itemUpsert` payload. `None` means "not part of the timeline",
 /// which is a decision, not a failure: turn markers and hidden rows are excluded
-/// on purpose.
+/// on purpose, and so are the two noise categories below.
 pub fn item(value: &Value, fallback_time: &str) -> Option<ItemEnvelope> {
     let raw_type = value.get("type").and_then(Value::as_str)?;
     if SKIPPED_TYPES.contains(&raw_type) {
@@ -77,6 +100,30 @@ pub fn item(value: &Value, fallback_time: &str) -> Option<ItemEnvelope> {
     let item_type = item_type(raw_type)?;
     let raw_status = value.get("status").and_then(Value::as_str)?;
     let status = item_status(raw_status)?;
+    let role = role(value.get("role").and_then(Value::as_str));
+    // The hub persists the user's own message from the REST payload (with
+    // clientMessageId idempotency), and DSH echoes that same message back as an
+    // item. Re-projecting the echo would print every prompt twice in one
+    // timeline — the same decision codex's mapper makes for `userMessage`
+    // (codex/mapper.rs:720-726). Only the user role is skipped; assistant, tool
+    // and artifact items are the runtime's own output and must flow.
+    if role == Some(Role::User) {
+        tracing::debug!(item_id = %id, "dsh echoed the user message back; not re-projecting it");
+        return None;
+    }
+    let content = value.get("content").cloned().unwrap_or(Value::Null);
+    // An item with nothing to display becomes an empty card in the browser. This
+    // is how the blank `{kind:"reasoning",text:""}` rows stop showing up as
+    // `system` items; real reasoning text is kept (it is displayable content we
+    // may render later) and produces no second, empty row of its own.
+    if !has_displayable_content(&content) {
+        tracing::debug!(
+            item_id = %id,
+            item_type = %raw_type,
+            "skipping a dsh item with no displayable content"
+        );
+        return None;
+    }
     let item_time = value
         .get("metadata")
         .and_then(|metadata| metadata.get("itemTime"))
@@ -93,8 +140,8 @@ pub fn item(value: &Value, fallback_time: &str) -> Option<ItemEnvelope> {
         id: id.to_string(),
         item_type,
         status,
-        role: role(value.get("role").and_then(Value::as_str)),
-        content: value.get("content").cloned().unwrap_or(Value::Null),
+        role,
+        content,
         item_time,
     })
 }
@@ -360,6 +407,95 @@ mod tests {
             json!({"type":"message","status":"done"}),
         ] {
             assert!(item(&raw, "now").is_none(), "should be skipped: {raw}");
+        }
+    }
+
+    #[test]
+    fn a_user_message_echo_is_not_re_projected() {
+        // The hub already wrote the prompt from the REST payload; DSH echoes that same
+        // turn back with its own item id, so projecting it shows the prompt twice.
+        let echo = json!({
+            "id": "dsh_echo_1", "type": "message", "status": "done", "role": "user",
+            "content": { "kind": "markdown", "text": "reply with the single word pong" },
+        });
+        assert!(
+            item(&echo, "now").is_none(),
+            "the user echo must be skipped"
+        );
+        // The same content from the assistant is the real reply and is kept.
+        let reply = json!({
+            "id": "dsh_reply_1", "type": "message", "status": "done", "role": "assistant",
+            "content": { "kind": "markdown", "text": "pong" },
+        });
+        let envelope = item(&reply, "now").expect("assistant reply");
+        assert_eq!(envelope.role, Some(Role::Assistant));
+        assert_eq!(envelope.content["text"], json!("pong"));
+    }
+
+    #[test]
+    fn an_empty_reasoning_item_is_not_projected() {
+        for text in [json!(""), json!("   "), json!("\n\t ")] {
+            let empty = json!({
+                "id": "dsh_think_1", "type": "system", "status": "done", "role": "assistant",
+                "content": { "kind": "reasoning", "text": text },
+            });
+            assert!(
+                item(&empty, "now").is_none(),
+                "an empty reasoning row must not become a system item: {empty}"
+            );
+        }
+        // No content at all, or only discriminator keys, is the same empty card.
+        for content in [
+            Value::Null,
+            json!({ "kind": "reasoning" }),
+            json!({ "kind": "markdown", "text": "" }),
+            json!([]),
+        ] {
+            let raw = json!({
+                "id": "dsh_blank", "type": "system", "status": "done", "content": content,
+            });
+            assert!(item(&raw, "now").is_none(), "should be skipped: {raw}");
+        }
+    }
+
+    #[test]
+    fn real_reasoning_text_is_kept_once_and_not_reshaped_into_a_system_row() {
+        let thinking = json!({
+            "id": "dsh_think_2", "type": "system", "status": "done", "role": "assistant",
+            "content": { "kind": "reasoning", "text": "the user wants one word" },
+        });
+        let envelope = item(&thinking, "now").expect("non-empty reasoning is kept");
+        assert_eq!(envelope.role, Some(Role::Assistant));
+        // One item in, one item out: the reasoning text is never turned into an
+        // extra row (an empty one would land as a blank card).
+        assert_eq!(envelope.content["kind"], json!("reasoning"));
+        assert_eq!(envelope.content["text"], json!("the user wants one word"));
+    }
+
+    #[test]
+    fn skipping_user_and_blank_rows_leaves_tool_and_artifact_rows_alone() {
+        let tool_call = json!({
+            "id": "dsh_tool_1", "type": "tool", "status": "running", "role": "tool",
+            "content": { "kind": "tool", "toolName": "shell", "input": { "command": "ls" } },
+        });
+        let envelope = item(&tool_call, "now").expect("tool call");
+        assert_eq!(envelope.item_type, ItemType::Tool);
+        assert_eq!(envelope.role, Some(Role::Tool));
+
+        let artifact = json!({
+            "id": "dsh_artifact_1", "type": "artifact", "status": "done", "role": "assistant",
+            "content": { "kind": "artifact", "title": "report.md", "path": "/w/report.md" },
+        });
+        let envelope = item(&artifact, "now").expect("artifact");
+        assert_eq!(envelope.item_type, ItemType::Artifact);
+        assert_eq!(envelope.content["path"], json!("/w/report.md"));
+
+        // Tool output as a bare string, and a plain assistant message, both survive.
+        for raw in [
+            json!({"id":"dsh_tool_2","type":"tool","status":"done","role":"tool","content":"exit 0"}),
+            json!({"id":"dsh_asst","type":"message","status":"done","role":"assistant","content":{"text":"pong"}}),
+        ] {
+            assert!(item(&raw, "now").is_some(), "should be kept: {raw}");
         }
     }
 

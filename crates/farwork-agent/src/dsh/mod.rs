@@ -17,8 +17,10 @@ pub mod handshake;
 pub mod interaction;
 pub mod projection;
 pub mod rpc;
+pub mod selections;
 pub mod sync;
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -43,6 +45,13 @@ pub use self::projection::capabilities_frame;
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many times one connection may answer a dead sync feed with a resubscribe.
+///
+/// Each attempt persists the checkpoints of every session the bridge managed to
+/// stream, so the next attempt resumes further along; more than a couple of them
+/// is a bridge that will not converge, and pretending otherwise just spins.
+const MAX_SYNC_RECOVERIES: u32 = 3;
+
 #[derive(Debug, Clone)]
 pub struct DshOptions {
     pub endpoint: Endpoint,
@@ -57,6 +66,17 @@ pub struct DshOptions {
     pub cwd: String,
     pub prompt: String,
     pub client_version: String,
+    /// `selections` for `createAndStart`, already resolved from the operator's
+    /// `--dsh-permission` / `--dsh-model` at startup. `None` keeps DSH's defaults.
+    pub selections: Option<Value>,
+    /// `agentPreset` for `createAndStart`, resolved from `--dsh-preset`. `None`
+    /// keeps whichever Agent mode the bridge considers default.
+    pub agent_preset: Option<String>,
+    /// Where durable checkpoints live (`$FARWORK_HOME/dsh/sync/checkpoints`).
+    /// `None` keeps them in memory for one process: still correct, but every
+    /// reconnect replays the whole inventory, which is what overflows the bridge's
+    /// own event queue on an instance with dozens of sessions.
+    pub checkpoint_dir: Option<PathBuf>,
 }
 
 /// Side effects that need a real RPC and therefore cannot happen while the
@@ -77,6 +97,8 @@ pub struct DshSession {
     hub_session_id: String,
     cwd: String,
     prompt: String,
+    selections: Option<Value>,
+    agent_preset: Option<String>,
     out: UnboundedSender<ClientFrame>,
     cmd: Option<UnboundedReceiver<SessionCmd>>,
     features: Features,
@@ -89,6 +111,9 @@ pub struct DshSession {
     checkpoints: Checkpoints,
     notices: NoticeQueue,
     messages: MessageIds,
+    /// How many times the bridge's sync feed has died on this connection's watch;
+    /// it bounds the retries (see `on_runtime_error`).
+    sync_failures: u32,
 }
 
 impl DshSession {
@@ -107,6 +132,8 @@ impl DshSession {
             hub_session_id: options.hub_session_id.clone(),
             cwd: options.cwd,
             prompt: options.prompt,
+            selections: options.selections,
+            agent_preset: options.agent_preset,
             out,
             cmd: Some(cmd),
             features: Features::default(),
@@ -116,9 +143,13 @@ impl DshSession {
             catalogs: CatalogSet::default(),
             capabilities: CapabilitySet::default(),
             snapshots: SnapshotStage::new(),
-            checkpoints: Checkpoints::new(),
+            checkpoints: match &options.checkpoint_dir {
+                Some(dir) => Checkpoints::open(dir),
+                None => Checkpoints::in_memory(),
+            },
             notices: NoticeQueue::new(),
             messages: MessageIds::new(),
+            sync_failures: 0,
         }
     }
 
@@ -193,6 +224,8 @@ impl DshSession {
                 &self.prompt,
                 &client_message_id,
                 &self.cwd,
+                self.selections.as_ref(),
+                self.agent_preset.as_deref(),
             )
             .await;
         let created = match created {
@@ -260,18 +293,9 @@ impl DshSession {
             return self.on_batch(client, &inbound.params).await;
         }
         if inbound.method == "runtime.error" {
-            let message = inbound
-                .params
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("the DSH bridge reported an error");
-            tracing::warn!(%message, "dsh runtime error");
-            self.send(ClientFrame::Error {
-                message: message.to_string(),
-                stream_id: Some(self.stream_id.clone()),
-            });
-            return Ok(());
+            return self.on_runtime_error(client, &inbound.params).await;
         }
+
         let mut frames = Vec::new();
         let mut refresh = Refresh::default();
         self.apply_notification(
@@ -291,6 +315,71 @@ impl DshSession {
             self.send_capabilities();
         }
         Ok(())
+    }
+
+    /// The bridge reports a dead sync feed as `runtime.error` with
+    /// `data.scope == "sync"` — on a big DSH instance that is its own event queue
+    /// (10000 events) overflowing while it replays the whole inventory.
+    ///
+    /// Retrying that as an unknown error is useless: the replay starts over and the
+    /// queue fills again. A retry only earns its place when the checkpoints we
+    /// persist let the bridge *resume* instead of replaying, and it is bounded.
+    /// Past that the operator gets the cause and the one action that fixes it,
+    /// because this agent cannot shrink somebody's DSH instance for them.
+    async fn on_runtime_error(
+        &mut self,
+        client: &DshClient,
+        params: &Value,
+    ) -> Result<(), ExitReport> {
+        let message = params
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("the DSH bridge reported an error");
+        let data = params.get("data");
+        let code = data
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or("INTERNAL_ERROR");
+        let scope = data
+            .and_then(|data| data.get("scope"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if scope != "sync" {
+            tracing::warn!(%message, "dsh runtime error");
+            self.send(ClientFrame::Error {
+                message: message.to_string(),
+                stream_id: Some(self.stream_id.clone()),
+            });
+            return Ok(());
+        }
+
+        self.sync_failures += 1;
+        if self.sync_failures <= MAX_SYNC_RECOVERIES && !self.checkpoints.is_empty() {
+            tracing::warn!(
+                %code,
+                %message,
+                attempt = self.sync_failures,
+                checkpoints = self.checkpoints.len(),
+                "dsh sync feed failed; resubscribing, the persisted checkpoints let the bridge resume"
+            );
+            return self.resubscribe(client).await;
+        }
+        Err(self.fail(
+            1,
+            format!(
+                "the DSH bridge dropped its sync stream ({code}: {message}). The bridge replays the \
+                 whole session inventory on subscribe and its own event queue (10000 events) \
+                 overflows before that replay finishes; retrying cannot fix it. Archive old \
+                 sessions in DSH (or run the bridge against fewer sessions) and reconnect. This \
+                 agent has persisted {} checkpoint(s) at {} — every session covered by one will \
+                 resume on the next connection instead of replaying.",
+                self.checkpoints.len(),
+                match self.checkpoints.dir() {
+                    Some(dir) => dir.display().to_string(),
+                    None => String::from("<in memory only>"),
+                },
+            ),
+        ))
     }
 
     async fn on_batch(&mut self, client: &DshClient, params: &Value) -> Result<(), ExitReport> {
@@ -456,7 +545,15 @@ impl DshSession {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 // The answer rides on the ack, `null` when we have none: an omitted
-                // key would read as "this extension is not implemented".
+                // key would read as "this extension is not implemented". One ack can
+                // carry one checkpoint, so a batch asking for two would silently
+                // drop an answer — the bridge sends one per batch, say so if not.
+                if ack_checkpoint.is_some() {
+                    tracing::warn!(
+                        external_session_id = external,
+                        "a dsh batch asked for more than one checkpoint; answering the last"
+                    );
+                }
                 *ack_checkpoint = Some(self.checkpoints.load(external).unwrap_or(Value::Null));
             }
             "checkpoint.save" => {
@@ -465,6 +562,8 @@ impl DshSession {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if let Some(checkpoint) = operation.get("checkpoint") {
+                    // Applied before the ack goes out: acknowledging durable state we
+                    // have not written is how a reconnect turns into a full replay.
                     self.checkpoints.save(external, checkpoint.clone());
                 }
             }
@@ -956,6 +1055,10 @@ mod tests {
             cwd: String::from("/tmp"),
             prompt: String::from("hello dsh"),
             client_version: String::from("0.1.0"),
+            selections: None,
+            agent_preset: None,
+            // A test must never write into the developer's real state directory.
+            checkpoint_dir: None,
         }
     }
 
@@ -1312,6 +1415,95 @@ mod tests {
         bridge.abort();
     }
 
+    /// Capture the `createAndStart` params a session actually sends, then stop it.
+    async fn sent_create_and_start_params(
+        selections: Option<Value>,
+        agent_preset: Option<&str>,
+    ) -> Value {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (captured_tx, captured_rx) = oneshot::channel();
+        let bridge = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let mut captured = Some(captured_tx);
+            while let Some(frame) = next_frame(&mut lines).await {
+                let id = frame["id"].clone();
+                match frame["method"].as_str().unwrap_or_default() {
+                    "initialize" => reply(&mut write, id, initialize_result()).await,
+                    "session.createAndStart" => {
+                        if let Some(captured) = captured.take() {
+                            let _ = captured.send(frame["params"].clone());
+                        }
+                        reply(
+                            &mut write,
+                            id,
+                            json!({ "sessionId": "sess_hub_1", "externalSessionId": "ext-1" }),
+                        )
+                        .await
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let mut options = options(port);
+        options.selections = selections;
+        options.agent_preset = agent_preset.map(str::to_string);
+        let (out_tx, _out_rx) = unbounded_channel();
+        let (_cmd_tx, cmd_rx) = unbounded_channel();
+        let session = DshSession::new(options, out_tx, cmd_rx);
+        let run = tokio::spawn(async move { session.run().await });
+        let params = tokio::time::timeout(Duration::from_secs(10), captured_rx)
+            .await
+            .expect("createAndStart timed out")
+            .expect("channel");
+        run.abort();
+        bridge.abort();
+        params
+    }
+
+    #[tokio::test]
+    async fn a_configured_permission_reaches_create_and_start() {
+        let selections = selections::Selections {
+            permission: Some(String::from("dsh:permission:cmVhZC1vbmx5")),
+            model: None,
+            preset: None,
+        };
+        let params = sent_create_and_start_params(selections.to_value(), None).await;
+        assert_eq!(
+            params["selections"]["permission"],
+            json!("dsh:permission:cmVhZC1vbmx5")
+        );
+        assert!(
+            params["selections"].get("model").is_none(),
+            "a model the operator did not name must not be overridden: {params}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unspecified_selection_leaves_the_key_out_of_create_and_start() {
+        let params = sent_create_and_start_params(None, None).await;
+        assert!(
+            params.get("selections").is_none(),
+            "DSH's own default must win, not an empty object: {params}"
+        );
+        assert!(
+            params.get("agentPreset").is_none(),
+            "an unconfigured Agent mode must not send the key: {params}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_configured_agent_preset_reaches_create_and_start() {
+        let params = sent_create_and_start_params(None, Some("ptc")).await;
+        assert_eq!(params["agentPreset"], json!("ptc"));
+        assert!(
+            params.get("selections").is_none(),
+            "the Agent mode is not a selection: {params}"
+        );
+    }
+
     fn frame_type(frame: &ClientFrame) -> String {
         match frame {
             ClientFrame::Hello { .. } => "hello",
@@ -1354,5 +1546,277 @@ mod tests {
             None
         );
         assert_eq!(external_session_id(&json!({})), None);
+    }
+
+    /// The durable half of the sync contract, over a real socket: the bridge asks
+    /// for a checkpoint on the ack, we answer from disk, and a `checkpoint.save`
+    /// lands on disk before the ack goes back.
+    ///
+    /// This is the fix for a subscribe that replays every session in full: without
+    /// it the answer is always "none" and the bridge starts over every time.
+    #[tokio::test]
+    async fn a_bridge_checkpoint_is_read_from_disk_and_written_back() {
+        let dir = std::env::temp_dir().join(format!(
+            "farwork-agent-dsh-checkpoints-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        // What an earlier connection stored: the answer this one has to give.
+        let mut earlier = Checkpoints::open(&dir);
+        earlier.save("ext-persisted", json!({"throughSeq": 42, "version": 1}));
+        drop(earlier);
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let bridge = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let mut acks: Vec<Value> = Vec::new();
+            let mut subscribe_params: Option<Value> = None;
+            while let Some(frame) = next_frame(&mut lines).await {
+                let id = frame["id"].clone();
+                match frame["method"].as_str().unwrap_or_default() {
+                    "initialize" => reply(&mut write, id, initialize_result()).await,
+                    "session.createAndStart" => {
+                        reply(
+                            &mut write,
+                            id,
+                            json!({ "sessionId": "sess_hub_1", "externalSessionId": "ext-1" }),
+                        )
+                        .await
+                    }
+                    "catalog.listModels" => {
+                        reply(
+                            &mut write,
+                            id,
+                            json!({ "runtime": "dsh", "revision": 1, "models": [] }),
+                        )
+                        .await
+                    }
+                    "catalog.listPermissions" => {
+                        reply(
+                            &mut write,
+                            id,
+                            json!({ "runtime": "dsh", "revision": 1, "permissions": [] }),
+                        )
+                        .await
+                    }
+                    "session.getCapabilities" => {
+                        reply(
+                            &mut write,
+                            id,
+                            json!({ "runtime": "dsh", "revision": 1, "capabilities": [] }),
+                        )
+                        .await
+                    }
+                    "runtime.sync.subscribe" => {
+                        subscribe_params = Some(frame["params"].clone());
+                        reply(
+                            &mut write,
+                            id,
+                            json!({ "streamId": "sync_1", "projectionVersion": 3, "checkpointVersion": 1 }),
+                        )
+                        .await;
+                        for (batch_seq, operations) in [
+                            (
+                                1u64,
+                                json!([{ "kind": "checkpoint.load", "externalSessionId": "ext-persisted" }]),
+                            ),
+                            (
+                                2u64,
+                                json!([{ "kind": "checkpoint.save", "externalSessionId": "ext-new",
+                                    "checkpoint": { "throughSeq": 99, "version": 1 } }]),
+                            ),
+                            (
+                                3u64,
+                                json!([{ "kind": "checkpoint.load", "externalSessionId": "ext-never-seen" }]),
+                            ),
+                            (
+                                4u64,
+                                json!([{ "kind": "checkpoint.delete", "externalSessionId": "ext-persisted" }]),
+                            ),
+                        ] {
+                            notify(&mut write, "runtime.sync.batch", json!({
+                                "streamId": "sync_1", "batchSeq": batch_seq, "projectionVersion": 3,
+                                "operations": operations,
+                            }))
+                            .await;
+                        }
+                    }
+                    "runtime.sync.ack" => {
+                        acks.push(frame["params"].clone());
+                        reply(&mut write, id, json!({ "ok": true })).await;
+                        if acks.len() >= 4 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (acks, subscribe_params)
+        });
+
+        let mut options = options(port);
+        options.checkpoint_dir = Some(dir.clone());
+        let (out_tx, _out_rx) = unbounded_channel();
+        let (_cmd_tx, cmd_rx) = unbounded_channel();
+        let session = DshSession::new(options, out_tx, cmd_rx);
+        let run = tokio::spawn(async move { session.run().await });
+
+        let (acks, subscribe_params) = tokio::time::timeout(Duration::from_secs(20), bridge)
+            .await
+            .expect("bridge timed out")
+            .expect("bridge task");
+        assert_eq!(acks.len(), 4, "every batch must be acked: {acks:?}");
+
+        let subscribe_params = subscribe_params.expect("no subscribe");
+        assert_eq!(subscribe_params["checkpointVersion"], json!(1));
+        let subscription = subscribe_params["subscriptionId"]
+            .as_str()
+            .expect("subscriptionId is what scopes the stream");
+        assert_eq!(subscription.len(), 32, "{subscription}");
+
+        // 1: the stored checkpoint comes back on the ack.
+        assert_eq!(acks[0]["batchSeq"], json!(1));
+        assert_eq!(
+            acks[0]["checkpoint"],
+            json!({ "throughSeq": 42, "version": 1 })
+        );
+        // 2: a save answers nothing, and it is already on disk.
+        assert!(acks[1].get("checkpoint").is_none(), "{}", acks[1]);
+        let saved = std::fs::read_to_string(dir.join("ext-new.json")).expect("saved file");
+        let saved: Value = serde_json::from_str(&saved).expect("json");
+        assert_eq!(saved, json!({ "throughSeq": 99, "version": 1 }));
+        // 3: a session we know nothing about is answered with an explicit null —
+        // an omitted key would read as "this extension is not implemented".
+        assert_eq!(acks[2]["checkpoint"], Value::Null);
+        // 4: a delete removes the file, so the next connection replays that one.
+        assert!(!dir.join("ext-persisted.json").exists());
+        let surviving = Checkpoints::open(&dir);
+        assert_eq!(surviving.load("ext-persisted"), None);
+        assert_eq!(surviving.load("ext-new"), Some(saved));
+
+        run.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sync feed the bridge killed is not an unknown error: on this machine it is
+    /// its own 10k-event queue overflowing during a full inventory replay. With no
+    /// checkpoint to resume from, retrying would replay the same inventory and die
+    /// again, so the session must say so once and stop.
+    #[tokio::test]
+    async fn a_dead_sync_feed_is_reported_with_the_one_action_that_fixes_it() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let bridge = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let mut subscribes = 0u32;
+            while let Some(frame) = next_frame(&mut lines).await {
+                let id = frame["id"].clone();
+                match frame["method"].as_str().unwrap_or_default() {
+                    "initialize" => reply(&mut write, id, initialize_result()).await,
+                    "session.createAndStart" => {
+                        reply(
+                            &mut write,
+                            id,
+                            json!({ "sessionId": "sess_hub_1", "externalSessionId": "ext-1" }),
+                        )
+                        .await
+                    }
+                    "catalog.listModels" => {
+                        reply(
+                            &mut write,
+                            id,
+                            json!({ "runtime": "dsh", "revision": 1, "models": [] }),
+                        )
+                        .await
+                    }
+                    "catalog.listPermissions" => {
+                        reply(
+                            &mut write,
+                            id,
+                            json!({ "runtime": "dsh", "revision": 1, "permissions": [] }),
+                        )
+                        .await
+                    }
+                    "session.getCapabilities" => {
+                        reply(
+                            &mut write,
+                            id,
+                            json!({ "runtime": "dsh", "revision": 1, "capabilities": [] }),
+                        )
+                        .await
+                    }
+                    "runtime.sync.subscribe" => {
+                        subscribes += 1;
+                        reply(
+                            &mut write,
+                            id,
+                            json!({ "streamId": "sync_1", "projectionVersion": 3, "checkpointVersion": 1 }),
+                        )
+                        .await;
+                        notify(
+                            &mut write,
+                            "runtime.error",
+                            json!({
+                                "code": -32603,
+                                "message": "DSH could not complete this request. Check the Bridge logs page and retry.",
+                                "data": { "code": "INTERNAL_ERROR", "retryable": true, "scope": "sync" },
+                            }),
+                        )
+                        .await;
+                    }
+                    _ => {}
+                }
+            }
+            subscribes
+        });
+
+        let mut options = options(port);
+        // Nothing persisted: there is no checkpoint to resume from, so the only
+        // honest answer is to report the cause instead of replaying again.
+        options.checkpoint_dir = None;
+        let (out_tx, mut out_rx) = unbounded_channel();
+        let (_cmd_tx, cmd_rx) = unbounded_channel();
+        let session = DshSession::new(options, out_tx, cmd_rx);
+        let run = tokio::spawn(async move { session.run().await });
+
+        let report = tokio::time::timeout(Duration::from_secs(20), run)
+            .await
+            .expect("the session must not retry forever")
+            .expect("join");
+        assert_eq!(report.code, 1);
+        assert!(
+            report.reason.contains("INTERNAL_ERROR"),
+            "the bridge's own code belongs in the reason: {}",
+            report.reason
+        );
+        assert!(
+            report.reason.contains("Archive old sessions"),
+            "an operator needs the action, not just the symptom: {}",
+            report.reason
+        );
+
+        let mut saw_error = false;
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(200), out_rx.recv()).await
+        {
+            if let ClientFrame::Error { message, .. } = &frame {
+                assert!(message.contains("Archive old sessions"), "{message}");
+                saw_error = true;
+            }
+        }
+        assert!(saw_error, "the hub must hear why the stream ended");
+
+        let subscribes = tokio::time::timeout(Duration::from_secs(5), bridge)
+            .await
+            .expect("bridge")
+            .expect("task");
+        assert_eq!(
+            subscribes, 1,
+            "a replay that cannot help must not be retried"
+        );
     }
 }
