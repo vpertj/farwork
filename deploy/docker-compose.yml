@@ -6,7 +6,7 @@
 # ghcr.io/vpertj/farwork as :latest, :<git tag> and :sha-<short>. Rollback is
 # therefore a one-line change in .env (FARWORK_TAG), not a rebuild.
 #
-# Requires Compose v2 (1Panel ships it): $name:$ and
+# Requires Compose v2 (1Panel ships it): top-level `name:` and
 # depends_on.condition: service_completed_successfully are v2 features.
 
 name: farwork
@@ -14,7 +14,7 @@ name: farwork
 services:
   hub:
     # Pin a deployment by setting FARWORK_TAG in .env (e.g. v0.1.0 or
-    # sha-1a2b3c4). :latest is only the default so a first $up -d$ works.
+    # sha-1a2b3c4). :latest is only the default so a first `up -d` works.
     image: ghcr.io/vpertj/farwork:${FARWORK_TAG:-latest}
     restart: always
     environment:
@@ -39,13 +39,13 @@ services:
       - 1panel-network
     depends_on:
       db-init:
-        # Makes $up -d$ fail loudly when the database cannot be prepared, instead of
+        # Makes `up -d` fail loudly when the database cannot be prepared, instead of
         # leaving a hub that crash-loops on a missing role or database.
         condition: service_completed_successfully
 
   db-init:
     # One-shot: make sure the application role and database exist, then exit.
-    # Idempotent, so it runs on every $docker compose up -d$ — that is also how a
+    # Idempotent, so it runs on every `docker compose up -d` — that is also how a
     # rotated DB_PASSWORD reaches the database.
     #
     # Why a container instead of 1Panel's "Database" module: that module only knows
@@ -55,6 +55,8 @@ services:
     # instance. And the panel API has no exec endpoint, so the panel cannot run
     # this SQL either. Talking to the instance directly is the only path that
     # cannot drift.
+    #
+    # Image choice is the one the host already has, so this pulls nothing.
     image: postgres:18.6-alpine
     restart: "no"
     networks:
@@ -65,10 +67,10 @@ services:
       PGUSER: ${POSTGRES_ADMIN_USER}
       PGPASSWORD: ${POSTGRES_ADMIN_PASSWORD}
       # Values the SQL needs. They are handed over as *container* environment and
-      # read back at run time ($$APP_* below) instead of being pasted into the command
-      # string by compose: a single $ substitution inside the shell command source
-      # would let a quote in a password break the line. As env they stay out of argv
-      # and any character is safe.
+      # read back at run time ($$APP_* below) instead of being pasted into the
+      # command string by compose: a compose-time substitution would drop the value
+      # into shell source, where a quote in a password breaks the line, whereas an
+      # environment expansion passes any character through untouched.
       APP_USER: ${DB_USER}
       APP_DB: ${DB_NAME}
       APP_PASSWORD: ${DB_PASSWORD}
