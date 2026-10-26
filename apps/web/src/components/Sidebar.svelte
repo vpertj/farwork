@@ -43,6 +43,10 @@
 				<span class="glyph" aria-hidden="true">＋</span>
 				<span>连接设备</span>
 			</a>
+			<a class="nav-link" class:active={route.page === 'projects'} href="#/projects">
+				<span class="glyph" aria-hidden="true">▤</span>
+				<span>项目</span>
+			</a>
 			<a class="nav-link" class:active={route.page === 'new-session'} href="#/new-session">
 				<span class="glyph" aria-hidden="true">✦</span>
 				<span>新建会话</span>
@@ -183,7 +187,8 @@
 		color: var(--muted-foreground);
 		font-size: 12.5px;
 		font-weight: 500;
-		flex: 1;
+		flex: 0 1 auto;
+		white-space: nowrap;
 	}
 
 	.nav-link:hover,

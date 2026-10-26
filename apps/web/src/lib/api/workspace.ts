@@ -1,5 +1,6 @@
 import { ApiError, webSocketUrl, apiRequest, clientId } from './client';
 import {
+	asNumber,
 	asRecord,
 	asString,
 	cursorToSeq,
@@ -11,6 +12,7 @@ import {
 	parseCreateAndStart,
 	parseNotice,
 	parseNotices,
+	parseProject,
 	parseProjects,
 	parseRecovery,
 	parseSessions,
@@ -55,6 +57,74 @@ export async function createConnector(token: string, name: string): Promise<Crea
 
 export async function listProjects(token: string): Promise<Project[]> {
 	return parseProjects(await apiRequest('/projects', { token }));
+}
+
+function requireProject(payload: unknown): Project {
+	const project = parseProject(asRecord(payload)?.project ?? payload);
+	if (!project) throw new Error('项目响应格式无法识别。');
+	return project;
+}
+
+export type CreateProjectInput = {
+	connectorId: string;
+	workspacePath: string;
+	name: string;
+};
+
+export async function createProject(token: string, input: CreateProjectInput): Promise<Project> {
+	return requireProject(
+		await apiRequest('/projects', {
+			method: 'POST',
+			token,
+			body: {
+				name: input.name,
+				connectorId: input.connectorId,
+				workspacePath: input.workspacePath,
+				manuallyCreated: true
+			}
+		})
+	);
+}
+
+export type UpdateProjectInput = { name?: string; pinned?: boolean };
+
+export async function updateProject(
+	token: string,
+	projectId: string,
+	input: UpdateProjectInput
+): Promise<Project> {
+	const body: Record<string, unknown> = {};
+	if (input.name !== undefined) body.name = input.name;
+	if (input.pinned !== undefined) body.pinned = input.pinned;
+	return requireProject(
+		await apiRequest(`/projects/${encodeURIComponent(projectId)}`, {
+			method: 'PATCH',
+			token,
+			body
+		})
+	);
+}
+
+export type DeletedProject = { projectId: string; detachedSessions: number };
+
+export async function deleteProject(token: string, projectId: string): Promise<DeletedProject> {
+	const payload = await apiRequest(`/projects/${encodeURIComponent(projectId)}`, {
+		method: 'DELETE',
+		token
+	});
+	const raw = asRecord(payload);
+	const echoedId = asString(raw?.projectId);
+	if (echoedId.length === 0) throw new Error('删除项目的响应里没有 projectId。');
+	return { projectId: echoedId, detachedSessions: asNumber(raw?.detachedSessions) };
+}
+
+export async function listProjectSessions(
+	token: string,
+	projectId: string
+): Promise<Session[]> {
+	return parseSessions(
+		await apiRequest(`/projects/${encodeURIComponent(projectId)}/sessions`, { token })
+	);
 }
 
 export async function listSessions(token: string): Promise<Session[]> {

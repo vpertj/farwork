@@ -134,6 +134,11 @@ export type Project = {
 	workspacePath: string;
 	activeSessionCount: number;
 	lastActivityAt: string | null;
+	pinned: boolean;
+	pinnedAt: string | null;
+	manuallyCreated: boolean;
+	createdAt: string | null;
+	updatedAt: string | null;
 };
 
 export function parseProject(value: unknown): Project | null {
@@ -147,7 +152,12 @@ export function parseProject(value: unknown): Project | null {
 		name: asString(raw.name, id),
 		workspacePath: asString(raw.workspacePath),
 		activeSessionCount: asNumber(raw.activeSessionCount),
-		lastActivityAt: asNullableString(raw.lastActivityAt)
+		lastActivityAt: asNullableString(raw.lastActivityAt),
+		pinned: asBoolean(raw.pinned),
+		pinnedAt: asNullableString(raw.pinnedAt),
+		manuallyCreated: asBoolean(raw.manuallyCreated, true),
+		createdAt: asNullableString(raw.createdAt),
+		updatedAt: asNullableString(raw.updatedAt)
 	};
 }
 

@@ -8,6 +8,7 @@
 	import TaskHome from '../components/TaskHome.svelte';
 	import SessionView from '../components/SessionView.svelte';
 	import NewSessionPage from '../components/NewSessionPage.svelte';
+	import ProjectsPage from '../components/ProjectsPage.svelte';
 	import ConnectDevicePage from '../components/ConnectDevicePage.svelte';
 	import PlaceholderPage from '../components/PlaceholderPage.svelte';
 	import SharePage from '../components/SharePage.svelte';
@@ -55,7 +56,9 @@
 			? 'Farwork · 分享'
 			: route.page === 'admin'
 				? 'Farwork · 管理台'
-				: 'Farwork · 工作台'}
+				: route.page === 'projects'
+					? 'Farwork · 项目'
+					: 'Farwork · 工作台'}
 	</title>
 </svelte:head>
 
@@ -86,6 +89,8 @@
 				title={`设备详情 · ${route.connectorId}`}
 				description="设备页需要设备运行时列表、终端与文件浏览，属于后续切片。"
 			/>
+		{:else if route.page === 'projects'}
+			<ProjectsPage {token} />
 		{:else if route.page === 'new-session'}
 			<NewSessionPage projectId={route.projectId} {token} />
 		{:else if route.page === 'connect'}
