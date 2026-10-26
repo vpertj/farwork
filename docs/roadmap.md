@@ -38,7 +38,7 @@ M1 的契约细节保留在 `docs/architecture.md` 附录 A（标注为遗留）
 - **timeline**：`GET /sessions/{id}/snapshot` 建投影；`seq:N` 事件游标补拉；条目按 `order_seq` 排序渲染。语义由新 crate `farwork-timeline`（纯域逻辑）承担，hub 只做持久化与传输。
 - **发消息**：`POST /sessions/{id}/runtime/messages` 持久化到 `timeline_items`，`clientMessageId` 由唯一索引保证幂等。
 - **WS 增量**：`POST /ws-ticket` 换一次性票据 → `/sessions/{id}/ws` 事件流 / `/dashboard/ws` 总览；`snapshotRequired` 时客户端整块重拉。
-- **诚实兜底**：52 条未实现路径统一 `501 not_implemented`，未注册路径 `404`；`GET /connectors` 的 `status` 当时恒为 `offline`（没有 ingress 就没有在线值）——这条已被 M3 取代：现在 49 条 `501`，`status` 有真实 `online`/`offline`。
+- **诚实兜底**：52 条未实现路径统一 `501 not_implemented`，未注册路径 `404`；`GET /connectors` 的 `status` 当时恒为 `offline`（没有 ingress 就没有在线值）——这条已被 M3 取代：`status` 有真实 `online`/`offline`；`501` 表现在是 **47 条**（M3 移出 3 条，分享再移出 2 条）。
 - **CI 硬化**：`rust` job 挂 `postgres:18-alpine` service 并注入 `TEST_DATABASE_URL`，让 hub 集成测试从「静默 SKIP」变成真跑。
 
 ### 已验收
@@ -50,7 +50,7 @@ M1 的契约细节保留在 `docs/architecture.md` 附录 A（标注为遗留）
 
 ### 明确未含（当时都是 `501`）
 
-connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终端 · 分享 · 管理台（admin / agents / usage / announcements / pairing）。其中 connector ingress、审批/中断与文件浏览已由 M3 交付（见下），终端 / 分享 / 管理台仍未实现。
+connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终端 · 分享 · 管理台（admin / agents / usage / announcements / pairing）。其中 connector ingress、审批/中断、文件浏览与设备终端已由 M3 交付（见下），分享也已交付，只剩管理台未实现。
 
 ## M3 · connector ingress + agent（**部分交付**）
 
@@ -62,9 +62,10 @@ connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终�
 - **`farwork-agent`（新 crate）**：主动出站连 hub；身份落盘在 `$FARWORK_HOME/agent.json`（文件 0600、目录 0700，重启不换 id）；按 `session.start` 拉起 `codex app-server --stdio` 并把 JSON-RPC 翻成 ingress 帧；自带 `--runtime echo` 假后端用于自测。
 - **会话真派发**：`POST /sessions/create-and-start` 会下发 `session.start`（首条消息走 `prompt`）；`POST /sessions/{id}/runtime/messages` 在会话有活跃流时把 `session.message` 推给 agent，响应里的 `runtimeDispatched` 才是真实投递结果。
 - **审批与中断（后端）**：`GET /sessions/{id}/runtime/notices`、`POST /sessions/{id}/notices/{id}/respond`（+ `runtime` 别名）、`POST /sessions/{id}/runtime/interrupt` 落地；新增迁移 `0002_connector_ingress.sql`（`session_streams` 让 `streamId` 跨 hub 重启存活，`session_notices` 让审批跨刷新存活）。
-- **文件浏览（只读）**：新增 ingress 帧 `fs.request` / `fs.response`（hub 侧 `crates/farwork-hub/src/ingress.rs` + 配对表 `crates/farwork-hub/src/fsrelay.rs`，agent 侧 `crates/farwork-agent/src/protocol.rs` + 沙箱 `crates/farwork-agent/src/fsops.rs`），REST 两条 `POST /connectors/{id}/fs/list`、`POST /connectors/{id}/fs/readText`（`crates/farwork-hub/src/routes/fs.rs`），Web 侧会话页文件面板（`apps/web/src/components/FilePanel.svelte`，API 是 `apps/web/src/lib/api/workspace.ts` 的 `listWorkspaceDir` / `readWorkspaceText`）。**沙箱根是 agent 的 `--workdir`**：`canonicalize` 后按路径组件判前缀，越界/符号链接逃逸一律 403，`workdir` 不可解析时直接拒绝（契约见 `docs/architecture.md` §5.5–§5.6）。`501` 表**没有变化**，仍是 49 条：这批入口本来就不在那张表里（表里的 `/sessions/{id}/files*` 是另一组）。
-- **设备终端（M3）**：新增 ingress 帧 `terminal.open` / `terminal.opened` / `terminal.data` / `terminal.resize` / `terminal.exit` / `terminal.error` / `terminal.close`（hub 侧 `crates/farwork-hub/src/ingress.rs:385-432,510-540`、中继 `crates/farwork-hub/src/termrelay.rs`、agent 侧 `crates/farwork-agent/src/protocol.rs:289-321,384-415` + PTY 宿主 `crates/farwork-agent/src/term.rs`），REST 两条 `POST /api/v2/connectors/{id}/terminals`（`crates/farwork-hub/src/routes/terminals.rs:45,85-173`，201 恰好五个键）与 `GET /api/v2/connectors/{id}/terminals/{terminalId}/stream`（同文件 `:46-49,224-383`，浏览器侧 `terminal.input`/`terminal.resize`/`terminal.close` ↔ `terminal.opened`/`terminal.data`/`terminal.exit`/`terminal.error`），迁移 `0003_terminals.sql`（`terminals` 表：`closed_at` 区分「已结束」与「从未存在」，`error_code`/`error_message` 让 agent 的拒绝原因活过它被报告的那一刻），Web 侧会话页终端面板（`apps/web/src/components/TerminalPanel.svelte`、`apps/web/src/lib/terminal.ts`、`apps/web/src/lib/api/workspace.ts:191-238`；xterm.js）。**入口是 connector 命名空间**，因此 `501` 表仍是 **49** 条：表里的 `/sessions/{id}/terminal*` 是会话命名空间的另一组，仍回 `501`。契约见 `docs/architecture.md` §5.11–§5.12。
-- **诚实兜底更窄了**：`501` 表从 52 条减到 **49 条**（移出 interrupt / notices / notices respond 三条）；REST 与 ingress 两侧仍然「宁可变窄，不伪造成功」。
+- **文件浏览（只读）**：新增 ingress 帧 `fs.request` / `fs.response`（hub 侧 `crates/farwork-hub/src/ingress.rs` + 配对表 `crates/farwork-hub/src/fsrelay.rs`，agent 侧 `crates/farwork-agent/src/protocol.rs` + 沙箱 `crates/farwork-agent/src/fsops.rs`），REST 两条 `POST /connectors/{id}/fs/list`、`POST /connectors/{id}/fs/readText`（`crates/farwork-hub/src/routes/fs.rs`），Web 侧会话页文件面板（`apps/web/src/components/FilePanel.svelte`，API 是 `apps/web/src/lib/api/workspace.ts` 的 `listWorkspaceDir` / `readWorkspaceText`）。**沙箱根是 agent 的 `--workdir`**：`canonicalize` 后按路径组件判前缀，越界/符号链接逃逸一律 403，`workdir` 不可解析时直接拒绝（契约见 `docs/architecture.md` §5.5–§5.6）。`501` 表**当时没有变化**，仍是 49 条：这批入口本来就不在那张表里（表里的 `/sessions/{id}/files*` 是另一组）。
+- **设备终端（M3）**：新增 ingress 帧 `terminal.open` / `terminal.opened` / `terminal.data` / `terminal.resize` / `terminal.exit` / `terminal.error` / `terminal.close`（hub 侧 `crates/farwork-hub/src/ingress.rs:385-432,510-540`、中继 `crates/farwork-hub/src/termrelay.rs`、agent 侧 `crates/farwork-agent/src/protocol.rs:289-321,384-415` + PTY 宿主 `crates/farwork-agent/src/term.rs`），REST 两条 `POST /api/v2/connectors/{id}/terminals`（`crates/farwork-hub/src/routes/terminals.rs:45,85-173`，201 恰好五个键）与 `GET /api/v2/connectors/{id}/terminals/{terminalId}/stream`（同文件 `:46-49,224-383`，浏览器侧 `terminal.input`/`terminal.resize`/`terminal.close` ↔ `terminal.opened`/`terminal.data`/`terminal.exit`/`terminal.error`），迁移 `0003_terminals.sql`（`terminals` 表：`closed_at` 区分「已结束」与「从未存在」，`error_code`/`error_message` 让 agent 的拒绝原因活过它被报告的那一刻），Web 侧会话页终端面板（`apps/web/src/components/TerminalPanel.svelte`、`apps/web/src/lib/terminal.ts`、`apps/web/src/lib/api/workspace.ts:191-238`；xterm.js）。**入口是 connector 命名空间**，因此 `501` 表当时仍是 **49** 条：表里的 `/sessions/{id}/terminal*` 是会话命名空间的另一组，仍回 `501`。契约见 `docs/architecture.md` §5.11–§5.12。
+- **分享**：三条 REST —— `POST /sessions/{id}/shares`、`GET /public/shares/{id}`（**免鉴权**）、`DELETE /sessions/{id}/shares/{share_id}`（`crates/farwork-hub/src/routes/shares.rs`），迁移 `0004_shares.sql`（`snapshot_json` 存一次写死、`deleted_at` 软删）。语义：① 快照在 per-session engine mutex 内拍，所以永远是已提交 head；② 公开读只 `SELECT snapshot_json` 一列，条目走七键白名单（`id`/`type`/`status`/`role`/`content`/`orderSeq`/`itemTime`），`connectorId`/`workspacePath`/`cwd`/`sessionId`/`source`/`hash` 从不进快照；③ 免鉴权路由**单独 mount**，不在 `AuthedUser` 里；④ 删除是软删，公开读对已删的返回 `404`。契约与源码行号见 `docs/architecture.md` §3.8。
+- **诚实兜底更窄了**：`501` 表从 52 条减到 49 条（移出 interrupt / notices / notices respond 三条），分享交付后再减 2 条（`/sessions/{id}/shares`、`/sessions/{id}/shares/{*rest}`）→ 现在是 **47 条**；REST 与 ingress 两侧仍然「宁可变窄，不伪造成功」。
 - **Web 审批卡**（`apps/web/src/components/ApprovalCard.svelte`）：三个决定按钮 `approve` / `approve_for_session` / `reject`（`:75-93`）；点击后状态先落在「已下发，等待运行时确认」（`:24-35,101`），卡片变灰**只**取决于服务端 `notice.status === 'resolved'`（`:22,25`）；投递失败可点「重试」（`:96-97`）。
 - **Web 新建会话表单**（`apps/web/src/components/NewSessionPage.svelte`，路由 `#/new-session[/:projectId]`，`apps/web/src/lib/router.ts:26-53`）：一次填 connector + 项目 + runtime + 首条消息；`connectorResult.ok` 为真则跳进会话页（`NewSessionPage.svelte:93`），为假则如实显示「设备未连接：指令未下发」（`:105,213`）+ 返回码（`:222`）+ 已创建会话 id（`:218`）。
 - **Web 中断与状态原因**（`apps/web/src/components/SessionView.svelte`）：中断按钮不本地改状态，只显示「中断指令已下发（stream …），等待运行时回推状态更新」（`:116-119,135-137`）；会话 `statusReason` 单独一行「状态原因：…」（`:129-130`，例如 `connector disconnected`）。
@@ -89,7 +90,8 @@ connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终�
    10. **没有残留 PTY**：浏览器断开时 hub 补发 `terminal.close`、agent 侧 `close_all` 收掉全部 shell，进程退出后无孤儿 shell（`terminals.rs:369-381`；`term.rs:250-260,756`）。
    11. **201 不冒充成功**：响应终端对象恰好五个键、无 `status`；`201` 仅表示已落库 + 已下发（`terminals.rs:73-83,156-165`；`terminal_bridge.rs:439-446`）。
    口径以 `docs/architecture.md` §5.11–§5.12 为准。上表来自仓库所有者的真二进制手工验收（hub + 真 `farwork-agent`）；协议层与拒绝路径另有集成测试 `crates/farwork-hub/tests/terminal_bridge.rs`（假 connector + 真 PostgreSQL）逐条断言，行号见各条。**未覆盖的**：浏览器页面里手动敲字的手工记录没有留存（面板本身的构建验收同第 3 条）。
-6. **`session.message.clientMessageId` 契约缺陷已修复**：hub 无值时不发该键（`crates/farwork-hub/src/ingress.rs:324-346`，回归测试 `ingress::tests::session_message_frame_omits_an_absent_client_message_id`）、agent 收 `Option<String>` 兼容缺失与 `null`（`crates/farwork-agent/src/protocol.rs:192-200`，回归测试 `protocol::tests::session_message_parses_without_a_client_message_id`）、agent 本地生成 `cmid_<uuid>` 供 `turn/start`（`crates/farwork-agent/src/hub.rs:303-319`）。契约口径见 `docs/architecture.md` §5.4。
+6. **`session.message.clientMessageId` 契约缺陷已修复**：hub 无值时不发该键（`crates/farwork-hub/src/ingress.rs:346-368`，回归测试 `ingress::tests::session_message_frame_omits_an_absent_client_message_id`，`ingress.rs:774-793`）、agent 收 `Option<String>` 兼容缺失与 `null`（`crates/farwork-agent/src/protocol.rs:358-364`，回归测试 `protocol::tests::session_message_parses_without_a_client_message_id`，`protocol.rs:582-597`）、agent 本地生成 `cmid_<uuid>` 供 `turn/start`（`crates/farwork-agent/src/hub.rs:337-353`）。契约口径见 `docs/architecture.md` §5.4。
+7. **分享 9/9 通过（仓库所有者验收）**：`crates/farwork-hub/tests/shares.rs`（假 connector + 真 PostgreSQL）跑通整条旅程，逐项过：① 会话级分享 `201`、share id 形如 `shr_*`、`scope` 回 `session`（`shares.rs:296-311`）；② **公开读不带 Authorization 也 `200`**，`sessionTitle` 与条目数与创建时的 timeline 一致（`shares.rs:330-355`）；③ **快照不可变、逐字节相同**：分享之后往原会话再发一条消息，公开页读回的 items 与首次完全相同（`shares.rs:359-395`）；④ 消息级分享恰好一条（`shares.rs:430`）；未知 `messageId` → `404`、`scope:"message"` 缺 `messageId` → `422`、未知 `scope` → `422`（`shares.rs:316-325,443,453`）；⑤ **敏感字段零命中**：直接对**裸 body** 断言不含 `sessionId`/`source`/`runtime`/`contentHash`/`updatedSeq`/`connectorId`/`workspacePath` 等（`shares.rs:238-262,357,395`）；⑥ **陌生人对别人的会话建分享 → `404`**，同一账号读别人的 timeline 也是 `404`（`shares.rs:461-487`）；⑦ **免鉴权的公开读 `200`，但同一串垃圾 token 打私有端点仍 `401`**（`shares.rs:497-523`）；⑧ 未知 share id → `404`（`shares.rs:526-534`）；⑨ **删除后 `404`**：owner `DELETE` → `204` 且无 body，公开读 `404`，重复删除 `404`，同会话的另一个 share 仍可读（`shares.rs:536-602`）。
 
 ### 未验证（别当成已支持）
 
@@ -101,13 +103,13 @@ connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终�
 
 ### 已修复的契约缺陷（记下来，别改回去）
 
-`session.message.clientMessageId` 曾是「hub 发 `null`、agent 要求 `String`」：省略该字段的 REST 调用者会让这一轮被 agent 当畸形帧静默丢弃，而 hub 已回 `runtimeDispatched:true`（细节见 `docs/architecture.md` §5.4）。现在 `clientMessageId` 是**可选**字段：hub 无值时不发该键（`ingress.rs:324-346`）、agent 收 `Option<String>` 同时接受缺失与 `null`（`protocol.rs:192-200`）、hub 没给时 agent 本地生成 `cmid_<uuid>` 交给 `turn/start` 且不回落 hub（`hub.rs:303-319`）。两侧都不许收紧成必填——收紧就会重演整轮静默消失。
+`session.message.clientMessageId` 曾是「hub 发 `null`、agent 要求 `String`」：省略该字段的 REST 调用者会让这一轮被 agent 当畸形帧静默丢弃，而 hub 已回 `runtimeDispatched:true`（细节见 `docs/architecture.md` §5.4）。现在 `clientMessageId` 是**可选**字段：hub 无值时不发该键（`ingress.rs:346-368`）、agent 收 `Option<String>` 同时接受缺失与 `null`（`protocol.rs:358-364`）、hub 没给时 agent 本地生成 `cmid_<uuid>` 交给 `turn/start` 且不回落 hub（`hub.rs:337-353`）。两侧都不许收紧成必填——收紧就会重演整轮静默消失。
 
 ## M3 · 下一批（按此顺序）
 
 顺序的理由：后面每一项都依赖 ingress 提供的真实连接，先做 UI 只会做出假状态。
 
-原「1. Web 审批卡」「2. 新建会话表单」已交付（见上文「已交付」与「已验证」第 3 条）；其中原定验收项——用 `--runtime echo` 点批准直到卡片转已解决——**仍未留证据**，属于下一批要补的验证，不是要重做功能。文件浏览与设备终端都已交付并划掉（见下），剩下的顺序是**分享 → 管理台**。**未验证项不因划掉一项而消失**：codex 成功路径、`file_change` / `permissions` 两种 notice kind、审批卡在浏览器里的端到端证据，仍留在上面的「未验证」清单里。
+原「1. Web 审批卡」「2. 新建会话表单」已交付（见上文「已交付」与「已验证」第 3 条）；其中原定验收项——用 `--runtime echo` 点批准直到卡片转已解决——**仍未留证据**，属于下一批要补的验证，不是要重做功能。文件浏览、设备终端与分享都已交付并划掉（见下），**下一批只剩管理台**。**未验证项不因划掉一项而消失**：codex 成功路径、`file_change` / `permissions` 两种 notice kind、审批卡在浏览器里的端到端证据，仍留在上面的「未验证」清单里。
 
 ### ~~1. 文件浏览~~ —— **已交付**（只读，见上文「已交付」与「已验证」第 4 条）
 
@@ -121,9 +123,13 @@ connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终�
 - **cwd 沙箱只约束起始目录**：起点必须在 agent 的 `--workdir` 内（与文件浏览同一套判定），但 shell 起来之后是它自己的能力。**不要**对外承诺「终端被关在 workdir 里」。
 - 仍缺的部分：`farwork-server` 尚未退场（它仍是 M1 探针）；终端不持久化 scrollback、没有多路复用/接管别人已开的终端。
 
-### 1. 分享
+### ~~1. 分享~~ —— **已交付**（见上文「已交付」与「已验证」第 7 条）
 
-- `/sessions/{id}/shares*` 与 `/shares*`：只读/可写分享链接、过期与撤销。
+交付的是会话级 `POST /sessions/{id}/shares` + `DELETE /sessions/{id}/shares/{share_id}`、消息级（`scope:"message"`，只分享那一条）以及免鉴权的 `GET /public/shares/{id}`；**撤销 = 软删**（写 `deleted_at`，公开读随后 `404`）。与计划的差距，别当成已支持：
+
+- 账号级分享清单 `/shares`、`/shares/{*rest}` 仍回 `501`（这是原计划的「我的分享」列表）。
+- **过期（`expiresAt`）没有实现**：现在只有「发布」与「撤销」两个动作，没有 TTL。
+- 快照里不带附件：`allowedFileIds` 只是随 share 存了一份白名单，没有任何取附件的路由，所以今天一律为空。
 
 ### 2. 管理台
 

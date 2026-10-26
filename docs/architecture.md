@@ -13,7 +13,7 @@
         |   WS    /api/v2/sessions/{id}/ws?ticket=...
         v
  farwork-hub (:7300, axum)  --->  PostgreSQL (唯一状态来源)
-        |                          migrations/0001_init.sql + 0002_connector_ingress.sql，启动时自动应用
+        |                          migrations/0001_init.sql … 0004_shares.sql，启动时自动应用
         ^
         |   WS  /api/v2/connector/ws?token=...    (Ingress Protocol v1，见 §5)
         |   连接由设备侧主动发起（出站），hub 从不反向拨号
@@ -65,7 +65,7 @@
 
 ## 3. `/api/v2` 端点（已实现）
 
-`/api/v2` 下共 **42 个已实现的 method+path 组合**（不含 §5 单独记录的 `GET /connector/ws`），由 **35 次** `.route(...)` 注册（auth 5 + connectors 5 + fs 2 + projects 3 + sessions 11 + notices 3 + connector_ws 1 + terminals 2 + ws 3；`routes/mod.rs:18-30` 合并 10 个子 router，其中 `unsupported` 子 router 用宏注册 49 条 `501` 路径，见 §4）。另有 `GET /healthz` 挂在根（`lib.rs:33`）。
+`/api/v2` 下共 **46 个已实现的 method+path 组合**（**含** §5 单独记录的 `GET /connector/ws`；只数 §3 这几节是 45），由 **38 次** `.route(...)` 注册（auth 5 + connectors 5 + fs 2 + projects 3 + sessions 11 + notices 3 + shares 3 + connector_ws 1 + terminals 2 + ws 3 = 38；`routes/mod.rs:20-36` 合并 11 个模块、12 次 `.merge`——`shares` 贡献两个 router：认证面与公开面；其中 `unsupported` 子 router 用宏注册 47 条 `501` 路径，见 §4）。另有 `GET /healthz` 挂在根（`lib.rs:33,35`）。
 
 ### 3.1 认证 —— `routes/auth.rs`
 
@@ -107,19 +107,19 @@
 
 | 方法 | 路径 | 说明 | 源码 |
 | --- | --- | --- | --- |
-| `GET` | `/sessions` | 会话分页（不透明 `cursor`，按 `pinned/sort_at/updated_seq/id` 排序） | `sessions.rs:28,643-659` |
-| `POST` | `/sessions` | **导入**一个已存在于运行时的会话：必须带 `externalSessionId`（否则 422 提示改用 `create-and-start`）。导入会话只读（`takeover:false`） | `sessions.rs:28,458-514` |
-| `GET` | `/sessions/list` | 不分页的 dashboard 清单（行数上限 100，取 `pinned/sort_at/updated_seq/id` 序） | `sessions.rs:29,661-687` |
-| `POST` | `/sessions/create-and-start` | 建会话 + 落首条消息 + **下发 `session.start`**。首条用户消息随 `session.start` 的 `prompt` 走（此刻还没有流可以 `session.message`）；`runtime` 必须在允许集合内（`echo` 只在 `FARWORK_HUB_DEV_RUNTIMES` 里才放行，否则 422）。connector 不在线时仍回 201/200，但 `runtimeDispatched:false` + `connectorResult.code = connector_offline` | `sessions.rs:30,516-641` |
+| `GET` | `/sessions` | 会话分页（不透明 `cursor`，按 `pinned/sort_at/updated_seq/id` 排序） | `sessions.rs:28,649-665` |
+| `POST` | `/sessions` | **导入**一个已存在于运行时的会话：必须带 `externalSessionId`（否则 422 提示改用 `create-and-start`）。导入会话只读（`takeover:false`） | `sessions.rs:28,464-520` |
+| `GET` | `/sessions/list` | 不分页的 dashboard 清单（行数上限 100，取 `pinned/sort_at/updated_seq/id` 序） | `sessions.rs:29,667-693` |
+| `POST` | `/sessions/create-and-start` | 建会话 + 落首条消息 + **下发 `session.start`**。首条用户消息随 `session.start` 的 `prompt` 走（此刻还没有流可以 `session.message`）；`runtime` 必须在允许集合内（`echo` 只在 `FARWORK_HUB_DEV_RUNTIMES` 里才放行，否则 422）。connector 不在线时仍回 201/200，但 `runtimeDispatched:false` + `connectorResult.code = connector_offline` | `sessions.rs:30,522-647` |
 | `GET` | `/sessions/{session_id}/meta` | 会话元数据 | `sessions.rs:31-34` |
 | `PATCH` | `/sessions/{session_id}/meta` | 改标题/置顶/归档/takeover | `sessions.rs:31-34` |
-| `GET` | `/sessions/{session_id}/timeline` | 条目读接口，`mode=latest\|changes\|history` + `limit/afterSeq/beforeOrderSeq`。**客户端不得轮询**（见 AGENTS.md 4.3） | `sessions.rs:35,769-806` |
-| `GET` | `/sessions/{session_id}/snapshot` | 一次拿齐：会话 + runtime state + timeline 首页 + **真实 notices**（来自 `session_notices`）+ `eventCursor`。`approvals` 仍是空数组、`effectiveCapabilities`/`runtimeCapabilities` 仍是空集 `revision:0`（理由见 §5.10） | `sessions.rs:36,808-846` |
-| `GET` | `/sessions/{session_id}/events` | 事件补拉，`after=seq:N`；无法无缝续接时回 `snapshotRequired:true` | `sessions.rs:37,860-914` |
-| `GET` | `/sessions/{session_id}/runtime/state` | 运行时状态（无则 404）。M3 起由 connector 的 `session.state` / `session.exit` 真实驱动 | `sessions.rs:38-41,916-929` |
-| `GET` | `/sessions/{session_id}/runtime/capabilities` | 仍是空集 `revision:0`：Ingress Protocol v1 没有 capability 帧，没协商过就不编 | `sessions.rs:42-45,931-944` |
-| `POST` | `/sessions/{session_id}/runtime/messages` | 发消息：先落 timeline（`clientMessageId` 幂等，重复不重放），**提交之后**才向活跃流下发 `session.message`。要求会话可写：非归档且 `takeover`，否则 409。响应里的 `runtimeDispatched` 才是「是否真的投给了 agent」 | `sessions.rs:46-49,946-1032` |
-| `POST` | `/sessions/{session_id}/runtime/interrupt` | 下发 `session.interrupt`。没有活跃流 → 409 `session_not_running`；connector 不在线或 socket 已断 → 409 `connector_offline`。拿到 200 就意味着帧真的进了 socket | `sessions.rs:50-53,1044-1096` |
+| `GET` | `/sessions/{session_id}/timeline` | 条目读接口，`mode=latest\|changes\|history` + `limit/afterSeq/beforeOrderSeq`。**客户端不得轮询**（见 AGENTS.md 4.3） | `sessions.rs:35,775-812` |
+| `GET` | `/sessions/{session_id}/snapshot` | 一次拿齐：会话 + runtime state + timeline 首页 + **真实 notices**（来自 `session_notices`）+ `eventCursor`。`approvals` 仍是空数组、`effectiveCapabilities`/`runtimeCapabilities` 仍是空集 `revision:0`（理由见 §5.10） | `sessions.rs:36,814-852` |
+| `GET` | `/sessions/{session_id}/events` | 事件补拉，`after=seq:N`；无法无缝续接时回 `snapshotRequired:true` | `sessions.rs:37,866-920` |
+| `GET` | `/sessions/{session_id}/runtime/state` | 运行时状态（无则 404）。M3 起由 connector 的 `session.state` / `session.exit` 真实驱动 | `sessions.rs:38-41,922-935` |
+| `GET` | `/sessions/{session_id}/runtime/capabilities` | 仍是空集 `revision:0`：Ingress Protocol v1 没有 capability 帧，没协商过就不编 | `sessions.rs:42-45,937-950` |
+| `POST` | `/sessions/{session_id}/runtime/messages` | 发消息：先落 timeline（`clientMessageId` 幂等，重复不重放），**提交之后**才向活跃流下发 `session.message`。要求会话可写：非归档且 `takeover`，否则 409。响应里的 `runtimeDispatched` 才是「是否真的投给了 agent」 | `sessions.rs:46-49,952-1044` |
+| `POST` | `/sessions/{session_id}/runtime/interrupt` | 下发 `session.interrupt`。没有活跃流 → 409 `session_not_running`；connector 不在线或 socket 已断 → 409 `connector_offline`。拿到 200 就意味着帧真的进了 socket | `sessions.rs:50-53,1050-1093` |
 
 ### 3.5 文件浏览（connector 中继，只读） —— `routes/fs.rs`
 
@@ -158,7 +158,24 @@
 - **投递失败就报错**：connector 不在线或 socket 已断 → `409 connector_offline`，审批保持 `open`。浏览器点了按钮不等于 agent 收到了决定。
 - **状态机**：非 `open` 的 notice 再 respond → `409 notice_already_resolved`；未知 notice → `409 notice_not_found`；`decision` 不在三值内 → 422。
 
-### 3.8 WebSocket —— `routes/ws.rs`
+### 3.8 分享 —— `routes/shares.rs`
+
+| 方法 | 路径 | 鉴权 | 说明 | 源码 |
+| --- | --- | --- | --- | --- |
+| `POST` | `/sessions/{session_id}/shares` | Bearer | body `{"scope":"session"\|"message", "messageId"?, "allowedFileIds"?}`。成功 `201` 回 `{share:{id, scope, urlPath, createdAt}, serverTime}`；`urlPath` 是 `/api/v2/public/shares/{id}`——**能真正取到内容的那个路径**，不是前端页面路由 | `shares.rs:47,110-186` |
+| `GET` | `/public/shares/{share_id}` | **无** | 公开读：`{share:{id, scope, sessionTitle, createdAt, timeline:{items}}, serverTime}`。行不存在或已软删 → `404 share not found` | `shares.rs:57,191-220` |
+| `DELETE` | `/sessions/{session_id}/shares/{share_id}` | Bearer | 软删（写 `deleted_at`），成功 `204` 且**无 body**；重复删除、别人的 share、别人的会话 → 一律 `404`（不是 `403`：不让调用者探测别人的会话存在） | `shares.rs:48-51,222-246` |
+
+四条语义（这张表的全部理由）：
+
+- **① 快照在 per-session engine mutex 内拍，所以永远是已提交 head**：`capture_items` 直接调 `TimelineHub::snapshot`（`shares.rs:256-275`），它走 `locked()` 拿**同一把**每会话 `SessionEngine` 互斥锁（`timeline.rs:68,84-94,103-113`）——`write_message` / `apply_runtime_item` 的「apply + persist」握着同一把锁。所以分享里不可能出现「已进 engine 但还没写进 `timeline_items`」的条目，也不会拍到半截的写入。
+- **② 公开读只 `SELECT snapshot_json` 一列，条目走白名单**：`SHARE_COLUMNS = "id, scope, snapshot_json, created_at"`（`shares.rs:42`），`user_id`/`session_id`/`message_id` **根本不出库**；条目由 `shared_item` 按白名单组装成七个键 `id`/`type`/`status`/`role`/`content`/`orderSeq`/`itemTime`（`shares.rs:282-312`）。**白名单而不是删字段**：`sessionId`/`source`/`contentHash`/`updatedSeq`/`revision` 从来没被复制进 `snapshot_json`，`connectorId`/`workspacePath`/`cwd` 也从来没进过，所以泄露在**结构上**不可能发生，而不是「记得别写进去」。键集合被单测钉死：`a_shared_item_carries_only_the_public_whitelist`（`shares.rs:350-376`）断言恰好这七个键。
+- **③ 免鉴权路由是单独 mount 的，不在 `AuthedUser` 里**：`public_router()` 只注册 `GET /public/shares/{share_id}`（`shares.rs:56-58`），handler 的提取器里**没有** `AuthedUser`（`shares.rs:191-194`），由 `routes/mod.rs:30-32` 单独 `.merge` 进来。公开面不是「容忍错误的 token」，而是根本没有鉴权提取器——所以 `Authorization: not-a-real-token` 的公开读照样 `200`，同一串垃圾 token 打 `/sessions/{id}/snapshot` 仍然 `401`（`tests/shares.rs:494-523`）。
+- **④ 删除是软删（`deleted_at`），公开读对已删的返回 `404`**：`DELETE` 只 `update shares set deleted_at = ...`（`shares.rs:231-244`），公开读的查询恒带 `and deleted_at is null`（`shares.rs:314-321`）。于是「撤销过的链接」与「从未存在的 id」回**同一个 404**，不给「这个 id 曾经有效过」这条探测面。
+
+**空 timeline 的分享按上游口径 `422 there is no content to share`**（`shares.rs:136-140`）：宁可拒绝，也不发一个空页面——对访客来说那看起来就是 bug。配套两条：`scope:"message"` 必须给 `messageId`（缺失 `422`、不在本会话 `404`，`shares.rs:120-133,266-273`），`scope` 是闭集 `session|message`（其他值 `422`，`shares.rs:66-75,119`）。快照自带 `version`/`sessionTitle`/`eventCursor`（`shares.rs:142-147`），所以公开读不必回表查会话。
+
+### 3.9 WebSocket —— `routes/ws.rs`
 
 | 方法 | 路径 | 说明 | 源码 |
 | --- | --- | --- | --- |
@@ -166,7 +183,7 @@
 | `GET` | `/dashboard/ws` | 总览流：connectors / projects / 会话状态 | `ws.rs:34,292-320`（socket 循环 `398-420`） |
 | `GET` | `/sessions/{session_id}/ws` | 会话事件流：先发 `session.subscribed`，随后增量；15s keepalive | `ws.rs:35,159-291` |
 
-### 3.9 `GET /healthz`（不在 `/api/v2` 下）
+### 3.10 `GET /healthz`（不在 `/api/v2` 下）
 
 ```json
 {"status":"ok","version":"0.1.0"}
@@ -174,27 +191,29 @@
 
 源码：`crates/farwork-hub/src/lib.rs:33,45-48`。
 
-## 4. `501 not_implemented`：**49 条路径**
+## 4. `501 not_implemented`：**47 条路径**
 
-`crates/farwork-hub/src/routes/unsupported.rs:19-77` 用一个宏注册了 49 条路径，全部 `any(not_implemented)`，返回 `501` 且 body 里带 `"METHOD /path is not implemented in this build"`；未注册的其余路径落到 `unknown_path` → `404`（`unsupported.rs:78,81-105`）。
+`crates/farwork-hub/src/routes/unsupported.rs:19-78` 用一个宏注册了 47 条路径，全部 `any(not_implemented)`，返回 `501` 且 body 里带 `"METHOD /path is not implemented in this build"`（`unsupported.rs:82-90`）；未注册的其余路径落到 `unknown_path` → `404`（`unsupported.rs:79,92-100`）。
 
 M3 从这张表里**移出了 3 条**并改为真实实现：`/sessions/{id}/runtime/interrupt`（§3.4）、`/sessions/{id}/runtime/notices` 与 `/sessions/{id}/runtime/notices/{notice_id}/respond`（§3.7）。移出这 3 条不等于那组都补齐了：steer / commands / selections / catalogs / sync / takeover 仍在表里。
 
-**文件浏览的真实端点不在本表**：交付的是 connector 命名空间下的 `POST /connectors/{id}/fs/list` 与 `/fs/readText`（§3.5，`routes/fs.rs`）；本表里的 `/sessions/{id}/files*` 是另一套（会话命名空间下的文件接口，写操作归它，尚未实现），仍回 `501`。所以这条计数**仍是 49**：M3 只从表里移出过 interrupt / notices / notices respond 三条，文件浏览的入口从一开始就是另一组路径。
+**分享又移出 2 条，49 → 47**：`/sessions/{id}/shares`（`POST`）与 `/sessions/{id}/shares/{*rest}`（其中 `DELETE .../{share_id}`）已由 `routes/shares.rs` 真实实现（§3.8），所以表里只剩账号级的 `/shares` 与 `/shares/{*rest}`。公开读 `GET /public/shares/{id}` **从来不在本表**——它的前缀是 `/public/...` 而不是 `/shares*`，是这一批新加的一条路径，不是从 501 里移出来的。
 
-**设备终端同理**：交付的是 connector 命名空间的 `POST /connectors/{id}/terminals` 与 `GET /connectors/{id}/terminals/{terminal_id}/stream`（§3.6、§5.11–§5.12）；本表里的 `/sessions/{id}/terminal` 与 `/sessions/{id}/terminal/{*rest}` 是会话命名空间的另一组，**仍回 `501`**。所以终端交付同样没有改这个数字：**还是 49**。
+**文件浏览的真实端点不在本表**：交付的是 connector 命名空间下的 `POST /connectors/{id}/fs/list` 与 `/fs/readText`（§3.5，`routes/fs.rs`）；本表里的 `/sessions/{id}/files*` 是另一套（会话命名空间下的文件接口，写操作归它，尚未实现），仍回 `501`。文件浏览的交付因此没有动过这个数字：它的入口从一开始就是另一组路径（这几轮里真正从这个数字上移走的只有 interrupt / notices / notices respond 三条，以及分享的两条）。
+
+**设备终端同理**：交付的是 connector 命名空间的 `POST /connectors/{id}/terminals` 与 `GET /connectors/{id}/terminals/{terminal_id}/stream`（§3.6、§5.11–§5.12）；本表里的 `/sessions/{id}/terminal` 与 `/sessions/{id}/terminal/{*rest}` 是会话命名空间的另一组，**仍回 `501`**。所以终端交付同样没有改这个数字。
 
 | 分组 | 路径（方法不限） |
 | --- | --- |
 | 会话运行时控制（steer / commands / selections / catalogs / sync / takeover） | `/sessions/{id}/runtime/steer`、`/runtime/commands`、`/runtime/selections`、`/runtime/catalogs/{catalog}`、`/sessions/{id}/sync`、`/sessions/{id}/takeover` |
 | 终端 / 会话文件接口（**与已交付的 connector 文件浏览不是同一组**，见上方说明） | `/sessions/{id}/terminal`、`/sessions/{id}/terminal/{*rest}`、`/sessions/{id}/files`、`/sessions/{id}/files/{*rest}` |
-| 分享 | `/sessions/{id}/shares`、`/sessions/{id}/shares/{*rest}`、`/shares`、`/shares/{*rest}` |
+| 分享（**只剩账号级清单**：会话级 create/delete 与公开读已实现，见 §3.8） | `/shares`、`/shares/{*rest}` |
 | 批量会话维护 | `/sessions/archive`、`/sessions/unarchive`、`/sessions/read` |
 | 设备运行时管理 | `/connectors/{id}/runtimes`、`/connectors/{id}/runtimes/{*rest}`、`/connectors/{id}/protocol/capabilities`、`/connectors/{id}/pairing`、`/runtimes`、`/runtimes/{*rest}`、`/devices`、`/devices/{*rest}` |
 | OAuth / 邮件码 / 移动端扫码登录 | `/auth/oauth/start|callback|finalize`、`/auth/mobile-login/{qr,exchange,refresh,request,status,confirm}`、`/auth/email-code`、`/auth/change-password`、`/auth/me/email|profile|avatar` |
 | 实例管理 / 公告 / agents / usage / 配对 | `/admin`、`/admin/{*rest}`、`/announcements`、`/announcements/{*rest}`、`/agents`、`/agents/{*rest}`、`/pairing`、`/pairing/{*rest}`、`/usage`、`/usage/{*rest}` |
 
-另有一处**带内** `501`：`POST /sessions/{id}/runtime/messages` 携带非空 `attachments` 时返回 `501 attachments are not implemented in this build`（`sessions.rs:865-873`）——拒绝好过静默丢弃附件。
+另有一处**带内** `501`：`POST /sessions/{id}/runtime/messages` 携带非空 `attachments` 时返回 `501 attachments are not implemented in this build`（`sessions.rs:971-979`）——拒绝好过静默丢弃附件。
 
 ## 5. Connector Ingress（M3）：Ingress Protocol v1
 
@@ -226,7 +245,7 @@ hub 侧类型是 `crates/farwork-hub/src/ingress.rs:460-547` 的 `ConnectorFrame
 | `item.upsert` | `streamId`, `item: {id, type, status, role?, content, itemTime}` | 交给 timeline 的 `apply_runtime_item`：`{type,status,role,content}` 哈希去重，未变更不提交也不广播；未知 `type`/`status`/`role` 报错，**不强转** |
 | `notice.upsert` | `streamId`, `notice: {id, kind, status?, title?, body?, options?}` | upsert 进 `session_notices`（同 id 可被细化 title/options），广播 `runtime.notice.updated` |
 | `notice.resolved` | `noticeId`, `decision`（**无** `streamId`） | 按 `id` + 「该 connector 拥有的会话」定位，写 `status='resolved'` 与 `decision`，广播 `runtime.notice.updated` 和整份 `runtime.notice.snapshot` |
-| `fs.response` | `requestId`, `ok`, `op?`, `path?`, `entries?`, `sizeBytes?`, `content?`, `truncated?`, `error?` | 交给 `FsRelay` 按 `requestId` 配给等待中的 REST 请求，**不走流路由**（`ConnectorFrame::stream_id()` 对它返回 `None`，`ingress.rs:470-471`）。三种形态（list 成功 / readText 成功 / 失败）见 §5.5 |
+| `fs.response` | `requestId`, `ok`, `op?`, `path?`, `entries?`, `sizeBytes?`, `content?`, `truncated?`, `error?` | 交给 `FsRelay` 按 `requestId` 配给等待中的 REST 请求，**不走流路由**（`ConnectorFrame::stream_id()` 对它返回 `None`，`ingress.rs:562`）。三种形态（list 成功 / readText 成功 / 失败）见 §5.5 |
 | `terminal.opened` | `terminalId` | 按 `terminalId` 路由（**不是** `streamId`）：`termrelay.mark_opened` 记住「这个终端已经起过」，并向已挂着的浏览器推 `{"type":"terminal.opened"}`；没人订阅时只记 debug（`connector_ws.rs:500-514`） |
 | `terminal.data` | `terminalId`, `data`（standard padded base64） | 原样转发给该终端的浏览器 socket，hub **不解码不重编码**；没有订阅者就丢弃并记 debug（`connector_ws.rs:516-529`） |
 | `terminal.exit` | `terminalId`, `code`（**键恒在，可为 `null`**） | 转发 `{type:"terminal.exit", code}` 后关通道并 `close_terminal` 落 `closed_at`（`connector_ws.rs:531-543`） |
@@ -235,34 +254,34 @@ hub 侧类型是 `crates/farwork-hub/src/ingress.rs:460-547` 的 `ConnectorFrame
 
 ### 5.3 下行（hub → connector）
 
-hub 用 `ingress.rs:308-443` 的**十一个**构造函数产出帧（设备终端四个：`terminal_open_frame` / `terminal_data_frame` / `terminal_resize_frame` / `terminal_close_frame`，`ingress.rs:385-432`）；agent 用 `protocol.rs:333-422` 的 `ServerFrame` 解析（解码入口 `parse_server_frame`，`protocol.rs:448`；未知 `type` 与畸形 payload 的区分在 `protocol.rs:432-474`）。
+hub 用 `ingress.rs:308-440` 的**十一个**构造函数产出帧（设备终端四个：`terminal_open_frame` / `terminal_data_frame` / `terminal_resize_frame` / `terminal_close_frame`，`ingress.rs:388-432`）；agent 用 `protocol.rs:333-422` 的 `ServerFrame` 解析（解码入口 `parse_server_frame`，`protocol.rs:448`；未知 `type` 与畸形 payload 的区分在 `protocol.rs:432-474`）。
 
 | `type` | wire 字段 | agent 侧行为 | hub 何时发 |
 | --- | --- | --- | --- |
 | `welcome` | `serverVersion`, `heartbeatSecs` | 握手完成；心跳间隔取 `max(heartbeatSecs,1)` | 握手成功后 |
-| `session.start` | `streamId`, `sessionId`, `runtime`, `cwd`, `prompt` | 校验 `runtime` 与本进程 `--runtime` 一致（不一致 → `error` + `session.exit{code:2}`，绝不冒充别的运行时）；一致则 spawn `codex app-server --stdio` 并回 `session.started` | `POST /sessions/create-and-start`（`sessions.rs:615-641`） |
+| `session.start` | `streamId`, `sessionId`, `runtime`, `cwd`, `prompt` | 校验 `runtime` 与本进程 `--runtime` 一致（不一致 → `error` + `session.exit{code:2}`，绝不冒充别的运行时）；一致则 spawn `codex app-server --stdio` 并回 `session.started` | `POST /sessions/create-and-start`（`sessions.rs:621-647`） |
 | `session.message` | `streamId`, `text`, `clientMessageId`（**可选**：hub 无值时不发该键；agent 必须能解析缺失与 `null`） | 追加到该流的 codex 线程（`turn/start`），`clientMessageId` 缺失时本地生成 `cmid_<uuid>` 当幂等键；无该流 → `error` | `POST /sessions/{id}/runtime/messages`，且仅当该会话有活跃流 |
 | `session.interrupt` | `streamId` | 映射成 codex `turn/interrupt`；`turn/completed{status:"interrupted"}` 把在跑条目收成 `interrupted` | `POST /sessions/{id}/runtime/interrupt` |
 | `notice.respond` | `noticeId`, `decision`（**无** `streamId`，与上行同形） | 在所有 live worker 里按 noticeId 找提示并回 JSON-RPC result；找不到只 warn | `POST .../notices/{id}/respond` |
-| `fs.request` | `requestId`, `op`, `path` | 按 `op`（`list` / `readText`）在**阻塞线程池**里应答，回一条同 `requestId` 的 `fs.response`；沙箱外一律 `permission_denied`（§5.6），没有沙箱时也 `permission_denied`（`hub.rs:382-406`） | `POST /connectors/{id}/fs/list`、`POST /connectors/{id}/fs/readText`（`routes/fs.rs:120-124`） |
-| `terminal.open` | `terminalId`, `cols`, `rows`, `cwd?`, `shell?` | 用 `--workdir` 沙箱校验 `cwd` 后起 shell（`term.rs:148-190,275-287`）；成功回 `terminal.opened`，失败回 `terminal.error`。`cwd`/`shell` 缺省时 hub **不发这两个键**（`ingress.rs:385-409`），agent 缺省语义是 `--workdir` / `--shell` / `$SHELL` | `POST /connectors/{id}/terminals`（`terminals.rs:133-139`） |
+| `fs.request` | `requestId`, `op`, `path` | 按 `op`（`list` / `readText`）在**阻塞线程池**里应答，回一条同 `requestId` 的 `fs.response`；沙箱外一律 `permission_denied`（§5.6），没有沙箱时也 `permission_denied`（`hub.rs:453-480`） | `POST /connectors/{id}/fs/list`、`POST /connectors/{id}/fs/readText`（`routes/fs.rs:120-124`） |
+| `terminal.open` | `terminalId`, `cols`, `rows`, `cwd?`, `shell?` | 用 `--workdir` 沙箱校验 `cwd` 后起 shell（`term.rs:148-190,275-287`）；成功回 `terminal.opened`，失败回 `terminal.error`。`cwd`/`shell` 缺省时 hub **不发这两个键**（`ingress.rs:388-411`），agent 缺省语义是 `--workdir` / `--shell` / `$SHELL` | `POST /connectors/{id}/terminals`（`terminals.rs:133-139`） |
 | `terminal.data` | `terminalId`, `data` | base64 解码后写进 PTY master（按字节，不断言 UTF-8）；不是合法 base64 就丢帧并 warn，未知 terminalId 只记 debug（`hub.rs:415-427`） | 浏览器 `terminal.input` |
 | `terminal.resize` | `terminalId`, `cols`, `rows` | `pty.resize`；越界在 hub 侧已拒，未知 terminalId 只记 debug（`hub.rs:429-437`；`term.rs:310-314`） | 浏览器 `terminal.resize` |
 | `terminal.close` | `terminalId` | 杀掉该 shell 并回收其线程/资源（`hub.rs:439-443`） | 浏览器 `terminal.close`；以及浏览器 socket 结束时 hub 补发一发，免得 PTY 变孤儿（`terminals.rs:372-378`） |
 | `error` | `message`, `streamId?` | 只记日志，**不断连** | 无法路由的入站帧、心跳超时、被新连接顶替 |
 
-**未知 `type` 必须丢帧不断连**：agent 的 `parse_server_frame` 把「未知类型」与「已知类型但 payload 不合法」分开（`protocol.rs:242-266`），前者 debug 后丢弃、后者 warn 后丢弃，socket 都不关。
+**未知 `type` 必须丢帧不断连**：agent 的 `parse_server_frame` 把「未知类型」与「已知类型但 payload 不合法」分开（`protocol.rs:443-474`），前者 debug 后丢弃、后者 warn 后丢弃，socket 都不关。
 
 ### 5.4 `clientMessageId` 是可选字段（曾静默丢整轮，故两侧都必须宽容）
 
-**当前契约**（三处已同改，见 `ingress.rs:324-346`、`protocol.rs:186-200`、`hub.rs:303-319`）：
+**当前契约**（三处已同改，见 `ingress.rs:346-368`、`protocol.rs:352-364`、`hub.rs:337-353`）：
 
-- **hub 侧：可选字段**。`session_message_frame(stream_id, text, client_message_id: Option<&str>)` 在无值时**不输出 `clientMessageId` 键**，而不是序列化成 `null`（`ingress.rs:337-346`）。测试 `ingress::tests::session_message_frame_omits_an_absent_client_message_id`（`ingress.rs:586-604`）断言该键不存在、编码结果里不含这串字面量、键数恰为 `type`/`streamId`/`text` 三个。
-- **agent 侧：`Option<String>`**。`ServerFrame::SessionMessage.client_message_id` 带 `#[serde(default, rename = "clientMessageId", skip_serializing_if = "Option::is_none")]`，因此**缺失、`null`、字符串三种都能解析**（`protocol.rs:192-200`）；测试 `protocol::tests::session_message_parses_without_a_client_message_id`（`protocol.rs:372-385`）以及 `session_message_parses_a_present_client_message_id`（含 `null` 分支，`protocol.rs:388-406`）。
-- **agent 自造本地 id**：hub 未提供 id 时，agent 生成 `cmid_<uuid>` 交给 codex 的 `turn/start` 当它自己的幂等键；该 id **不回落 hub**，timeline 幂等仍只由 `unique (session_id, client_message_id)` 保证（§4.5；`hub.rs:303-319`）。
+- **hub 侧：可选字段**。`session_message_frame(stream_id, text, client_message_id: Option<&str>)` 在无值时**不输出 `clientMessageId` 键**，而不是序列化成 `null`（`ingress.rs:356-368`）。测试 `ingress::tests::session_message_frame_omits_an_absent_client_message_id`（`ingress.rs:774-793`）断言该键不存在、编码结果里不含这串字面量、键数恰为 `type`/`streamId`/`text` 三个。
+- **agent 侧：`Option<String>`**。`ServerFrame::SessionMessage.client_message_id` 带 `#[serde(default, rename = "clientMessageId", skip_serializing_if = "Option::is_none")]`，因此**缺失、`null`、字符串三种都能解析**（`protocol.rs:358-364`）；测试 `protocol::tests::session_message_parses_without_a_client_message_id`（`protocol.rs:582-597`）以及 `session_message_parses_a_present_client_message_id`（含 `null` 分支，`protocol.rs:599-618`）。
+- **agent 自造本地 id**：hub 未提供 id 时，agent 生成 `cmid_<uuid>` 交给 codex 的 `turn/start` 当它自己的幂等键；该 id **不回落 hub**，timeline 幂等仍只由 `unique (session_id, client_message_id)` 保证（§4.5；`hub.rs:337-353`）。
 - **契约结论**：`clientMessageId` 在 ingress 上是**可选**字段；hub 无值时不发该键；agent **必须**同时能解析「缺失」与 `null`。
 
-**为什么两侧都要宽容（踩过的坑，别改回去）**：这个缺陷真的发生过 —— hub 曾序列化 `"clientMessageId": null`，agent 曾要求必填 `String`，serde 报错后这一帧被 `parse_server_frame` 归入 `Malformed` 并丢弃（`hub.rs:237-239` 只 warn），而 hub 已经把这一轮落库并回了 `runtimeDispatched:true` —— 界面显示「已发送」，运行时毫无动静。省略该字段的 REST 调用者必踩；Web UI 恒发 `cmid-<uuid>`（`apps/web/src/lib/session.svelte.ts:194`），所以页面当时没暴露。经验：**下游可能不传的字段，上游必须能省、下游必须能缺；任一侧收紧成必填都会让整轮静默消失**。
+**为什么两侧都要宽容（踩过的坑，别改回去）**：这个缺陷真的发生过 —— hub 曾序列化 `"clientMessageId": null`，agent 曾要求必填 `String`，serde 报错后这一帧被 `parse_server_frame` 归入 `Malformed` 并丢弃（`hub.rs:268-277` 只 warn），而 hub 已经把这一轮落库并回了 `runtimeDispatched:true` —— 界面显示「已发送」，运行时毫无动静。省略该字段的 REST 调用者必踩；Web UI 恒发 `cmid-<uuid>`（`apps/web/src/lib/session.svelte.ts:194`），所以页面当时没暴露。经验：**下游可能不传的字段，上游必须能省、下游必须能缺；任一侧收紧成必填都会让整轮静默消失**。
 
 其余差异都是「hub 比 agent 宽松」，不构成破坏，但说明「hub 接受」不等于「契约要求」：
 
@@ -273,14 +292,14 @@ hub 用 `ingress.rs:308-443` 的**十一个**构造函数产出帧（设备终�
 | `session.started.externalSessionId` | 必填 `String` | `Option<String>` |
 | `session.exit.code` | 必填 `i32` | `Option<i64>`，缺失按 0 处理 |
 | `item.itemTime` | 必发（agent 自己的钟） | `Option<String>` 且**只收不用**：排序一律用 hub 的 `orderSeq`，绝不用它排序或盖时间戳 |
-| `notice.resolved.streamId` | 不发 | 接受并忽略（`ingress.rs:405-417`），因为该帧契约上无 `streamId` |
+| `notice.resolved.streamId` | 不发 | 接受并忽略（`ingress.rs:500-507`），因为该帧契约上无 `streamId` |
 | `notice.upsert.status/title/body/options` | 必发（`status` 恒为 `open`） | 全部可选，缺省 `open`/空串/`null`/`[]` |
 
 ### 5.5 文件浏览：`fs.request` / `fs.response`
 
-hub 侧：构造 `ingress.rs:365-372`、解析 `ingress.rs:448-449,476-531`、配对 `crates/farwork-hub/src/fsrelay.rs`；agent 侧：类型 `protocol.rs:110-240`、下行解析 `protocol.rs:344-350`、应答 `crates/farwork-agent/src/hub.rs:382-406`、沙箱 `crates/farwork-agent/src/fsops.rs`。
+hub 侧：构造 `ingress.rs:376-383`、解析 `ingress.rs:448-456,583-638`、配对 `crates/farwork-hub/src/fsrelay.rs`；agent 侧：类型 `protocol.rs:110-240`、下行解析 `protocol.rs:377-383`、应答 `crates/farwork-agent/src/hub.rs:453-480`、沙箱 `crates/farwork-agent/src/fsops.rs`。
 
-`op` 是**闭集两个**：`list` / `readText`（`ingress.rs:36-44`；`protocol.rs:110-117`）。第三种拼写是坏帧，agent 拒绝而不是猜——加第三个 op 是契约变更，必须三处同改。
+`op` 是**闭集两个**：`list` / `readText`（`ingress.rs:35-36,53-55`；`protocol.rs:110-117`）。第三种拼写是坏帧，agent 拒绝而不是猜——加第三个 op 是契约变更，必须三处同改。
 
 **下行 `fs.request`（hub → connector）**
 
@@ -321,13 +340,13 @@ hub 侧：构造 `ingress.rs:365-372`、解析 `ingress.rs:448-449,476-531`、�
 | --- | --- | --- |
 | `requestId` / `ok` | 三种形态 | `ok` 是成功与失败的唯一判别 |
 | `op` / `path` | 两个成功形态 | `path` 是**规范化之后**的路径；list 返回的 `path` 就是下一层的入参 |
-| `entries[]` | 仅 list 成功 | 每项 `{name, path, kind, sizeBytes, modifiedAt}`；`kind` 闭集 `file`/`dir`（`protocol.rs:119-125`）且**必填**——浏览器按它决定能不能点进去，缺了算坏帧而不是「默认是文件」；`sizeBytes`/`modifiedAt` 在 hub 侧可缺省（按 `0`/`""` 兜底，`ingress.rs:476-490`），agent 恒发全字段 |
+| `entries[]` | 仅 list 成功 | 每项 `{name, path, kind, sizeBytes, modifiedAt}`；`kind` 闭集 `file`/`dir`（`protocol.rs:119-125`）且**必填**——浏览器按它决定能不能点进去，缺了算坏帧而不是「默认是文件」；`sizeBytes`/`modifiedAt` 在 hub 侧可缺省（按 `0`/`""` 兜底，`ingress.rs:591-596`），agent 恒发全字段 |
 | `content` / `sizeBytes` / `truncated` | 仅 readText 成功 | `truncated` **实际恒为 `false`**（`protocol.rs:213-215`）：超限一律 `too_large`，不给「短了却自称完整」的内容；`sizeBytes` 是字节数，不是字符数 |
 | `error{code,message}` | 仅失败 | `code` 闭集 `not_found` / `permission_denied` / `io_error` / `too_large`（`protocol.rs:138-147`）；失败帧不带 `op`/`path`/`entries`/`content` |
 
 **配对、超时与错误映射**（hub 侧）：
 
-- **按 `requestId` 配对，不按流**：`fs.response` 没有 `streamId`，`ConnectorFrame::stream_id()` 对它返回 `None`（`ingress.rs:470-471`）；回包被交到 `FsRelay` 里挂着的那条 oneshot（`fsrelay.rs:47-62`）。正因如此，多个文件请求可以共用同一条 socket。
+- **按 `requestId` 配对，不按流**：`fs.response` 没有 `streamId`，`ConnectorFrame::stream_id()` 对它返回 `None`（`ingress.rs:562`）；回包被交到 `FsRelay` 里挂着的那条 oneshot（`fsrelay.rs:47-62`）。正因如此，多个文件请求可以共用同一条 socket。
 - **只有收到请求的那台设备能回**：`deliver` 校验条目上的 `connector_id`，不符返回 `WrongConnector` 并只 warn（`fsrelay.rs:64-83`；`connector_ws.rs:470`）。契约不依赖「UUID 猜不到」——一台设备不能替另一台回包。
 - **三条退出路径都清条目**：回包、超时、断连，谁先到谁删；没人回答的请求不会泄漏（`fsrelay.rs:1-6,87-100`）。
 - **10 秒超时 → `504 code=fs_timeout`**：`FS_RESPONSE_TIMEOUT = Duration::from_secs(10)`（`fs.rs:24-25`）。超时先 `abandon` 条目再回 504，迟到的回包被当 `Unknown` 丢掉（`fs.rs:134-145`；`fsrelay.rs:22-28`）。设备卡住不能把浏览器一起卡住。
@@ -338,12 +357,12 @@ hub 侧：构造 `ingress.rs:365-372`、解析 `ingress.rs:448-449,476-531`、�
 
 hub 只转发路径，**边界全部在 agent 侧**（模块头注释 `crates/farwork-agent/src/fsops.rs:1-8`）：
 
-- **根 = `--workdir`**：连接前 `Sandbox::new(opts.workdir)` 对根 `canonicalize()` 一次（`hub.rs:62-66`；`fsops.rs:61-66`）。`--workdir` 缺省取进程当前目录，随后同样 `canonicalize`；非绝对路径直接启动失败（退出码 1，`main.rs:54-65`）。
+- **根 = `--workdir`**：连接前 `Sandbox::new(opts.workdir)` 对根 `canonicalize()` 一次（`hub.rs:69-80`；`fsops.rs:61-66`）。`--workdir` 缺省取进程当前目录，随后同样 `canonicalize`；非绝对路径直接启动失败（退出码 1，`main.rs:54-65`）。
 - **判定方式**：请求路径必须非空且为绝对路径（否则 `permission_denied`）→ `fs::canonicalize`（**跟符号链接**）→ 对**路径组件**做 `starts_with(root)`（`fsops.rs:73-92`）。三类逃逸因此全部被拒：
   - **符号链接**指向根外：解析后落在根外 → `permission_denied`（单测 `a_symlink_pointing_outside_the_root_is_refused`，`fsops.rs:403-425`）
   - **`../` 上跳**：同理（`fsops.rs:337-380`）
   - **前缀陷阱**：`/srv/work-evil` 不是 `/srv/work` 的下级——比较按组件而不是字符串前缀（`fsops.rs:84-90,381-402`）
-- **workdir 不可解析 → 一律拒绝，绝不退化**：`canonicalize` 失败时 agent 不建沙箱、只记一条 warn（`hub.rs:62-70`），此后每个 `fs.request` 都回 `permission_denied`（`fsops.rs:187-191`；`hub.rs:389-397`）。宁可整个文件浏览不可用，也不放开成「读这台机器的一切」。
+- **workdir 不可解析 → 一律拒绝，绝不退化**：`canonicalize` 失败时 agent 不建沙箱、只记一条 warn（`hub.rs:70-80`），此后每个 `fs.request` 都回 `permission_denied`（`fsops.rs:187-191`；`hub.rs:465-471`）。宁可整个文件浏览不可用，也不放开成「读这台机器的一切」。
 - **单文件 1 MiB 上限**：`MAX_READ_BYTES = 1024 * 1024`（`fsops.rs:17-20`）；读前按 `metadata.len()` 判、读完再按实际字节数复判（文件可能在两次检查之间变大），超限都是 `too_large` 而不是截断（`fsops.rs:144-158`）。目录当文件读 → `io_error`；非 UTF-8 → `io_error`（`fsops.rs:145-166`）。
 - **列表只列一层**：目录在前、文件在后，各按名字排序（`fsops.rs:133-137`）；单个条目 stat / 读取失败只 warn 跳过，不让整次 list 崩掉。条目按 OS 报告的目录项元数据填，**不额外做越界过滤**——真正的边界在每次打开时重跑 `resolve`，所以列表里看得见的符号链接，进去照样被拒。
 
@@ -356,7 +375,7 @@ hub 只转发路径，**边界全部在 agent 侧**（模块头注释 `crates/fa
 ### 5.8 hub 不做乐观 resolve；断连必须收敛
 
 - `POST .../notices/{id}/respond` 只下发 `notice.respond`，响应里 `status` 仍是 `open`；`resolved` 只由 connector 的 `notice.resolved` 写入（§3.7）。hub 抢先置 `resolved` 的话，一旦投递失败就会留下「已批准但没人执行」的假状态。
-- socket 一结束就 `abandon_connector_streams`：关掉该 connector 全部未关流，把对应会话的 `session_runtime_states.status` 与 `sessions.status` 一起标 `error`（`status_reason = "connector disconnected"`）再广播（`ingress.rs:207-247`；`connector_ws.rs:167-193`）。**在途流收敛成显式 error，而不是静默丢弃。**
+- socket 一结束就 `abandon_connector_streams`：关掉该 connector 全部未关流，把对应会话的 `session_runtime_states.status` 与 `sessions.status` 一起标 `error`（`status_reason = "connector disconnected"`）再广播（`ingress.rs:229-268`；`connector_ws.rs:167-193`）。**在途流收敛成显式 error，而不是静默丢弃。**
 - 同理 `POST runtime/messages`：没有活跃流就只落库并回 `runtimeDispatched:false`，不会假装派发。
 
 ### 5.9 codex 集成的真实边界
@@ -379,15 +398,16 @@ agent 不实现 agent 逻辑，只做协议翻译：一个 `session.start` = 一
 - `runtime/capabilities` 仍是空集：Ingress Protocol v1 没有 capability 帧，没协商过就不编。
 - steer / takeover 仍然没有 ingress 帧；文件只有**只读**的 `fs.request` / `fs.response`（§5.5），写操作没有帧。这些 REST 仍在 `501` 表里（§4）。
 - 设备终端**已有**真实帧（§5.11–§5.12），入口是 connector 命名空间的 `/connectors/{id}/terminals*`；`501` 表里的 `/sessions/{id}/terminal*` 是会话命名空间的另一组，仍然 `501`（§4）。
+- **分享（§3.8）没有新增任何 ingress 帧**：快照读的是 timeline 已有的投影，出口只有 REST 与那条免鉴权的公开读。所以它既不依赖 connector 在线，也不受 `snapshot.approvals` / capabilities 这两个空缺影响。
 - codex 的**成功路径**（assistant 文本增量、工具执行、真实审批往返）在本机未验证：没有 Codex 凭据。见 `docs/roadmap.md` 的 M3。
 
 ### 5.11 设备终端帧（Ingress Protocol v1.2，本仓实现）
 
-设备终端是 ingress v1 之上**新增的一组帧**（迁移头注释写的版本就是 v1.2：`migrations/0003_terminals.sql:1`）。hub 半边：构造 `ingress.rs:385-432`、入站解析 `ingress.rs:510-540`、按 `terminalId` 路由 `ingress.rs:551-581`、socket 循环里分发 `routes/connector_ws.rs:497-560`；agent 半边：类型 `protocol.rs:289-321,384-415`、PTY 宿主 `crates/farwork-agent/src/term.rs`、帧分发 `hub.rs:385-443`。
+设备终端是 ingress v1 之上**新增的一组帧**（迁移头注释写的版本就是 v1.2：`migrations/0003_terminals.sql:1`）。hub 半边：构造 `ingress.rs:388-432`、入站解析 `ingress.rs:510-547`、按 `terminalId` 路由 `ingress.rs:551-581`、socket 循环里分发 `routes/connector_ws.rs:497-560`；agent 半边：类型 `protocol.rs:289-327,384-421`、PTY 宿主 `crates/farwork-agent/src/term.rs`、帧分发 `hub.rs:279-451`。
 
 **`terminalId` 由 hub 铸**：裸 UUID v4、无前缀（`ids.rs:53-57`），浏览器 / hub / agent 全程只用这一个 id 寻址。**帧按 `terminalId` 路由，不按 `streamId`**：`ConnectorFrame::stream_id()` 对这四帧返回 `None`，`terminal_id()` 才是路由键（`ingress.rs:551-581`）；一条 connector socket 同时承载这台设备的所有终端。
 
-**下行 hub → agent**（hub 构造 `ingress.rs:385-432`；agent 解析 `protocol.rs:384-415`）
+**下行 hub → agent**（hub 构造 `ingress.rs:388-432`；agent 解析 `protocol.rs:384-421`）
 
 | `type` | wire 字段 | 必填 | 说明 |
 | --- | --- | --- | --- |
@@ -401,7 +421,7 @@ agent 不实现 agent 逻辑，只做协议翻译：一个 `session.start` = 一
 {"type":"terminal.open","terminalId":"1f0c…","cols":120,"rows":40,"cwd":"/srv/work/sub","shell":"/bin/bash"}
 ```
 
-**上行 agent → hub**（agent 构造 `protocol.rs:289-321` / `term.rs:68-74,319-334`；hub 解析 `ingress.rs:510-540`）
+**上行 agent → hub**（agent 构造 `protocol.rs:289-327` / `term.rs:68-74,319-334`；hub 解析 `ingress.rs:510-547`）
 
 | `type` | wire 字段 | 必填 | 说明 |
 | --- | --- | --- | --- |
@@ -419,12 +439,12 @@ agent 不实现 agent 逻辑，只做协议翻译：一个 `session.start` = 一
 
 四条约定（都踩过或差点踩，别改成「看起来更顺手」的版本）：
 
-- **`terminal.open` 的 `cwd` / `shell` 缺省时 hub 不发键，不是发 `null`**：`terminal_open_frame` 只在 `Some` 时插入这两个键（`ingress.rs:385-409`），agent 侧是 `Option<String>` + `#[serde(default)]`（`protocol.rs:384-397`），所以「缺失」与 `null` 都能收。这和 §5.4 的 `clientMessageId` 是同一条教训：**下游可能不传的字段，上游必须能省**；把缺省序列化成 `null` 只是换一种拼法，任何一侧的严格实现都会把它当畸形。
-- **`terminal.exit.code` 恒带键、可为 `null`**：agent 侧是 `Option<i32>` 且**不加** `skip_serializing_if`（`protocol.rs:302-310`；`None` 来自信号终止或 `wait()` 失败，`term.rs:319-334`）；hub 侧收 `Option<i64>` + `#[serde(default)]`，对缺失也宽容（`ingress.rs:522-529`）——**发的时候严格，收的时候宽容**。省略 `code` 会让「信号终止」有第二种拼法，浏览器就得多判一次。
+- **`terminal.open` 的 `cwd` / `shell` 缺省时 hub 不发键，不是发 `null`**：`terminal_open_frame` 只在 `Some` 时插入这两个键（`ingress.rs:388-411`），agent 侧是 `Option<String>` + `#[serde(default)]`（`protocol.rs:384-397`），所以「缺失」与 `null` 都能收。这和 §5.4 的 `clientMessageId` 是同一条教训：**下游可能不传的字段，上游必须能省**；把缺省序列化成 `null` 只是换一种拼法，任何一侧的严格实现都会把它当畸形。
+- **`terminal.exit.code` 恒带键、可为 `null`**：agent 侧是 `Option<i32>` 且**不加** `skip_serializing_if`（`protocol.rs:302-314`；`None` 来自信号终止或 `wait()` 失败，`term.rs:319-334`）；hub 侧收 `Option<i64>` + `#[serde(default)]`，对缺失也宽容（`ingress.rs:522-529`）——**发的时候严格，收的时候宽容**。省略 `code` 会让「信号终止」有第二种拼法，浏览器就得多判一次。
 - **`data` 一律 standard 字母表 + `=` padding 的 base64，按字节**：agent 出站直接从读缓冲编码、入站直接解码进 master，整条路径不假设 UTF-8（`term.rs:10-11`；`READ_CHUNK = 8192`，`term.rs:36-38`）；hub 只校验、不重写（`terminals.rs:487-492`）。一次「hub 顺手解码再编码」就是第二份独立实现的 bug 源头。
 - **尺寸界两侧同一个上界**：`MIN_TERMINAL_DIMENSION = 1`、`MAX_TERMINAL_DIMENSION = 2000`、判定 `is_valid_terminal_size`（`ingress.rs:41-47`）；agent 侧 `MAX_DIMENSION = 2000` + `checked_size`（`term.rs:32-34,387-392`）。越界一律拒绝（`invalid_size`），不 clamp：60000 列的屏幕没人能渲染。
 
-**`terminal.error` 是为 ingress 新增的一帧（原契约没有它）**：M1 的 connector 链路（附录 A.2）只有 `open/opened/data/resize/exit/close`，没有 error 帧——只有浏览器侧的 `/ws/client`（附录 A.3）才有 `terminal.error`。ingress 若照抄 M1 的 connector 帧集合，「cwd 越界」「PTY 起不来」就只能表现为静默或裸断连：浏览器分不清「终端没起来」和「设备掉了」，而这正是最需要说清楚的一件事。所以 agent 侧补了同名帧并如实上报（`protocol.rs:311-321`、`term.rs:67-74`），hub 反过来也解析它（`ingress.rs:530-540`）。agent 的错误码是**闭集**：`permission_denied` / `invalid_size` / `invalid_terminal` / `already_open` / `spawn_failed`（`term.rs:40-46`），hub 原样透传（`connector_ws.rs:545-556`）；乱造一个码，浏览器无法据以行动（重开？放弃？）。
+**`terminal.error` 是为 ingress 新增的一帧（原契约没有它）**：M1 的 connector 链路（附录 A.2）只有 `open/opened/data/resize/exit/close`，没有 error 帧——只有浏览器侧的 `/ws/client`（附录 A.3）才有 `terminal.error`。ingress 若照抄 M1 的 connector 帧集合，「cwd 越界」「PTY 起不来」就只能表现为静默或裸断连：浏览器分不清「终端没起来」和「设备掉了」，而这正是最需要说清楚的一件事。所以 agent 侧补了同名帧并如实上报（`protocol.rs:315-327`、`term.rs:67-74`），hub 反过来也解析它（`ingress.rs:530-540`）。agent 的错误码是**闭集**：`permission_denied` / `invalid_size` / `invalid_terminal` / `already_open` / `spawn_failed`（`term.rs:40-46`），hub 原样透传（`connector_ws.rs:545-556`）；乱造一个码，浏览器无法据以行动（重开？放弃？）。
 
 ### 5.12 浏览器侧：终端 REST + WS
 
@@ -523,9 +543,9 @@ hub 侧的对应行为：`routes/sessions.rs:766-812` —— `after` 不可解�
 
 ## 7. 持久化
 
-- 迁移文件 **3 个**：`crates/farwork-hub/migrations/0001_init.sql` + `0002_connector_ingress.sql`（M3 ingress）+ `0003_terminals.sql`（设备终端）。启动时由 `db::migrate` 通过 `sqlx::migrate!("./migrations")` 应用，sqlx 自带 ledger，重复启动是 no-op（`db.rs:17-22`；`main.rs` 的启动序列）。
-- **11 张表**（`create table` 计数）：0001 的 `users`、`app_settings`、`connectors`、`projects`、`sessions`、`session_runtime_states`、`timeline_items`、`ws_tickets`，加 0002 的 `session_streams`、`session_notices`，加 0003 的 `terminals`。后三张的存在理由见 §5.7：一张让 `streamId` 跨 hub 重启存活，一张让审批跨刷新存活，`terminals` 让「终端已结束 / 从未存在」可区分并让 agent 的拒绝原因活过它被报告的那一刻（列含 `closed_at`、`error_code`、`error_message`，`0003_terminals.sql:13-29`）。
-- **14 个索引**（0001 十个 + 0002 两个 + 0003 两个），其中四条是语义承载点：
+- 迁移文件 **4 个**：`crates/farwork-hub/migrations/0001_init.sql` + `0002_connector_ingress.sql`（M3 ingress）+ `0003_terminals.sql`（设备终端）+ `0004_shares.sql`（分享）。启动时由 `db::migrate` 通过 `sqlx::migrate!("./migrations")` 应用，sqlx 自带 ledger，重复启动是 no-op（`db.rs:17-22`；`main.rs` 的启动序列）。
+- **12 张表**（`create table` 计数）：0001 的 `users`、`app_settings`、`connectors`、`projects`、`sessions`、`session_runtime_states`、`timeline_items`、`ws_tickets`，加 0002 的 `session_streams`、`session_notices`，加 0003 的 `terminals`，加 0004 的 `shares`（`snapshot_json` 存一次写死的快照、`deleted_at` 是软删，见 §3.8）。后三张的存在理由见 §5.7：一张让 `streamId` 跨 hub 重启存活，一张让审批跨刷新存活，`terminals` 让「终端已结束 / 从未存在」可区分并让 agent 的拒绝原因活过它被报告的那一刻（列含 `closed_at`、`error_code`、`error_message`，`0003_terminals.sql:13-29`）。
+- **15 个索引**（0001 十个 + 0002 两个 + 0003 两个 + 0004 一个），其中四条是语义承载点：
   - `uq_timeline_items_client_message`：`unique (session_id, client_message_id)`（`0001_init.sql:132`）——`clientMessageId` 幂等的**唯一**保证。
   - `idx_timeline_items_session_updated_seq` / `_session_order_seq`：游标补拉与展示排序的查询路径（`0001_init.sql:129-130`）。
   - `idx_session_notices_id`：`notice.resolved` 只带 notice id，解析时先按 id 找行、再校验它属于发帧的 connector（`0002_connector_ingress.sql:37-39`）。
@@ -534,7 +554,7 @@ hub 侧的对应行为：`routes/sessions.rs:766-812` —— `after` 不可解�
 
 ## 8. 测试的前置条件（`crates/farwork-hub/tests/`）
 
-`crates/farwork-hub/tests/` 下四个集成测试都跑真实 PostgreSQL：`e2e.rs`（M2 纵向切片）、`connector_ingress.rs`（ingress 上下行）、`fs_bridge.rs`（文件浏览中继）、`terminal_bridge.rs`（设备终端中继）。下面以 `e2e.rs` 为例：
+`crates/farwork-hub/tests/` 下五个集成测试都跑真实 PostgreSQL：`e2e.rs`（M2 纵向切片）、`connector_ingress.rs`（ingress 上下行）、`fs_bridge.rs`（文件浏览中继）、`terminal_bridge.rs`（设备终端中继）、`shares.rs`（分享快照与公开读）。下面以 `e2e.rs` 为例：
 
 - `TEST_DATABASE_URL` **未设置** → 打印 `SKIP farwork-hub integration test: TEST_DATABASE_URL is not set.` 并附上怎么设置，然后 `return`（`e2e.rs:127-134`）。测试仍然是「通过」的——这就是 CI 必须提供数据库的原因。
 - `TEST_DATABASE_URL` 为空串 → 打印 `SKIP farwork-hub integration test: TEST_DATABASE_URL is empty.` 并返回（`e2e.rs:135-138`）。
