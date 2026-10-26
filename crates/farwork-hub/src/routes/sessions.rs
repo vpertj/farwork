@@ -56,6 +56,11 @@ pub fn router() -> Router<AppState> {
 /// Runtime names advertised by upstream protocol 1.0.
 const RUNTIMES: [&str; 5] = ["codex", "claude", "opencode", "acp", "dsh"];
 
+/// Comma-separated extra runtime names appended to the allowlist. Exists so a
+/// real hub binary can be smoke-tested end to end against a runtime that is not
+/// part of the shipped protocol set (e.g. `--runtime echo`). Dev/test only.
+pub const DEV_RUNTIMES_ENV: &str = "FARWORK_HUB_DEV_RUNTIMES";
+
 pub const SESSION_COLUMNS: &str =
     "id, user_id, connector_id, project_id, runtime, runtime_id, origin,
             external_session_id, title, title_source, cwd, status, takeover, pinned, pinned_at,
@@ -67,13 +72,53 @@ const RUNTIME_STATE_COLUMNS: &str = "session_id, runtime, external_session_id, s
             selections_json, status_reason, error_json, metadata_json, updated_seq,
             created_at, updated_at";
 
+fn parse_runtime_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn dev_extra_runtimes() -> Vec<String> {
+    parse_runtime_list(&std::env::var(DEV_RUNTIMES_ENV).unwrap_or_default())
+}
+
+/// The effective allowlist: the protocol set plus whatever dev-only extras are
+/// live. Parameterized so tests never have to touch process env.
+fn allowed_runtimes(extra: &[String]) -> Vec<String> {
+    let mut allowed: Vec<String> = RUNTIMES.iter().map(|name| (*name).to_string()).collect();
+    for name in extra {
+        if !allowed.iter().any(|known| known == name) {
+            allowed.push(name.clone());
+        }
+    }
+    allowed
+}
+
+fn runtime_allowed(runtime: &str, extra: &[String]) -> bool {
+    allowed_runtimes(extra).iter().any(|name| name == runtime)
+}
+
 fn validate_runtime(runtime: &str) -> ApiResult<()> {
-    if RUNTIMES.contains(&runtime) {
+    if runtime_allowed(runtime, &dev_extra_runtimes()) {
         Ok(())
     } else {
         Err(ApiError::unprocessable(format!(
             "unknown runtime {runtime:?}"
         )))
+    }
+}
+
+/// One WARN at startup when the dev escape hatch is armed, so an operator can
+/// never enable extra runtimes silently.
+pub fn warn_if_dev_runtimes_enabled() {
+    let extra = dev_extra_runtimes();
+    if !extra.is_empty() {
+        tracing::warn!(
+            "dev-only runtimes enabled: {} (never set {DEV_RUNTIMES_ENV} in production)",
+            extra.join(",")
+        );
     }
 }
 
@@ -1087,8 +1132,41 @@ mod tests {
 
     #[test]
     fn runtime_validation_matches_protocol_names() {
-        assert!(validate_runtime("codex").is_ok());
-        assert!(validate_runtime("dsh").is_ok());
-        assert!(validate_runtime("gpt").is_err());
+        let none: Vec<String> = Vec::new();
+        assert!(runtime_allowed("codex", &none));
+        assert!(runtime_allowed("dsh", &none));
+        assert!(!runtime_allowed("gpt", &none));
+    }
+
+    #[test]
+    fn default_allowed_runtimes_exclude_echo() {
+        let allowed = allowed_runtimes(&[]);
+        assert_eq!(allowed, RUNTIMES.map(str::to_string).to_vec());
+        assert!(!allowed.contains(&String::from("echo")));
+        assert!(!runtime_allowed("echo", &[]));
+    }
+
+    #[test]
+    fn dev_runtimes_are_appended_to_the_allowlist() {
+        let extra = vec![String::from("echo")];
+        let allowed = allowed_runtimes(&extra);
+        assert!(allowed.contains(&String::from("echo")));
+        assert!(runtime_allowed("echo", &extra));
+        assert_eq!(allowed.len(), RUNTIMES.len() + 1);
+        // A dev extra must never shrink the protocol set or duplicate a name.
+        for name in RUNTIMES {
+            assert!(allowed.contains(&String::from(name)));
+        }
+        let idempotent = allowed_runtimes(&[String::from("codex"), String::from("echo")]);
+        assert_eq!(idempotent.len(), RUNTIMES.len() + 1);
+    }
+
+    #[test]
+    fn dev_runtime_env_list_is_trimmed_and_skips_blanks() {
+        assert_eq!(
+            parse_runtime_list(" echo , codex ,, "),
+            vec![String::from("echo"), String::from("codex")]
+        );
+        assert!(parse_runtime_list("").is_empty());
     }
 }

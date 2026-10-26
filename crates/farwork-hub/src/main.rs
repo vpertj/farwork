@@ -33,6 +33,8 @@ async fn run() -> anyhow::Result<()> {
         config = config.with_port_override(port);
     }
 
+    farwork_hub::routes::sessions::warn_if_dev_runtimes_enabled();
+
     let pool = db::connect(&config).await?;
     db::migrate(&pool).await?;
     let state = AppState::new(config.clone(), pool);
