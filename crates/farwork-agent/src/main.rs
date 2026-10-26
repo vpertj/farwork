@@ -84,6 +84,7 @@ async fn run() -> Result<()> {
         runtime: cli.runtime,
         workdir,
         codex_bin: cli.codex_bin,
+        shell: cli.shell,
         once: cli.once,
     };
     Connector::new(options, identity).run().await

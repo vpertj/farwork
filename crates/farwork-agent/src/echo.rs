@@ -187,6 +187,10 @@ mod tests {
                 ClientFrame::Heartbeat { .. } => "heartbeat",
                 ClientFrame::Hello { .. } => "hello",
                 ClientFrame::FsResponse(_) => "fs.response",
+                ClientFrame::TerminalOpened { .. } => "terminal.opened",
+                ClientFrame::TerminalData { .. } => "terminal.data",
+                ClientFrame::TerminalExit { .. } => "terminal.exit",
+                ClientFrame::TerminalError { .. } => "terminal.error",
             })
             .collect()
     }

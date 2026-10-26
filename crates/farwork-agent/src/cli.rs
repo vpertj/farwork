@@ -41,6 +41,8 @@ pub struct Cli {
     pub runtime: RuntimeKind,
     pub once: bool,
     pub codex_bin: String,
+    /// Shell override for device terminals, instead of $SHELL.
+    pub shell: Option<String>,
     pub show_help: bool,
     pub show_version: bool,
 }
@@ -55,6 +57,7 @@ impl Default for Cli {
             runtime: RuntimeKind::Codex,
             once: false,
             codex_bin: String::from(DEFAULT_CODEX_BIN),
+            shell: None,
             show_help: false,
             show_version: false,
         }
@@ -86,6 +89,7 @@ OPTIONS:
     --name <name>        Device display name (default: host name)
     --workdir <path>     Default working directory for sessions
     --runtime <kind>     codex | echo (default: codex)
+    --shell <path>       Shell for device terminals (default: $SHELL)
     --once               Connect once, then exit instead of reconnecting
     -h, --help           Print this help
     -V, --version        Print the version
@@ -117,6 +121,7 @@ pub fn parse(
                 cli.runtime = RuntimeKind::parse(&raw).ok_or(CliError::UnknownRuntime(raw))?;
             }
             "--codex-bin" => codex_bin = Some(value("--codex-bin")?),
+            "--shell" => cli.shell = Some(value("--shell")?),
             "--once" => cli.once = true,
             "-h" | "--help" => cli.show_help = true,
             "-V" | "--version" => cli.show_version = true,
@@ -225,6 +230,7 @@ mod tests {
         assert_eq!(cli.hub, "ws://127.0.0.1:7300");
         assert_eq!(cli.runtime, RuntimeKind::Codex);
         assert_eq!(cli.codex_bin, "codex");
+        assert_eq!(cli.shell, None, "an absent --shell falls back to SHELL");
         assert!(!cli.once);
         assert_eq!(cli.token, None);
     }
@@ -246,6 +252,8 @@ mod tests {
                 "--once",
                 "--codex-bin",
                 "/opt/codex",
+                "--shell",
+                "/bin/bash",
             ]),
             &no_env,
         )
@@ -257,6 +265,7 @@ mod tests {
         assert_eq!(cli.runtime, RuntimeKind::Echo);
         assert!(cli.once);
         assert_eq!(cli.codex_bin, "/opt/codex");
+        assert_eq!(cli.shell.as_deref(), Some("/bin/bash"));
     }
 
     #[test]

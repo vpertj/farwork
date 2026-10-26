@@ -133,6 +133,8 @@ struct Inner {
     connectors: crate::ingress::ConnectorRegistry,
     /// In-flight `fs.request` waits, keyed by the requestId the hub minted.
     fs_relay: crate::fsrelay::FsRelay,
+    /// Live terminals: connector frames in, browser stream sockets out.
+    term_relay: crate::termrelay::TerminalRelay,
 }
 
 #[derive(Clone)]
@@ -152,6 +154,7 @@ impl AppState {
                 timelines: crate::timeline::TimelineHub::new(),
                 connectors: crate::ingress::ConnectorRegistry::new(),
                 fs_relay: crate::fsrelay::FsRelay::new(),
+                term_relay: crate::termrelay::TerminalRelay::new(),
             }),
         }
     }
@@ -185,5 +188,10 @@ impl AppState {
     /// In-flight file requests waiting for a connector's reply.
     pub fn fs_relay(&self) -> &crate::fsrelay::FsRelay {
         &self.inner.fs_relay
+    }
+
+    /// Open terminals and their browser subscribers.
+    pub fn term_relay(&self) -> &crate::termrelay::TerminalRelay {
+        &self.inner.term_relay
     }
 }

@@ -174,6 +174,23 @@ async fn run_connector_socket(state: AppState, mut socket: WebSocket, connector:
         );
     }
 
+    // Every PTY this connector was streaming died with the socket. Each waiting
+    // browser is told so and each row is closed, so a terminal cannot be resumed
+    // against a device that is gone.
+    match crate::routes::terminals::abandon_connector_terminals(&state, &connector.id).await {
+        Ok(closed) if closed > 0 => tracing::warn!(
+            connector_id = %connector.id,
+            terminals = closed,
+            "connector disconnected with terminals open"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            connector_id = %connector.id,
+            detail = ?error.detail,
+            "cannot close the connector's abandoned terminals"
+        ),
+    }
+
     // The connector's runtimes died with this socket, so their streams are closed
     // here whether or not a newer connection already took over the route.
     match ingress::abandon_connector_streams(&state, &connector.id).await {
@@ -475,6 +492,73 @@ async fn apply_frame(
                     "dropped an fs.response that nothing was waiting for"
                 ),
             }
+            Ok(())
+        }
+        // ------------------------------------------------------- device terminals
+        // A terminal frame is routed by terminalId, never by streamId: one
+        // connector socket carries every terminal of that device at once.
+        ConnectorFrame::TerminalOpened { terminal_id } => {
+            // The flag goes first: a browser socket that subscribes in between
+            // must see either already_opened or this frame, never neither.
+            state.term_relay().mark_opened(&terminal_id);
+            if !state
+                .term_relay()
+                .publish(&terminal_id, &json!({ "type": "terminal.opened" }))
+            {
+                tracing::warn!(
+                    connector_id = %connector.id,
+                    %terminal_id,
+                    "terminal.opened for a terminal nothing is attaching to"
+                );
+            }
+            Ok(())
+        }
+        ConnectorFrame::TerminalData { terminal_id, data } => {
+            // Verbatim, exactly like the other direction: decoding here would make
+            // the hub a second implementation of the contract's base64.
+            if !state.term_relay().publish(
+                &terminal_id,
+                &json!({ "type": "terminal.data", "data": data }),
+            ) {
+                tracing::debug!(
+                    connector_id = %connector.id,
+                    %terminal_id,
+                    "dropped terminal.data nobody is watching"
+                );
+            }
+            Ok(())
+        }
+        ConnectorFrame::TerminalExit { terminal_id, code } => {
+            state.term_relay().publish(
+                &terminal_id,
+                &json!({ "type": "terminal.exit", "code": code }),
+            );
+            // Retiring the channel ends the browser socket: it drains the exit
+            // frame first, then sees the channel close.
+            state.term_relay().close(&terminal_id);
+            crate::routes::terminals::close_terminal(state, &terminal_id)
+                .await
+                .map_err(err)?;
+            Ok(())
+        }
+        ConnectorFrame::TerminalError {
+            terminal_id,
+            message,
+            code,
+        } => {
+            // The agent refused or could not start the shell; the browser must
+            // learn why instead of waiting for output that will never come.
+            let code = code.unwrap_or_else(|| String::from("terminal_error"));
+            state.term_relay().publish(
+                &terminal_id,
+                &crate::routes::terminals::terminal_error(message.clone(), &code),
+            );
+            state.term_relay().close(&terminal_id);
+            // The reason is persisted, not only published: a browser that attaches
+            // a moment later must still learn why the terminal never opened.
+            crate::routes::terminals::fail_terminal(state, &terminal_id, &code, &message)
+                .await
+                .map_err(err)?;
             Ok(())
         }
         ConnectorFrame::Error { message, stream_id } => {

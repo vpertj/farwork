@@ -8,6 +8,7 @@ pub mod fs;
 pub mod notices;
 pub mod projects;
 pub mod sessions;
+pub mod terminals;
 pub mod unsupported;
 pub mod ws;
 
@@ -24,6 +25,7 @@ pub fn api() -> Router<AppState> {
         .merge(notices::router())
         .merge(projects::router())
         .merge(sessions::router())
+        .merge(terminals::router())
         .merge(ws::router())
         .merge(unsupported::router())
 }

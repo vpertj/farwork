@@ -50,6 +50,12 @@ pub fn request_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// Device terminal id. The contract spells this "<uuid>" and the hub is the only
+/// side that mints it, so it is a UUID rather than one of the prefixed ids.
+pub fn terminal_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 /// Connector device credential (`cxt_` prefix, 32 random bytes).
 pub fn connector_token() -> String {
     format!("cxt_{}", token_urlsafe(32))

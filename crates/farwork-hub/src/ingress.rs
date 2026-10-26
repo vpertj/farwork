@@ -35,6 +35,17 @@ pub const RUNTIME_STATES: [&str; 4] = ["running", "idle", "waiting_approval", "e
 /// File-browsing operations the hub may ask a connector for.
 pub const FS_OPS: [&str; 2] = ["list", "readText"];
 
+/// Terminal dimensions the hub accepts, in both directions. The agent refuses
+/// the same range: the hub refuses first so the browser gets a 422 instead of a
+/// stream that dies on its first frame.
+pub const MIN_TERMINAL_DIMENSION: u16 = 1;
+pub const MAX_TERMINAL_DIMENSION: u16 = 2000;
+
+pub fn is_valid_terminal_size(cols: u16, rows: u16) -> bool {
+    (MIN_TERMINAL_DIMENSION..=MAX_TERMINAL_DIMENSION).contains(&cols)
+        && (MIN_TERMINAL_DIMENSION..=MAX_TERMINAL_DIMENSION).contains(&rows)
+}
+
 /// Failure codes an `fs.response` may carry. `routes::fs` maps each one to an
 /// HTTP status; an unlisted code is reported as 502 rather than guessed at.
 pub const FS_ERROR_CODES: [&str; 4] = ["not_found", "permission_denied", "io_error", "too_large"];
@@ -371,6 +382,55 @@ pub fn fs_request_frame(request_id: &str, op: &str, path: &str) -> Value {
     })
 }
 
+/// `terminal.open`. `cwd` and `shell` are omitted when absent — never
+/// serialized as null — because the agent reads an absent key as "use the
+/// workdir / $SHELL".
+pub fn terminal_open_frame(
+    terminal_id: &str,
+    cols: u16,
+    rows: u16,
+    cwd: Option<&str>,
+    shell: Option<&str>,
+) -> Value {
+    let mut frame = json!({
+        "type": "terminal.open",
+        "terminalId": terminal_id,
+        "cols": cols,
+        "rows": rows,
+    });
+    let map = frame.as_object_mut().expect("object literal");
+    if let Some(cwd) = cwd {
+        map.insert(String::from("cwd"), Value::String(cwd.to_string()));
+    }
+    if let Some(shell) = shell {
+        map.insert(String::from("shell"), Value::String(shell.to_string()));
+    }
+    frame
+}
+
+/// `terminal.data`. `data` is forwarded verbatim in both directions: the hub
+/// never decodes or re-encodes a PTY byte.
+pub fn terminal_data_frame(terminal_id: &str, data: &str) -> Value {
+    json!({
+        "type": "terminal.data",
+        "terminalId": terminal_id,
+        "data": data,
+    })
+}
+
+pub fn terminal_resize_frame(terminal_id: &str, cols: u16, rows: u16) -> Value {
+    json!({
+        "type": "terminal.resize",
+        "terminalId": terminal_id,
+        "cols": cols,
+        "rows": rows,
+    })
+}
+
+pub fn terminal_close_frame(terminal_id: &str) -> Value {
+    json!({ "type": "terminal.close", "terminalId": terminal_id })
+}
+
 pub fn notice_respond_frame(notice_id: &str, decision: &str) -> Value {
     json!({
         "type": "notice.respond",
@@ -447,6 +507,37 @@ pub enum ConnectorFrame {
     },
     #[serde(rename = "fs.response")]
     FsResponse(IngressFsResponse),
+    #[serde(rename = "terminal.opened")]
+    TerminalOpened {
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+    },
+    #[serde(rename = "terminal.data")]
+    TerminalData {
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+        /// Standard base64 with padding, relayed byte-for-byte.
+        data: String,
+    },
+    #[serde(rename = "terminal.exit")]
+    TerminalExit {
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+        /// Absent or null both mean "no exit code" (signal death, unknown).
+        #[serde(default)]
+        code: Option<i64>,
+    },
+    /// The terminal never came up: the agent refused the cwd, or the shell could
+    /// not be spawned. Relayed to the browser as `terminal.error`.
+    #[serde(rename = "terminal.error")]
+    TerminalError {
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+        #[serde(default)]
+        message: String,
+        #[serde(default)]
+        code: Option<String>,
+    },
     #[serde(rename = "error")]
     Error {
         message: String,
@@ -469,6 +560,22 @@ impl ConnectorFrame {
             }
             // `fs.response` is paired by requestId, not routed by stream.
             Self::FsResponse(_) | Self::Hello { .. } | Self::Heartbeat { .. } => None,
+            // Terminal frames are routed by terminalId, which is not a stream.
+            Self::TerminalOpened { .. }
+            | Self::TerminalData { .. }
+            | Self::TerminalExit { .. }
+            | Self::TerminalError { .. } => None,
+        }
+    }
+
+    /// The terminal this frame belongs to, when it has one.
+    pub fn terminal_id(&self) -> Option<&str> {
+        match self {
+            Self::TerminalOpened { terminal_id }
+            | Self::TerminalData { terminal_id, .. }
+            | Self::TerminalExit { terminal_id, .. }
+            | Self::TerminalError { terminal_id, .. } => Some(terminal_id),
+            _ => None,
         }
     }
 }
@@ -827,6 +934,129 @@ mod tests {
         };
         let input = item.to_input().expect("valid");
         assert_eq!(input.status, ItemStatus::WaitingApproval);
+    }
+
+    #[test]
+    fn terminal_open_frame_carries_only_the_contract_fields() {
+        let frame = terminal_open_frame("t1", 80, 24, None, None);
+        assert_eq!(frame["type"], "terminal.open");
+        assert_eq!(frame["terminalId"], "t1");
+        assert_eq!(frame["cols"], 80);
+        assert_eq!(frame["rows"], 24);
+        // Absent stays absent: the agent reads a missing cwd as "the workdir" and
+        // a missing shell as "$SHELL". Null would be a third spelling.
+        assert!(frame.get("cwd").is_none());
+        assert!(frame.get("shell").is_none());
+        assert_eq!(
+            frame.as_object().expect("object").keys().count(),
+            4,
+            "expected exactly type/terminalId/cols/rows: {frame}"
+        );
+
+        let with_options = terminal_open_frame("t1", 100, 30, Some("/w/sub"), Some("/bin/bash"));
+        assert_eq!(with_options["cwd"], "/w/sub");
+        assert_eq!(with_options["shell"], "/bin/bash");
+    }
+
+    #[test]
+    fn terminal_data_resize_and_close_frames_are_verbatim() {
+        let data = terminal_data_frame("t1", "AAEC/w==");
+        assert_eq!(data["type"], "terminal.data");
+        assert_eq!(data["terminalId"], "t1");
+        assert_eq!(
+            data["data"], "AAEC/w==",
+            "base64 is relayed, never re-encoded"
+        );
+        assert_eq!(data.as_object().expect("object").keys().count(), 3);
+
+        let resize = terminal_resize_frame("t1", 100, 30);
+        assert_eq!(resize["type"], "terminal.resize");
+        assert_eq!(resize["terminalId"], "t1");
+        assert_eq!(resize["cols"], 100);
+        assert_eq!(resize["rows"], 30);
+
+        let close = terminal_close_frame("t1");
+        assert_eq!(close["type"], "terminal.close");
+        assert_eq!(close["terminalId"], "t1");
+        assert_eq!(close.as_object().expect("object").keys().count(), 2);
+    }
+
+    #[test]
+    fn inbound_terminal_frames_route_by_terminal_id_not_stream() {
+        let opened: ConnectorFrame =
+            serde_json::from_str(r#"{"type":"terminal.opened","terminalId":"t1"}"#)
+                .expect("parses");
+        assert_eq!(opened.terminal_id(), Some("t1"));
+        assert_eq!(opened.stream_id(), None);
+
+        let data: ConnectorFrame =
+            serde_json::from_str(r#"{"type":"terminal.data","terminalId":"t1","data":"AAEC/w=="}"#)
+                .expect("parses");
+        assert_eq!(data.terminal_id(), Some("t1"));
+        assert_eq!(data.stream_id(), None);
+
+        let exit: ConnectorFrame =
+            serde_json::from_str(r#"{"type":"terminal.exit","terminalId":"t1","code":7}"#)
+                .expect("parses");
+        match exit {
+            ConnectorFrame::TerminalExit { terminal_id, code } => {
+                assert_eq!(terminal_id, "t1");
+                assert_eq!(code, Some(7));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // A signal death reports null, and a shorter agent may omit the key: both
+        // must read as "no exit code", not as a broken frame.
+        for text in [
+            r#"{"type":"terminal.exit","terminalId":"t1","code":null}"#,
+            r#"{"type":"terminal.exit","terminalId":"t1"}"#,
+        ] {
+            match serde_json::from_str::<ConnectorFrame>(text).expect("parses") {
+                ConnectorFrame::TerminalExit { code, .. } => assert_eq!(code, None, "{text}"),
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+
+        let refused: ConnectorFrame = serde_json::from_str(
+            r#"{"type":"terminal.error","terminalId":"t1","message":"/etc is outside the agent workdir /w","code":"permission_denied"}"#,
+        )
+        .expect("parses");
+        match refused {
+            ConnectorFrame::TerminalError {
+                terminal_id,
+                code,
+                message,
+            } => {
+                assert_eq!(terminal_id, "t1");
+                assert_eq!(code.as_deref(), Some("permission_denied"));
+                assert!(message.contains("outside the agent workdir"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // A code-less refusal is still a refusal the browser has to hear about.
+        match serde_json::from_str::<ConnectorFrame>(
+            r#"{"type":"terminal.error","terminalId":"t1"}"#,
+        )
+        .expect("parses")
+        {
+            ConnectorFrame::TerminalError { code, .. } => assert_eq!(code, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_sizes_are_bounded_in_both_directions() {
+        assert!(is_valid_terminal_size(80, 24));
+        assert!(is_valid_terminal_size(
+            MIN_TERMINAL_DIMENSION,
+            MAX_TERMINAL_DIMENSION
+        ));
+        assert!(!is_valid_terminal_size(0, 24));
+        assert!(!is_valid_terminal_size(80, 0));
+        assert!(!is_valid_terminal_size(MAX_TERMINAL_DIMENSION + 1, 24));
+        assert!(!is_valid_terminal_size(80, MAX_TERMINAL_DIMENSION + 1));
     }
 
     #[test]

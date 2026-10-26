@@ -286,6 +286,39 @@ pub enum ClientFrame {
     },
     #[serde(rename = "fs.response")]
     FsResponse(FsResponse),
+    #[serde(rename = "terminal.opened")]
+    TerminalOpened {
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+    },
+    #[serde(rename = "terminal.data")]
+    TerminalData {
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+        /// Standard base64 with padding. Bytes, never text: a UTF-8
+        /// assumption here corrupts every frame that is not ASCII.
+        data: String,
+    },
+    #[serde(rename = "terminal.exit")]
+    TerminalExit {
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+        /// null when the shell died from a signal or the code is unknown.
+        /// The key is always present: the contract says code may be null, and
+        /// omitting it would be a third spelling for the same fact.
+        code: Option<i32>,
+    },
+    /// The terminal never came up (sandbox refusal, spawn failure). The
+    /// browser side of the contract has terminal.error; the agent needs the
+    /// same frame so a refused terminal.open is not indistinguishable from
+    /// silence.
+    #[serde(rename = "terminal.error")]
+    TerminalError {
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+        message: String,
+        code: String,
+    },
     #[serde(rename = "error")]
     Error {
         message: String,
@@ -347,6 +380,38 @@ pub enum ServerFrame {
         request_id: String,
         op: FsOp,
         path: String,
+    },
+    #[serde(rename = "terminal.open")]
+    TerminalOpen {
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+        cols: u16,
+        rows: u16,
+        /// Absent means "the agent --workdir". Present means an absolute
+        /// path that must resolve inside that sandbox.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// Per-terminal override; absent falls back to --shell, then $SHELL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shell: Option<String>,
+    },
+    #[serde(rename = "terminal.data")]
+    TerminalData {
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+        data: String,
+    },
+    #[serde(rename = "terminal.resize")]
+    TerminalResize {
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    #[serde(rename = "terminal.close")]
+    TerminalClose {
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
     },
     #[serde(rename = "error")]
     Error {
@@ -415,6 +480,10 @@ const KNOWN_SERVER_TYPES: &[&str] = &[
     "session.interrupt",
     "notice.respond",
     "fs.request",
+    "terminal.open",
+    "terminal.data",
+    "terminal.resize",
+    "terminal.close",
     "error",
 ];
 
@@ -615,6 +684,123 @@ mod tests {
         assert_eq!(
             failure.encode().expect("encode"),
             r#"{"type":"fs.response","requestId":"req_3","ok":false,"error":{"code":"permission_denied","message":"denied"}}"#
+        );
+    }
+
+    #[test]
+    fn terminal_open_parses_with_and_without_its_optional_fields() {
+        let full = r#"{"type":"terminal.open","terminalId":"t1","cols":80,"rows":24,"cwd":"/w/sub","shell":"/bin/bash"}"#;
+        match parse_server_frame(full) {
+            ParsedServerFrame::Frame(ServerFrame::TerminalOpen {
+                terminal_id,
+                cols,
+                rows,
+                cwd,
+                shell,
+            }) => {
+                assert_eq!(terminal_id, "t1");
+                assert_eq!((cols, rows), (80, 24));
+                assert_eq!(cwd.as_deref(), Some("/w/sub"));
+                assert_eq!(shell.as_deref(), Some("/bin/bash"));
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+
+        // Omitted cwd/shell mean "workdir" and "$SHELL": absence must not be a
+        // decode error, and an explicit null must read the same way.
+        let minimal = r#"{"type":"terminal.open","terminalId":"t2","cols":100,"rows":30}"#;
+        match parse_server_frame(minimal) {
+            ParsedServerFrame::Frame(ServerFrame::TerminalOpen { cwd, shell, .. }) => {
+                assert_eq!(cwd, None);
+                assert_eq!(shell, None);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        let nulls = r#"{"type":"terminal.open","terminalId":"t3","cols":1,"rows":1,"cwd":null,"shell":null}"#;
+        match parse_server_frame(nulls) {
+            ParsedServerFrame::Frame(ServerFrame::TerminalOpen { cwd, shell, .. }) => {
+                assert_eq!(cwd, None);
+                assert_eq!(shell, None);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_data_and_resize_and_close_parse_by_type() {
+        let data = r#"{"type":"terminal.data","terminalId":"t1","data":"AAEC/w=="}"#;
+        match parse_server_frame(data) {
+            ParsedServerFrame::Frame(ServerFrame::TerminalData { terminal_id, data }) => {
+                assert_eq!(terminal_id, "t1");
+                assert_eq!(data, "AAEC/w==");
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+
+        let resize = r#"{"type":"terminal.resize","terminalId":"t1","cols":100,"rows":30}"#;
+        match parse_server_frame(resize) {
+            ParsedServerFrame::Frame(ServerFrame::TerminalResize { cols, rows, .. }) => {
+                assert_eq!((cols, rows), (100, 30));
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+
+        let close = r#"{"type":"terminal.close","terminalId":"t1"}"#;
+        assert_eq!(
+            parse_server_frame(close),
+            ParsedServerFrame::Frame(ServerFrame::TerminalClose {
+                terminal_id: String::from("t1"),
+            })
+        );
+    }
+
+    #[test]
+    fn agent_terminal_frames_use_the_contract_field_names() {
+        assert_eq!(
+            ClientFrame::TerminalOpened {
+                terminal_id: String::from("t1"),
+            }
+            .encode()
+            .expect("encode"),
+            r#"{"type":"terminal.opened","terminalId":"t1"}"#
+        );
+        assert_eq!(
+            ClientFrame::TerminalData {
+                terminal_id: String::from("t1"),
+                data: String::from("AAEC/w=="),
+            }
+            .encode()
+            .expect("encode"),
+            r#"{"type":"terminal.data","terminalId":"t1","data":"AAEC/w=="}"#
+        );
+        // A signal death reports null, and the key stays present.
+        assert_eq!(
+            ClientFrame::TerminalExit {
+                terminal_id: String::from("t1"),
+                code: None,
+            }
+            .encode()
+            .expect("encode"),
+            r#"{"type":"terminal.exit","terminalId":"t1","code":null}"#
+        );
+        assert_eq!(
+            ClientFrame::TerminalExit {
+                terminal_id: String::from("t1"),
+                code: Some(7),
+            }
+            .encode()
+            .expect("encode"),
+            r#"{"type":"terminal.exit","terminalId":"t1","code":7}"#
+        );
+        assert_eq!(
+            ClientFrame::TerminalError {
+                terminal_id: String::from("t1"),
+                message: String::from("/etc is outside the agent workdir /w"),
+                code: String::from("permission_denied"),
+            }
+            .encode()
+            .expect("encode"),
+            r#"{"type":"terminal.error","terminalId":"t1","message":"/etc is outside the agent workdir /w","code":"permission_denied"}"#
         );
     }
 

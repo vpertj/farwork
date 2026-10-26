@@ -91,6 +91,17 @@ impl Sandbox {
         Ok(canonical)
     }
 
+    /// Canonical directory inside the sandbox, or the reason it is not one.
+    /// `terminal.open.cwd` goes through exactly this check, so a terminal can
+    /// never start in a directory the file browser would refuse.
+    pub fn canonical_dir(&self, raw: &str) -> Result<PathBuf, FsFailure> {
+        let path = self.resolve(raw)?;
+        if !path.is_dir() {
+            return Err(FsFailure::io_error(format!("{raw:?} is not a directory")));
+        }
+        Ok(path)
+    }
+
     /// One level of `raw`: directories first, then files, each by name.
     /// Returns the canonical directory path alongside the entries, because that
     /// is the path the caller must use to descend.

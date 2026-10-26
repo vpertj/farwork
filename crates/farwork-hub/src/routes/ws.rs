@@ -39,6 +39,10 @@ pub fn router() -> Router<AppState> {
 pub struct WsTicketScope {
     #[serde(default, rename = "sessionId")]
     pub session_id: Option<String>,
+    /// A device terminal stream. The scope string stored on the ticket is the
+    /// terminalId itself, so the ticket can only be spent on that terminal.
+    #[serde(default, rename = "terminalId")]
+    pub terminal_id: Option<String>,
     #[serde(default)]
     pub dashboard: Option<bool>,
 }
@@ -51,9 +55,9 @@ pub struct WsTicketRequest {
     pub scope: Option<WsTicketScope>,
 }
 
-struct ConsumedTicket {
-    user_id: String,
-    client_id: String,
+pub(crate) struct ConsumedTicket {
+    pub(crate) user_id: String,
+    pub(crate) client_id: String,
 }
 
 async fn issue_ticket(
@@ -82,7 +86,7 @@ async fn issue_ticket(
 
 /// Single use: the row is deleted on read, so a replay cannot be distinguished
 /// from a stale ticket by design.
-async fn consume_ticket(
+pub(crate) async fn consume_ticket(
     state: &AppState,
     token: &str,
     expected_scope: &str,
@@ -125,21 +129,38 @@ async fn create_ws_ticket(
         .session_id
         .as_deref()
         .filter(|value| !value.is_empty());
+    let terminal_id = scope
+        .terminal_id
+        .as_deref()
+        .filter(|value| !value.is_empty());
     let dashboard = scope.dashboard.unwrap_or(false);
-    if session_id.is_some() == dashboard {
+    let chosen = [session_id.is_some(), terminal_id.is_some(), dashboard]
+        .iter()
+        .filter(|chosen| **chosen)
+        .count();
+    if chosen != 1 {
         return Err(ApiError::unprocessable(
             "exactly one WebSocket ticket scope is required",
         ));
     }
-    let resolved = match session_id {
-        Some(session_id) => {
+    let resolved = match (session_id, terminal_id) {
+        (Some(session_id), None) => {
             crate::routes::sessions::find_session(state.pool(), session_id)
                 .await?
                 .filter(|row| row.user_id == user_id)
                 .ok_or_else(|| ApiError::not_found("session not found"))?;
             session_id.to_string()
         }
-        None => String::from("dashboard"),
+        (None, Some(terminal_id)) => {
+            // Creating the terminal is not enough: a ticket may only be minted
+            // for a terminal this user owns, and its scope binds that exact id.
+            crate::routes::terminals::find_terminal(&state, terminal_id)
+                .await?
+                .filter(|row| row.user_id == user_id)
+                .ok_or_else(|| ApiError::not_found("terminal not found"))?;
+            terminal_id.to_string()
+        }
+        _ => String::from("dashboard"),
     };
     let (ticket, expires_at) = issue_ticket(&state, &user_id, &client_id, &resolved).await?;
     Ok(Json(json!({

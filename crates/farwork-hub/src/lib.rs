@@ -15,6 +15,7 @@ pub mod ingress;
 pub mod models;
 pub mod routes;
 pub mod state;
+pub mod termrelay;
 pub mod timeline;
 pub mod timeutil;
 

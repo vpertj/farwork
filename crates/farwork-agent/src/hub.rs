@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -27,6 +29,7 @@ use crate::identity::AgentIdentity;
 use crate::protocol::{
     parse_server_frame, AgentInfo, ClientFrame, FsOp, ParsedServerFrame, ServerFrame,
 };
+use crate::term::{TerminalHost, TerminalSpec};
 use crate::timeutil;
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -41,6 +44,8 @@ pub struct HubOptions {
     pub runtime: RuntimeKind,
     pub workdir: PathBuf,
     pub codex_bin: String,
+    /// `--shell`, the default shell for `terminal.open`.
+    pub shell: Option<String>,
     pub once: bool,
 }
 
@@ -55,6 +60,9 @@ pub struct Connector {
     /// `None` when the workdir cannot be resolved: every fs request is then
     /// denied instead of falling back to an unconstrained read.
     sandbox: Option<Arc<Sandbox>>,
+    /// Live PTYs. They share the sandbox root with the file browser, so a
+    /// terminal cannot start outside the workdir either.
+    terminals: TerminalHost,
 }
 
 impl Connector {
@@ -65,15 +73,17 @@ impl Connector {
                 tracing::warn!(
                     workdir = %opts.workdir.display(),
                     %error,
-                    "workdir cannot be resolved; fs requests will be denied"
+                    "workdir cannot be resolved; fs requests and terminals will be denied"
                 );
                 None
             }
         };
+        let terminals = TerminalHost::new(sandbox.clone(), opts.shell.clone());
         Self {
             opts,
             identity,
             sandbox,
+            terminals,
         }
     }
 
@@ -190,6 +200,10 @@ impl Connector {
                 }
             }
         };
+
+        // Nobody is reading terminal output any more, so the shells go with the
+        // socket: a PTY left running would be a process leak with no reader.
+        self.terminals.close_all();
 
         // In-flight streams cannot continue without the hub: abort the workers so
         // no orphaned codex child keeps running, and queue an honest report for
@@ -367,6 +381,66 @@ impl Connector {
                 op,
                 path,
             } => self.spawn_fs_request(request_id, op, path, out.clone()),
+            ServerFrame::TerminalOpen {
+                terminal_id,
+                cols,
+                rows,
+                cwd,
+                shell,
+            } => {
+                let spec = TerminalSpec {
+                    terminal_id: terminal_id.clone(),
+                    cols,
+                    rows,
+                    cwd,
+                    shell,
+                };
+                match self.terminals.open(spec, out.clone()) {
+                    Ok(()) => {
+                        let _ = out.send(TerminalHost::opened_frame(&terminal_id));
+                    }
+                    Err(failure) => {
+                        // A refusal must reach the browser: an open that produces
+                        // nothing at all looks like a hang.
+                        tracing::warn!(
+                            %terminal_id,
+                            code = failure.code,
+                            reason = %failure.message,
+                            "terminal.open refused"
+                        );
+                        let _ = out.send(failure.frame(&terminal_id));
+                    }
+                }
+            }
+            ServerFrame::TerminalData { terminal_id, data } => {
+                // Standard alphabet with padding, decoded as bytes. A chunk that
+                // does not decode is dropped rather than half-applied: it is a
+                // client bug, and no frame in the contract acknowledges input.
+                match STANDARD.decode(data.as_bytes()) {
+                    Ok(bytes) => {
+                        if !self.terminals.write(&terminal_id, bytes) {
+                            tracing::debug!(%terminal_id, "terminal.data for an unknown terminal");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%terminal_id, %error, "terminal.data is not base64; dropped")
+                    }
+                }
+            }
+            ServerFrame::TerminalResize {
+                terminal_id,
+                cols,
+                rows,
+            } => {
+                if !self.terminals.resize(&terminal_id, cols, rows) {
+                    tracing::debug!(%terminal_id, "terminal.resize for an unknown terminal");
+                }
+            }
+            ServerFrame::TerminalClose { terminal_id } => {
+                if !self.terminals.close(&terminal_id) {
+                    tracing::debug!(%terminal_id, "terminal.close for an unknown terminal");
+                }
+            }
             ServerFrame::Error { message, stream_id } => {
                 tracing::warn!(?stream_id, %message, "hub reported an error");
             }
@@ -500,6 +574,7 @@ mod tests {
             runtime,
             workdir: PathBuf::from("/tmp"),
             codex_bin: String::from("codex"),
+            shell: None,
             once: true,
         }
     }
