@@ -176,9 +176,12 @@ test p0_journey_login_to_websocket_delta ... ok
 
 ## 4. 已实现端点（HTTP/WS 契约对齐上游 `server/agent_server/api/*`）
 
+**39 个路径 / 47 个 method+path**（含 hub 自有的 `/healthz` 与 `/install.sh`；其余都在 `/api/v2` 下）。
+
 | 方法 | 路径 | 上游依据 |
 | --- | --- | --- |
 | GET | `/healthz` | ——（本 crate 自有） |
+| GET | `/install.sh` | ——（本 crate 自有）：**免鉴权**，回仓库根 `install.sh` 的原字节（`include_str!` 编进二进制），配对页那句 `curl -fsSL <hubUrl>/install.sh \| sh` 靠它才成立 |
 | GET | `/api/v2/auth/config` | `api/auth.py:81` `AuthConfigResponse` |
 | POST | `/api/v2/auth/password-salt` | `api/auth.py:114` `{salt, serverTime}` |
 | POST | `/api/v2/auth/register` | `api/auth.py:126`（首启需 setupToken，之后看 registrationOpen） |

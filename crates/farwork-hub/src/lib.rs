@@ -12,6 +12,7 @@ pub mod error;
 pub mod fsrelay;
 pub mod ids;
 pub mod ingress;
+pub mod install;
 pub mod models;
 pub mod pairing;
 pub mod routes;
@@ -35,6 +36,10 @@ use tower_http::trace::TraceLayer;
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health))
+        // The pairing page hands the user `curl -fsSL <hubUrl>/install.sh | sh`,
+        // so this route lives at the root, next to `/healthz` — not under
+        // `/api/v2`, which no part of that command carries.
+        .merge(install::router())
         .nest("/api/v2", routes::api())
         .layer(TraceLayer::new_for_http())
         .layer(
