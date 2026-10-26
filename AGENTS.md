@@ -50,6 +50,14 @@ pnpm run preview                 # 4173，预览静态产物（CI 不跑）
 
 上面 6 条带 "CI 要过" 的命令与 `.github/workflows/ci.yml` 完全一致；提交前本地跑通。
 
+### pnpm workspace 布局陷阱（已实测，别踩）
+
+- `apps/web/pnpm-workspace.yaml` **存在**，内容只有两行：`allowBuilds:` / `  esbuild: true`；根目录**没有** `pnpm-workspace.yaml`。这是 pnpm 11 里 `allowBuilds` 唯一生效的位置。
+- 副作用：**`apps/web` 自成 workspace root**。CI 的 `working-directory: apps/web` 正依赖这个布局。
+- 别只加根的 `pnpm-workspace.yaml` 而不迁移：那会改变 `pnpm install` 在 `apps/web` 下的归属（包被提升到根、`apps/web` 退化为子包），现有布局与 CI 一起失效。
+- 将来真要建根 workspace，必须两步同时做：把 `allowBuilds` 上移到根 `pnpm-workspace.yaml`，然后**删除** `apps/web/pnpm-workspace.yaml`。漏掉任一步，`pnpm install` 会以 `ERR_PNPM_IGNORED_BUILDS`（退出码 1）失败，CI 直接红。
+- pnpm 版本必须与 CI 一致：**11.19.0**（见 `ci.yml` 的 `pnpm/action-setup`）。`apps/web/pnpm-lock.yaml` 由该版本生成，换版本可能改写锁文件。
+
 ## 4. 不可违反的约定
 
 - **协议三处同改**：任何字段名/类型/取值变更，必须在同一个 PR 内同步 `crates/farwork-protocol`、`apps/web/src/lib/protocol.ts`、`docs/architecture.md`。少一处即为破坏契约。
@@ -67,6 +75,7 @@ pnpm run preview                 # 4173，预览静态产物（CI 不跑）
 - 里程碑：**M1 可行走骨架**已实现并通过端到端验收（真 server + connector + 浏览器 WS 客户端：设备上线 `connected: true`、`echo` 回显、设备断连后 `connected: false` 且在途流以 `exit code -1` 结束）。设备注册表是**内存态**，进程重启即丢设备记录。
 - 里程碑事实来源是 `docs/roadmap.md`：M1 骨架 / M2 ACP 会话·审批·文件浏览 / M3 多设备中继与自托管鉴权 / M4 Capacitor Android App（其后 iOS）。
 - App 属 M4，本轮不做；不要提前引入 Capacitor、移动平台目录或原生桥接代码。
+- **已实测的边界事实（M2 的输入，不是缺陷）**：设备 id 在每次 connector 进程启动时重新生成（`crates/farwork-connector/src/main.rs:28-30`，`Uuid::new_v4()`，进程内复用于重连，原注释即 "Identity is per process run"），**未持久化**。因此重启 connector 后设备列表里会多出一条新记录（旧记录留在列表里但 `connected: false`）。M2 若需要稳定身份，必须把 device id 落盘。
 
 ## 6. 给 agent 的三条纪律
 
