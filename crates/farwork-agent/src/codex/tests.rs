@@ -730,6 +730,7 @@ async fn session_driver_pumps_codex_frames_to_the_hub_until_eof() {
         .iter()
         .map(|frame| match frame {
             ClientFrame::SessionStarted { .. } => "session.started",
+            ClientFrame::SessionCapabilities { .. } => "session.capabilities",
             ClientFrame::SessionStateFrame { .. } => "session.state",
             ClientFrame::ItemUpsert { .. } => "item.upsert",
             ClientFrame::SessionExit { .. } => "session.exit",
@@ -742,6 +743,8 @@ async fn session_driver_pumps_codex_frames_to_the_hub_until_eof() {
         vec![
             "session.state",
             "session.started",
+            // v1.3: one report per stream, immediately after session.started.
+            "session.capabilities",
             "item.upsert",
             "session.state",
             "session.exit"
@@ -819,4 +822,28 @@ async fn wait_for_sent(
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+#[test]
+fn codex_capabilities_claim_only_what_the_mapper_can_do() {
+    let ClientFrame::SessionCapabilities {
+        stream_id,
+        capabilities,
+        catalogs,
+        commands,
+    } = crate::codex::capabilities_frame("str_9")
+    else {
+        panic!("codex must answer with session.capabilities");
+    };
+    assert_eq!(stream_id, "str_9");
+    // turn/interrupt is a real app-server method the mapper sends.
+    assert!(capabilities.interrupt);
+    // No steer method, no command catalog, no catalog method for models or
+    // permission profiles: claiming any of them would put dead controls in the UI.
+    assert!(!capabilities.steer);
+    assert!(!capabilities.selections);
+    assert!(!capabilities.commands);
+    assert!(catalogs.models.is_empty(), "no model list may be invented");
+    assert!(catalogs.permissions.is_empty());
+    assert!(commands.is_empty());
 }

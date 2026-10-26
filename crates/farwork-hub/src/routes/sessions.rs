@@ -940,13 +940,14 @@ async fn session_runtime_capabilities(
     Path(session_id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let session = owned_session(&state, &user_id, &session_id).await?;
-    // Ingress Protocol v1 has no capability frame, so nothing has been
-    // negotiated: the truthful set is empty rather than an invented one.
-    Ok(Json(json!({
-        "connectorId": session.connector_id,
-        "capabilitySet": { "revision": 0, "capabilities": [] },
-        "serverTime": timeutil::utc_now(),
-    })))
+    // The agent's own report, cached while its stream is alive. A session that
+    // never reported (or whose runtime is gone) reads all-false: the truth is
+    // "nothing is supported", not "everything is".
+    Ok(Json(crate::routes::runtime::capabilities_view(
+        &state,
+        &session_id,
+        &session.connector_id,
+    )))
 }
 
 async fn send_message(

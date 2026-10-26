@@ -14,6 +14,7 @@ pub mod ids;
 pub mod ingress;
 pub mod models;
 pub mod routes;
+pub mod runtime_caps;
 pub mod state;
 pub mod termrelay;
 pub mod timeline;

@@ -38,7 +38,7 @@ pub const DEFAULT_ROWS: u16 = 24;
 const KEEPALIVE_SECONDS: u64 = 15;
 
 pub const TERMINAL_COLUMNS: &str =
-    "id, connector_id, user_id, cols, rows, cwd, created_at, closed_at, error_code, error_message";
+    "id, connector_id, user_id, cols, rows, cwd, created_at, closed_at, error_code, error_message, session_id";
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -46,6 +46,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/connectors/{connector_id}/terminals/{terminal_id}/stream",
             get(stream),
+        )
+        // Session namespace: the same PTY, the same relay, but the connector comes
+        // from the session instead of from the URL, and the row records which
+        // session opened it.
+        .route("/sessions/{session_id}/terminal", post(session_create))
+        .route(
+            "/sessions/{session_id}/terminal/{terminal_id}/stream",
+            get(session_stream),
         )
 }
 
@@ -59,6 +67,10 @@ pub struct TerminalRow {
     pub cwd: Option<String>,
     pub created_at: String,
     pub closed_at: Option<String>,
+    /// Which session opened it, when it was opened from the session namespace.
+    /// Nullable: device-scoped terminals have no session, and rewriting those rows
+    /// to invent one would be a lie about who opened them.
+    pub session_id: Option<String>,
     /// Set when the agent refused to open the terminal: what a browser attaching
     /// after the refusal is told.
     pub error_code: Option<String>,
@@ -88,7 +100,43 @@ async fn create(
     Path(connector_id): Path<String>,
     Json(payload): Json<CreateTerminal>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let connector = crate::routes::connectors::find_connector(state.pool(), &connector_id)
+    request_terminal(&state, &user_id, &connector_id, None, payload).await
+}
+
+/// `POST /sessions/{id}/terminal` — a PTY for this session's device and, unless
+/// the caller asked for something else, started in the session's workspace.
+async fn session_create(
+    State(state): State<AppState>,
+    AuthedUser(user_id): AuthedUser,
+    Path(session_id): Path<String>,
+    Json(payload): Json<CreateTerminal>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let session = crate::routes::sessions::owned_session(&state, &user_id, &session_id).await?;
+    let payload = CreateTerminal {
+        cwd: payload
+            .cwd
+            .or_else(|| session.cwd.clone().filter(|cwd| !cwd.trim().is_empty())),
+        cols: payload.cols,
+        rows: payload.rows,
+    };
+    request_terminal(
+        &state,
+        &user_id,
+        &session.connector_id,
+        Some(&session_id),
+        payload,
+    )
+    .await
+}
+
+async fn request_terminal(
+    state: &AppState,
+    user_id: &str,
+    connector_id: &str,
+    session_id: Option<&str>,
+    payload: CreateTerminal,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let connector = crate::routes::connectors::find_connector(state.pool(), connector_id)
         .await?
         .filter(|row| row.user_id == user_id && !row.revoked)
         .ok_or_else(|| {
@@ -117,15 +165,21 @@ async fn create(
     let handle = state.connectors().get(&connector.id).ok_or_else(offline)?;
 
     let terminal_id = crate::ids::terminal_id();
-    insert_terminal(
-        &state,
-        &terminal_id,
-        &connector.id,
-        &user_id,
-        cols,
-        rows,
-        cwd.as_deref(),
+    // One statement, one row: the terminal is durable before the device is told,
+    // so a browser that attaches immediately finds a row to attach to.
+    sqlx::query(
+        "insert into terminals (id, connector_id, user_id, cols, rows, cwd, created_at, session_id)
+         values ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
+    .bind(&terminal_id)
+    .bind(&connector.id)
+    .bind(user_id)
+    .bind(i32::from(cols))
+    .bind(i32::from(rows))
+    .bind(cwd.as_deref())
+    .bind(timeutil::utc_now())
+    .bind(session_id)
+    .execute(state.pool())
     .await?;
     // Registered before the frame leaves: a fast agent can answer
     // terminal.opened before this handler gets back here.
@@ -141,7 +195,7 @@ async fn create(
         // Recorded, not just closed: a browser that attaches anyway is told the
         // device is gone instead of "this terminal never existed".
         fail_terminal(
-            &state,
+            state,
             &terminal_id,
             "connector_offline",
             "the connector socket closed before the terminal request was sent",
@@ -150,7 +204,7 @@ async fn create(
         return Err(offline());
     }
 
-    let stored = find_terminal(&state, &terminal_id)
+    let stored = find_terminal(state, &terminal_id)
         .await?
         .ok_or_else(|| ApiError::internal("the terminal was not persisted"))?;
     tracing::info!(
@@ -159,6 +213,7 @@ async fn create(
         cols,
         rows,
         cwd = cwd.as_deref().unwrap_or("-"),
+        session_id = session_id.unwrap_or("-"),
         // Dispatched, not proven: the agent may still refuse the cwd, and that
         // refusal arrives as terminal.error on the stream.
         "terminal requested"
@@ -227,6 +282,29 @@ async fn stream(
     Query(query): Query<HashMap<String, String>>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    attach_stream(state, Some(connector_id), None, terminal_id, query, upgrade).await
+}
+
+async fn session_stream(
+    State(state): State<AppState>,
+    Path((session_id, terminal_id)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    attach_stream(state, None, Some(session_id), terminal_id, query, upgrade).await
+}
+
+/// Both stream routes share this body: the connector namespace names the device in
+/// the URL, the session namespace derives it from the session and additionally
+/// requires the terminal to have been opened by that session.
+async fn attach_stream(
+    state: AppState,
+    connector_id: Option<String>,
+    session_id: Option<String>,
+    terminal_id: String,
+    query: HashMap<String, String>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
     let Some(ticket_value) = query
         .get("ticket")
         .map(String::as_str)
@@ -242,6 +320,28 @@ async fn stream(
         Err(error) => return error.into_response(),
     };
 
+    // A session is not a credential here (the ticket is), so "this session is not
+    // yours" is answered exactly like an unknown terminal: the handshake must not
+    // become a way to probe for other people's sessions.
+    let connector_id = match (&session_id, connector_id) {
+        (Some(session_id), _) => {
+            let session = crate::routes::sessions::find_session(state.pool(), session_id)
+                .await
+                .ok()
+                .flatten()
+                .filter(|row| row.user_id == ticket.user_id);
+            let Some(session) = session else {
+                return upgrade.on_upgrade(move |mut socket| async move {
+                    let _ = send_error(&mut socket, "unknown terminal", "terminal_not_found").await;
+                    let _ = socket.send(Message::Close(None)).await;
+                });
+            };
+            session.connector_id
+        }
+        (None, Some(connector_id)) => connector_id,
+        (None, None) => return unauthorized("no terminal scope"),
+    };
+
     // Offline is checked before the row: "the device is gone" is a better answer
     // than "unknown terminal" for a terminal that existed a moment ago, and it is
     // refused at the HTTP layer. Establishing the socket and then saying "offline"
@@ -254,7 +354,13 @@ async fn stream(
         .await
         .ok()
         .flatten()
-        .filter(|row| row.user_id == ticket.user_id && row.connector_id == connector_id);
+        .filter(|row| row.user_id == ticket.user_id && row.connector_id == connector_id)
+        // Which session opened it is part of the answer in the session namespace:
+        // a terminal of the same device opened elsewhere is a different terminal.
+        .filter(|row| match session_id.as_deref() {
+            Some(session_id) => row.session_id.as_deref() == Some(session_id),
+            None => true,
+        });
     let Some(row) = owned else {
         // The handshake is allowed so the browser gets a reason rather than a
         // bare socket failure; the reason is the contract's own error frame.
@@ -527,31 +633,6 @@ pub async fn find_terminal(state: &AppState, terminal_id: &str) -> ApiResult<Opt
         .bind(terminal_id)
         .fetch_optional(state.pool())
         .await?)
-}
-
-async fn insert_terminal(
-    state: &AppState,
-    terminal_id: &str,
-    connector_id: &str,
-    user_id: &str,
-    cols: u16,
-    rows: u16,
-    cwd: Option<&str>,
-) -> ApiResult<()> {
-    sqlx::query(
-        "insert into terminals (id, connector_id, user_id, cols, rows, cwd, created_at)
-         values ($1, $2, $3, $4, $5, $6, $7)",
-    )
-    .bind(terminal_id)
-    .bind(connector_id)
-    .bind(user_id)
-    .bind(i32::from(cols))
-    .bind(i32::from(rows))
-    .bind(cwd)
-    .bind(timeutil::utc_now())
-    .execute(state.pool())
-    .await?;
-    Ok(())
 }
 
 /// Idempotent: a terminal can be closed by the browser, by the agent or by a

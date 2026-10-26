@@ -378,6 +378,12 @@ impl CodexMapper {
                         stream_id: self.stream_id.clone(),
                         external_session_id: thread_id.to_owned(),
                     }));
+                    // Immediately after session.started, in the same batch: the
+                    // browser must learn what this runtime supports before it can
+                    // render (or hide) the controls for it.
+                    outs.push(CodexOut::Hub(crate::codex::capabilities_frame(
+                        &self.stream_id,
+                    )));
                 }
                 let prompt = self.initial_prompt.clone();
                 if prompt.trim().is_empty() {

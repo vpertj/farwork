@@ -354,6 +354,41 @@ impl Connector {
             ServerFrame::SessionInterrupt { stream_id } => {
                 self.forward(sessions, &stream_id, SessionCmd::Interrupt)
             }
+            ServerFrame::SessionSteer { stream_id, text } => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    // A steer carrying no instruction is a peer bug: drop it with a
+                    // warning and keep the socket, never forward an empty command
+                    // the runtime would have to refuse on the timeline.
+                    tracing::warn!(%stream_id, "session.steer without text; dropped");
+                    return;
+                }
+                self.forward(
+                    sessions,
+                    &stream_id,
+                    SessionCmd::Steer {
+                        text: trimmed.to_string(),
+                    },
+                )
+            }
+            ServerFrame::SessionSelections {
+                stream_id,
+                model,
+                permission_mode,
+            } => {
+                if model.is_none() && permission_mode.is_none() {
+                    tracing::warn!(%stream_id, "session.selections without a selection; dropped");
+                    return;
+                }
+                self.forward(
+                    sessions,
+                    &stream_id,
+                    SessionCmd::Selections {
+                        model,
+                        permission_mode,
+                    },
+                )
+            }
             ServerFrame::NoticeRespond {
                 notice_id,
                 decision,
@@ -967,6 +1002,36 @@ mod tests {
                 let frame = read_json(&mut source).await;
                 if frame["type"] == serde_json::json!("session.started") {
                     assert_eq!(frame["streamId"], serde_json::json!("str_1"));
+                    break;
+                }
+            }
+            // A v1.3 frame with a missing field is dropped with a warning, and the
+            // socket keeps running: only the well-formed steer becomes an item.
+            write_json(
+                &mut sink,
+                serde_json::json!({"type": "session.steer", "streamId": "str_1"}),
+            )
+            .await;
+            write_json(
+                &mut sink,
+                serde_json::json!({"type": "session.selections", "streamId": "str_1"}),
+            )
+            .await;
+            write_json(
+                &mut sink,
+                serde_json::json!({"type": "session.steer", "streamId": "str_1", "text": "carry on"}),
+            )
+            .await;
+            loop {
+                let frame = read_json(&mut source).await;
+                if frame["type"] == serde_json::json!("item.upsert")
+                    && frame["item"]["role"] == serde_json::json!("user")
+                {
+                    assert_eq!(
+                        frame["item"]["content"]["text"],
+                        serde_json::json!("carry on"),
+                        "only the steer that carried text may reach the timeline: {frame}"
+                    );
                     return;
                 }
             }

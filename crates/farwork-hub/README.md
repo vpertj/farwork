@@ -110,10 +110,10 @@ token=eyJhbGciOiJIUzI1NiIsInR5...
 
 === runtime/state + runtime/capabilities ===
 {"status":"idle","updatedSeq":2}
-{"connectorId":"conn_Zpr_a9bRL4MAQA","revision":0,"capabilities":0}
+{"connectorId":"conn_Zpr_a9bRL4MAQA","revision":0,"capabilitySet":{"steer":false,"interrupt":false,"selections":false,"commands":false}}
 
-=== not implemented: steer answers 501 ===
-{"error":"not_implemented","detail":"POST /api/v2/sessions/sess_W_sRN6Dp0zM_Gw/runtime/steer is not implemented in this build"}
+=== not implemented: session sync answers 501 (steer is implemented now) ===
+{"error":"not_implemented","detail":"POST /api/v2/sessions/sess_W_sRN6Dp0zM_Gw/sync is not implemented in this build"}
 
 === ws-ticket + session socket (session.subscribed, then a live delta) ===
 {"type":"session.subscribed","cursor":"seq:2","payloadKeys":["clientId","eventCursor"]}
@@ -214,15 +214,16 @@ test p0_journey_login_to_websocket_delta ... ok
 | PATCH | `/api/v2/admin/users/{id}` | `200 {user, serverTime}`；body `{role?, disabled?, displayName?}`；会把自己或最后一个 admin 锁在门外时 409 `{code:"admin_lockout", reason, message}` |
 | GET/PATCH | `/api/v2/admin/settings` | `{settings:{registrationOpen, emailVerificationRequired}, serverTime}`；写 `app_settings` 的 `registration_open` / `email_verification_required`，`GET /auth/config` 读同一行 |
 
-### 501 清单（`{"error":"not_implemented","detail":...,"serverTime":...}`）· **45 条**
+### 501 清单（`{"error":"not_implemented","detail":...,"serverTime":...}`）· **37 条**
 
-审批 / steer / interrupt / runtime commands / notices 应答 / runtime selections / catalogs
-/ `POST|DELETE /sessions/{id}/takeover` / `POST /sessions/{id}/sync` / 终端
-（`/sessions/{id}/terminal/**`）/ 文件浏览（`/sessions/{id}/files/**`）/ 账号级分享列表
+`POST|DELETE /sessions/{id}/takeover` / `POST /sessions/{id}/sync` / 账号级分享列表
 （`/shares/**`；会话/消息分享的三条端点已实现，见上表）/ 批量 archive|unarchive|read / device runtime 管理
 （`/connectors/{id}/runtimes/**`、`/runtimes/**`、`/devices/**`）/ OAuth（`/auth/oauth/*`）/
 扫码登录（`/auth/mobile-login/*`）/ 邮箱验证码、改密、换头像 / announcements、agents、
-pairing、usage。管理台（`/admin/**`）已实现，见上表四条，不再在这份清单里。未知路径返回 404
+pairing、usage。**会话命名空间整体已实现**：`/sessions/{id}/files/list`、`/files/readText`、
+`/sessions/{id}/terminal` 与 `/terminal/{terminalId}/stream`、`runtime/capabilities`、
+`runtime/catalogs/{catalog}`、`runtime/commands`、`runtime/steer`、`runtime/selections` 都不在这份清单里。
+管理台（`/admin/**`）已实现，见上表四条，不再在这份清单里。未知路径返回 404
 `{"detail":"no route for ..."}`（包括没有对应路由的 `/admin/xxx`）。
 
 ---
@@ -313,8 +314,8 @@ snapshot_json / allowed_file_ids_json / created_at / deleted_at`）。`snapshot_
 
 1. **没有 connector ingress**（`/ws/connector` 不存在），所以：
    * `connectors.status` 恒为 `offline`（真实值，不是占位）；
-   * `runtime/capabilities` 的 `capabilitySet.capabilities` 为空集（不谎称支持
-     `session.send_message` 的执行）；`snapshot` 的 `state.status` 来自会话行；
+   * `runtime/capabilities` 的 `capabilitySet` 现在来自 agent 的 `session.capabilities`
+     帧（v1.3），没收到过就是全 `false`；`snapshot` 的 `state.status` 来自会话行；
    * `create-and-start` 不向 runtime 派发，响应显式给出
      `connectorResult:{ok:false, code:"connector_offline"}` 与 `runtimeDispatched:false`，
      但平台会话与首条消息是真落库的。

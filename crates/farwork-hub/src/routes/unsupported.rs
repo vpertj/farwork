@@ -17,19 +17,15 @@ macro_rules! unimplemented_paths {
 
 pub fn router() -> Router<AppState> {
     unimplemented_paths!(
-        // Session runtime control. Interrupt, notices and notice responses are
-        // implemented (routes::sessions / routes::notices) and are not listed here.
-        "/sessions/{session_id}/runtime/steer",
-        "/sessions/{session_id}/runtime/commands",
-        "/sessions/{session_id}/runtime/selections",
-        "/sessions/{session_id}/runtime/catalogs/{catalog}",
+        // Session runtime control. Interrupt, notices, notice responses and the
+        // whole runtime/* group (capabilities / steer / commands / selections /
+        // catalogs) are implemented (routes::sessions, routes::notices,
+        // routes::runtime) and are not listed here.
         "/sessions/{session_id}/sync",
         "/sessions/{session_id}/takeover",
-        // Terminal + file browsing relay.
-        "/sessions/{session_id}/terminal",
-        "/sessions/{session_id}/terminal/{*rest}",
-        "/sessions/{session_id}/files",
-        "/sessions/{session_id}/files/{*rest}",
+        // The session namespace has no entry left in this table: every
+        // /sessions/{id}/files* and /sessions/{id}/terminal* path is implemented
+        // (routes::fs, routes::terminals).
         // Sharing: POST/DELETE on the session's shares and the public read are
         // implemented (routes::shares), so only the account-level share list and
         // any share sub-path we have no contract for stay here. That is 2 fewer
@@ -66,7 +62,9 @@ pub fn router() -> Router<AppState> {
         "/auth/me/avatar",
         // Announcements, agents, usage. Instance administration is implemented
         // (routes::admin) and is not listed here — that is 2 fewer paths than
-        // the 47 M3 left behind: 45.
+        // the 47 M3 left behind: 45. The session namespace then took it to 37:
+        // /sessions/{id}/terminal, /terminal/{*rest}, /files, /files/{*rest} and
+        // the four runtime/* entries are all implemented now.
         "/announcements",
         "/announcements/{*rest}",
         "/agents",

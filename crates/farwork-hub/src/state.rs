@@ -135,6 +135,9 @@ struct Inner {
     fs_relay: crate::fsrelay::FsRelay,
     /// Live terminals: connector frames in, browser stream sockets out.
     term_relay: crate::termrelay::TerminalRelay,
+    /// Last runtime capability report per session. In memory on purpose: it
+    /// describes a live process, so it must not outlive the process.
+    runtime_caps: crate::runtime_caps::RuntimeCapsCache,
 }
 
 #[derive(Clone)]
@@ -155,6 +158,7 @@ impl AppState {
                 connectors: crate::ingress::ConnectorRegistry::new(),
                 fs_relay: crate::fsrelay::FsRelay::new(),
                 term_relay: crate::termrelay::TerminalRelay::new(),
+                runtime_caps: crate::runtime_caps::RuntimeCapsCache::new(),
             }),
         }
     }
@@ -193,5 +197,10 @@ impl AppState {
     /// Open terminals and their browser subscribers.
     pub fn term_relay(&self) -> &crate::termrelay::TerminalRelay {
         &self.inner.term_relay
+    }
+
+    /// The last capability report of each session (what it can do right now).
+    pub fn runtime_caps(&self) -> &crate::runtime_caps::RuntimeCapsCache {
+        &self.inner.runtime_caps
     }
 }

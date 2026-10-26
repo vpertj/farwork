@@ -90,10 +90,10 @@ api GET "/api/v2/sessions/$SESSION_ID/events?after=seq:0" \
 
 say "runtime/state + runtime/capabilities"
 api GET "/api/v2/sessions/$SESSION_ID/runtime/state" | jq -c '{status: .state.status, updatedSeq: .state.updatedSeq}'
-api GET "/api/v2/sessions/$SESSION_ID/runtime/capabilities" | jq -c '{connectorId, revision: .capabilitySet.revision, capabilities: (.capabilitySet.capabilities|length)}'
+api GET "/api/v2/sessions/$SESSION_ID/runtime/capabilities" | jq -c '{connectorId, revision, capabilitySet}'
 
-say "not implemented: steer answers 501"
-api POST "/api/v2/sessions/$SESSION_ID/runtime/steer" '{"content":"nope"}' | jq -c '{error, detail}'
+say "not implemented: session sync answers 501 (steer is implemented: 202 with no live stream -> 409)"
+api POST "/api/v2/sessions/$SESSION_ID/sync" '{}' | jq -c '{error, detail}'
 
 say "ws-ticket + session socket (session.subscribed, then a live delta)"
 TICKET=$(api POST /api/v2/ws-ticket "{\"clientId\":\"e2e-client\",\"scope\":{\"sessionId\":\"$SESSION_ID\"}}" | jq -r .ticket)

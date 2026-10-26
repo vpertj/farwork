@@ -371,6 +371,38 @@ pub fn session_interrupt_frame(stream_id: &str) -> Value {
     json!({ "type": "session.interrupt", "streamId": stream_id })
 }
 
+/// `session.steer`. The hub relays the user's extra instruction verbatim; what
+/// it means for the running turn is the runtime's decision, not the hub's.
+pub fn session_steer_frame(stream_id: &str, text: &str) -> Value {
+    json!({
+        "type": "session.steer",
+        "streamId": stream_id,
+        "text": text,
+    })
+}
+
+/// `session.selections`. An absent key is omitted rather than sent as null, so
+/// "leave the model alone, change the permission" stays expressible: the agent
+/// reads an absent key as "keep the current value".
+pub fn session_selections_frame(
+    stream_id: &str,
+    model: Option<&str>,
+    permission_mode: Option<&str>,
+) -> Value {
+    let mut frame = json!({ "type": "session.selections", "streamId": stream_id });
+    let map = frame.as_object_mut().expect("object literal");
+    if let Some(model) = model {
+        map.insert(String::from("model"), Value::String(model.to_string()));
+    }
+    if let Some(permission_mode) = permission_mode {
+        map.insert(
+            String::from("permissionMode"),
+            Value::String(permission_mode.to_string()),
+        );
+    }
+    frame
+}
+
 /// `fs.request`. The hub mints `requestId`; the connector must answer with that
 /// exact id, which is what lets many file requests share the one socket.
 pub fn fs_request_frame(request_id: &str, op: &str, path: &str) -> Value {
@@ -485,6 +517,19 @@ pub enum ConnectorFrame {
         #[serde(default)]
         code: Option<i64>,
     },
+    /// What the runtime can do right now. Sent once soon after `session.started`;
+    /// the hub caches it and never substitutes a guess of its own.
+    #[serde(rename = "session.capabilities")]
+    SessionCapabilities {
+        #[serde(rename = "streamId")]
+        stream_id: String,
+        #[serde(default)]
+        capabilities: crate::runtime_caps::CapabilityFlags,
+        #[serde(default)]
+        catalogs: crate::runtime_caps::CatalogSet,
+        #[serde(default)]
+        commands: Vec<crate::runtime_caps::CommandEntry>,
+    },
     #[serde(rename = "item.upsert")]
     ItemUpsert {
         #[serde(rename = "streamId")]
@@ -554,6 +599,7 @@ impl ConnectorFrame {
             | Self::SessionState { stream_id, .. }
             | Self::SessionExit { stream_id, .. }
             | Self::ItemUpsert { stream_id, .. }
+            | Self::SessionCapabilities { stream_id, .. }
             | Self::NoticeUpsert { stream_id, .. } => Some(stream_id),
             Self::NoticeResolved { stream_id, .. } | Self::Error { stream_id, .. } => {
                 stream_id.as_deref()

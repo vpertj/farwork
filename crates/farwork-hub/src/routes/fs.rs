@@ -28,6 +28,13 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/connectors/{connector_id}/fs/list", post(list))
         .route("/connectors/{connector_id}/fs/readText", post(read_text))
+        // Session namespace: same relay, resolved through the session's own
+        // connector and workspace instead of a connector id the browser picked.
+        .route("/sessions/{session_id}/files/list", post(session_list))
+        .route(
+            "/sessions/{session_id}/files/readText",
+            post(session_read_text),
+        )
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,6 +51,22 @@ async fn list(
 ) -> ApiResult<Json<Value>> {
     let requested = payload.path;
     let reply = relay(&state, &user_id, &connector_id, "list", &requested).await?;
+    list_response(reply, requested)
+}
+
+async fn session_list(
+    State(state): State<AppState>,
+    AuthedUser(user_id): AuthedUser,
+    Path(session_id): Path<String>,
+    Json(payload): Json<FsRequest>,
+) -> ApiResult<Json<Value>> {
+    let (connector_id, requested) =
+        session_target(&state, &user_id, &session_id, &payload.path).await?;
+    let reply = relay(&state, &user_id, &connector_id, "list", &requested).await?;
+    list_response(reply, requested)
+}
+
+fn list_response(reply: IngressFsResponse, requested: String) -> ApiResult<Json<Value>> {
     if !reply.ok {
         return Err(error_response(reply.error));
     }
@@ -67,6 +90,22 @@ async fn read_text(
 ) -> ApiResult<Json<Value>> {
     let requested = payload.path;
     let reply = relay(&state, &user_id, &connector_id, "readText", &requested).await?;
+    read_text_response(reply, requested)
+}
+
+async fn session_read_text(
+    State(state): State<AppState>,
+    AuthedUser(user_id): AuthedUser,
+    Path(session_id): Path<String>,
+    Json(payload): Json<FsRequest>,
+) -> ApiResult<Json<Value>> {
+    let (connector_id, requested) =
+        session_target(&state, &user_id, &session_id, &payload.path).await?;
+    let reply = relay(&state, &user_id, &connector_id, "readText", &requested).await?;
+    read_text_response(reply, requested)
+}
+
+fn read_text_response(reply: IngressFsResponse, requested: String) -> ApiResult<Json<Value>> {
     if !reply.ok {
         return Err(error_response(reply.error));
     }
@@ -82,6 +121,48 @@ async fn read_text(
         "truncated": reply.truncated.unwrap_or(false),
         "serverTime": timeutil::utc_now(),
     })))
+}
+
+/// Resolve a session-scoped file request to the connector that serves it plus an
+/// absolute path.
+///
+/// The session namespace addresses files in the workspace the caller is already
+/// looking at, so a relative `path` is anchored on the session's cwd. The
+/// connector namespace stays absolute-only: there the caller names a device, not
+/// a workspace.
+async fn session_target(
+    state: &AppState,
+    user_id: &str,
+    session_id: &str,
+    raw_path: &str,
+) -> ApiResult<(String, String)> {
+    // Someone else's session is a 404, never a 403: existence must not leak.
+    let session = crate::routes::sessions::owned_session(state, user_id, session_id).await?;
+    let path = raw_path.trim();
+    if path.is_empty() {
+        return Err(ApiError::unprocessable(json!({
+            "code": "invalid_path",
+            "message": "path is required",
+        })));
+    }
+    if std::path::Path::new(path).is_absolute() {
+        return Ok((session.connector_id, path.to_string()));
+    }
+    let Some(cwd) = session
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(ApiError::unprocessable(json!({
+            "code": "invalid_path",
+            "message": format!("path {raw_path:?} is relative and this session has no cwd"),
+        })));
+    };
+    Ok((
+        session.connector_id,
+        format!("{}/{}", cwd.trim_end_matches('/'), path),
+    ))
 }
 
 /// Send one `fs.request` and wait for the reply that carries its requestId.

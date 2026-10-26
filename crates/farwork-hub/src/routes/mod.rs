@@ -8,6 +8,7 @@ pub mod extract;
 pub mod fs;
 pub mod notices;
 pub mod projects;
+pub mod runtime;
 pub mod sessions;
 pub mod shares;
 pub mod terminals;
@@ -27,6 +28,7 @@ pub fn api() -> Router<AppState> {
         .merge(fs::router())
         .merge(notices::router())
         .merge(projects::router())
+        .merge(runtime::router())
         .merge(sessions::router())
         .merge(shares::router())
         // The one unauthenticated surface under /api/v2: a public share link is

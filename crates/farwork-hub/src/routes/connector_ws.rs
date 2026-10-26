@@ -195,6 +195,16 @@ async fn run_connector_socket(state: AppState, mut socket: WebSocket, connector:
     // here whether or not a newer connection already took over the route.
     match ingress::abandon_connector_streams(&state, &connector.id).await {
         Ok(session_ids) => {
+            // With no runtime there is nothing to claim: the next reader must see
+            // the all-false default rather than the dead process's report.
+            let cleared = state.runtime_caps().clear_all(&session_ids);
+            if cleared > 0 {
+                tracing::debug!(
+                    connector_id = %connector.id,
+                    sessions = cleared,
+                    "dropped cached runtime capabilities on disconnect"
+                );
+            }
             for session_id in &session_ids {
                 if let Err(error) =
                     publish_runtime_state(&state, &connector.user_id, session_id).await
@@ -373,6 +383,9 @@ async fn apply_frame(
             ingress::close_stream(state, &stream_id)
                 .await
                 .map_err(err)?;
+            // The runtime that made these claims is finished: keep the cache and
+            // a later REST read would describe a process that no longer exists.
+            state.runtime_caps().clear(&session.id);
             let final_status = if code.unwrap_or(0) == 0 {
                 "idle"
             } else {
@@ -397,6 +410,31 @@ async fn apply_frame(
                 .map_err(|error| error.to_string())?;
             publish_runtime_state(state, &connector.user_id, &session.id).await?;
             crate::routes::projects::publish_dashboard_change(state, &connector.user_id);
+            Ok(())
+        }
+        ConnectorFrame::SessionCapabilities {
+            stream_id,
+            capabilities,
+            catalogs,
+            commands,
+        } => {
+            let session = session_for_stream(state, &connector.id, &stream_id).await?;
+            let revision = state.runtime_caps().record(
+                &session.id,
+                capabilities,
+                catalogs,
+                commands,
+                timeutil::utc_now(),
+            );
+            tracing::info!(
+                session_id = %session.id,
+                revision,
+                steer = capabilities.steer,
+                interrupt = capabilities.interrupt,
+                selections = capabilities.selections,
+                commands = capabilities.commands,
+                "runtime capabilities recorded"
+            );
             Ok(())
         }
         ConnectorFrame::ItemUpsert { stream_id, item } => {

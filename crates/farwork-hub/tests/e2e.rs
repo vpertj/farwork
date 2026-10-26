@@ -559,26 +559,30 @@ async fn p0_journey_login_to_websocket_delta() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(capabilities["connectorId"], connector_id);
-    assert!(capabilities["capabilitySet"]["revision"].as_i64().is_some());
+    assert_eq!(capabilities["revision"], json!(0));
+    // No connector is attached in this journey, so the agent has reported nothing
+    // and the truthful capability set is all-false.
     assert_eq!(
-        capabilities["capabilitySet"]["capabilities"]
-            .as_array()
-            .expect("capabilities")
-            .len(),
-        0
+        capabilities["capabilitySet"],
+        json!({
+            "steer": false,
+            "interrupt": false,
+            "selections": false,
+            "commands": false,
+        })
     );
 
     // --- unimplemented surfaces ------------------------------------------
-    let (status, steer) = call(
+    let (status, sync) = call(
         &app,
         Method::POST,
-        &format!("/api/v2/sessions/{session_id}/runtime/steer"),
+        &format!("/api/v2/sessions/{session_id}/sync"),
         Some(&token),
-        Some(json!({ "content": "nope" })),
+        Some(json!({})),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(steer["error"], "not_implemented");
+    assert_eq!(sync["error"], "not_implemented");
 
     // --- websockets -------------------------------------------------------
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

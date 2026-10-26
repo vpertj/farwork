@@ -21,6 +21,15 @@ pub enum SessionCmd {
         client_message_id: String,
     },
     Interrupt,
+    /// One more instruction for the running turn (`session.steer`).
+    Steer {
+        text: String,
+    },
+    /// `session.selections`: absent keys mean "keep the current value".
+    Selections {
+        model: Option<String>,
+        permission_mode: Option<String>,
+    },
     NoticeDecision {
         notice_id: String,
         decision: Decision,
@@ -98,6 +107,36 @@ impl CodexSession {
                             .mapper
                             .on_user_message(&text, &client_message_id),
                         SessionCmd::Interrupt => self.mapper.on_interrupt(),
+                        SessionCmd::Steer { text } => {
+                            // codex app-server has no steer method, and the hub only
+                            // sends this when capabilities.steer was reported true.
+                            // Saying so beats dropping the instruction silently.
+                            tracing::warn!(text = %text, "codex app-server has no steer; the instruction was not applied");
+                            vec![CodexOut::Hub(ClientFrame::Error {
+                                message: String::from(
+                                    "this runtime cannot steer a running turn; the instruction was not applied",
+                                ),
+                                stream_id: Some(self.mapper.stream_id().to_string()),
+                            })]
+                        }
+                        SessionCmd::Selections {
+                            model,
+                            permission_mode,
+                        } => {
+                            // No catalog method, so no selection can be honoured
+                            // without inventing one: refused, and reported.
+                            tracing::warn!(
+                                model = model.as_deref().unwrap_or("-"),
+                                permission_mode = permission_mode.as_deref().unwrap_or("-"),
+                                "codex app-server has no runtime selection method; the change was not applied"
+                            );
+                            vec![CodexOut::Hub(ClientFrame::Error {
+                                message: String::from(
+                                    "this runtime cannot change model or permission mode at run time; the selection was not applied",
+                                ),
+                                stream_id: Some(self.mapper.stream_id().to_string()),
+                            })]
+                        }
                         SessionCmd::NoticeDecision { notice_id, decision } => {
                             self.mapper.on_notice_decision(&notice_id, decision)
                         }

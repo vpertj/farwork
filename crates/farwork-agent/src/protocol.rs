@@ -239,6 +239,68 @@ impl FsResponse {
     }
 }
 
+/// What the runtime reports it can do `right now` (Ingress Protocol v1.3).
+///
+/// Every flag is `default`: a field the runtime does not mention reads as "not
+/// supported", never as "supported". A hub that filled in the missing ones would
+/// turn a silent absence into a control that does nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityFlags {
+    #[serde(default)]
+    pub steer: bool,
+    #[serde(default)]
+    pub interrupt: bool,
+    #[serde(default)]
+    pub selections: bool,
+    #[serde(default)]
+    pub commands: bool,
+}
+
+/// One entry of a model or permission catalog.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatalogItem {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl CatalogItem {
+    pub fn new(id: impl Into<String>, name: impl Into<String>, description: Option<&str>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            description: description.map(str::to_string),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CatalogSet {
+    #[serde(default)]
+    pub models: Vec<CatalogItem>,
+    #[serde(default)]
+    pub permissions: Vec<CatalogItem>,
+}
+
+/// One runtime command the bridge can execute.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommandEntry {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl CommandEntry {
+    pub fn new(name: impl Into<String>, description: Option<&str>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.map(str::to_string),
+        }
+    }
+}
+
 /// Connector -> hub frames.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -265,6 +327,14 @@ pub enum ClientFrame {
         #[serde(rename = "streamId")]
         stream_id: String,
         code: i32,
+    },
+    #[serde(rename = "session.capabilities")]
+    SessionCapabilities {
+        #[serde(rename = "streamId")]
+        stream_id: String,
+        capabilities: CapabilityFlags,
+        catalogs: CatalogSet,
+        commands: Vec<CommandEntry>,
     },
     #[serde(rename = "item.upsert")]
     ItemUpsert {
@@ -367,6 +437,32 @@ pub enum ServerFrame {
     SessionInterrupt {
         #[serde(rename = "streamId")]
         stream_id: String,
+    },
+    /// One more instruction for the turn that is already running.
+    #[serde(rename = "session.steer")]
+    SessionSteer {
+        #[serde(rename = "streamId")]
+        stream_id: String,
+        // Tolerated as absent so a steer without text is dropped with a warning
+        // here rather than taking the whole frame decode down with it: the
+        // connection must survive a peer's malformed frame.
+        #[serde(default)]
+        text: String,
+    },
+    /// Change the model and/or the permission mode of a running session. Absent
+    /// keys mean "keep the current value" and are never sent as null.
+    #[serde(rename = "session.selections")]
+    SessionSelections {
+        #[serde(rename = "streamId")]
+        stream_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(
+            default,
+            rename = "permissionMode",
+            skip_serializing_if = "Option::is_none"
+        )]
+        permission_mode: Option<String>,
     },
     #[serde(rename = "notice.respond")]
     NoticeRespond {
@@ -478,6 +574,8 @@ const KNOWN_SERVER_TYPES: &[&str] = &[
     "session.start",
     "session.message",
     "session.interrupt",
+    "session.steer",
+    "session.selections",
     "notice.respond",
     "fs.request",
     "terminal.open",
@@ -850,5 +948,72 @@ mod tests {
             }
             other => panic!("unexpected parse: {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_steer_and_selections_parse_as_v1_3_frames() {
+        match parse_server_frame(
+            r#"{"type":"session.steer","streamId":"str_1","text":"also run the tests"}"#,
+        ) {
+            ParsedServerFrame::Frame(ServerFrame::SessionSteer { stream_id, text }) => {
+                assert_eq!(stream_id, "str_1");
+                assert_eq!(text, "also run the tests");
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        match parse_server_frame(r#"{"type":"session.selections","streamId":"str_1","model":"m1"}"#)
+        {
+            ParsedServerFrame::Frame(ServerFrame::SessionSelections {
+                stream_id,
+                model,
+                permission_mode,
+            }) => {
+                assert_eq!(stream_id, "str_1");
+                assert_eq!(model.as_deref(), Some("m1"));
+                // Absent stays absent: a missing key must never become null, which
+                // a runtime would have to interpret as "clear the current value".
+                assert!(permission_mode.is_none());
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        match parse_server_frame(
+            r#"{"type":"session.selections","streamId":"str_1","permissionMode":"read-only"}"#,
+        ) {
+            ParsedServerFrame::Frame(ServerFrame::SessionSelections {
+                model,
+                permission_mode,
+                ..
+            }) => {
+                assert!(model.is_none());
+                assert_eq!(permission_mode.as_deref(), Some("read-only"));
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_steer_without_text_parses_so_the_router_can_drop_it_with_a_warning() {
+        // Dropping the whole frame decode would take the connection down over a
+        // peer's malformed frame; an empty instruction is refused one layer up.
+        match parse_server_frame(r#"{"type":"session.steer","streamId":"str_1"}"#) {
+            ParsedServerFrame::Frame(ServerFrame::SessionSteer { stream_id, text }) => {
+                assert_eq!(stream_id, "str_1");
+                assert!(text.is_empty());
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn revisions_of_the_frame_set_do_not_swallow_an_unknown_type() {
+        assert_eq!(
+            parse_server_frame(r#"{"type":"session.capabilities","streamId":"str_1"}"#),
+            ParsedServerFrame::UnknownType(String::from("session.capabilities")),
+            "session.capabilities only flows hub-ward: from a hub it is an unknown frame"
+        );
+        assert_eq!(
+            parse_server_frame(r#"{"type":"session.nonsense","streamId":"str_1"}"#),
+            ParsedServerFrame::UnknownType(String::from("session.nonsense"))
+        );
     }
 }
