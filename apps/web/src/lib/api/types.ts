@@ -141,6 +141,7 @@ export type Session = {
 	status: string;
 	title: string | null;
 	connectorStatus: string;
+	cwd: string | null;
 	archived: boolean;
 	unread: boolean;
 	updatedSeq: number;
@@ -160,6 +161,7 @@ export function parseSession(value: unknown): Session | null {
 		status: asString(raw.status, 'idle'),
 		title: asNullableString(raw.title),
 		connectorStatus: asString(raw.connectorStatus, 'unknown'),
+		cwd: asNullableString(raw.cwd),
 		archived: asBoolean(raw.archived),
 		unread: asBoolean(raw.unread),
 		updatedSeq: asNumber(raw.updatedSeq),
@@ -444,4 +446,89 @@ export function cursorToSeq(cursor: string | null | undefined): number | null {
 
 export function seqToCursor(seq: number): string {
 	return `seq:${Math.max(0, Math.trunc(seq))}`;
+}
+
+export type FsEntryKind = 'file' | 'dir';
+
+export type FsEntry = {
+	name: string;
+	path: string;
+	kind: FsEntryKind;
+	sizeBytes: number;
+	modifiedAt: string | null;
+};
+
+export type FsListing = {
+	path: string;
+	entries: FsEntry[];
+	serverTime: string;
+};
+
+export type FsTextFile = {
+	path: string;
+	content: string;
+	sizeBytes: number;
+	truncated: boolean;
+	serverTime: string;
+};
+
+export type FsFailure = {
+	status: number;
+	code: string | null;
+	message: string;
+};
+
+function narrowFsKind(value: unknown): FsEntryKind | null {
+	if (value === 'file' || value === 'dir') return value;
+	return null;
+}
+
+export function parseFsEntry(value: unknown): FsEntry | null {
+	const raw = asRecord(value);
+	if (!raw) return null;
+	const path = asString(raw.path);
+	const kind = narrowFsKind(raw.kind);
+	if (!path || !kind) return null;
+	const name = asString(raw.name);
+	return {
+		name: name.length > 0 ? name : (path.split('/').pop() ?? path),
+		path,
+		kind,
+		sizeBytes: asNumber(raw.sizeBytes),
+		modifiedAt: asNullableString(raw.modifiedAt)
+	};
+}
+
+export function parseFsListing(value: unknown): FsListing | null {
+	const raw = asRecord(value);
+	if (!raw) return null;
+	const path = asString(raw.path);
+	if (!path) return null;
+	const entries: FsEntry[] = [];
+	for (const row of asArray(raw.entries)) {
+		const entry = parseFsEntry(row);
+		if (entry) entries.push(entry);
+	}
+	return { path, entries, serverTime: asString(raw.serverTime) };
+}
+
+export function parseFsText(value: unknown): FsTextFile | null {
+	const raw = asRecord(value);
+	if (!raw) return null;
+	const path = asString(raw.path);
+	if (!path) return null;
+	return {
+		path,
+		content: asString(raw.content),
+		sizeBytes: asNumber(raw.sizeBytes),
+		truncated: asBoolean(raw.truncated),
+		serverTime: asString(raw.serverTime)
+	};
+}
+
+export function sortFsEntries(entries: FsEntry[]): FsEntry[] {
+	return [...entries].sort((left, right) => {
+		if (left.kind !== right.kind) return left.kind === 'dir' ? -1 : 1;
+		return left.name.localeCompare(right.name, 'zh-CN');
+	});
 }

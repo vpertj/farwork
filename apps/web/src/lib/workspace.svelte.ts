@@ -63,6 +63,16 @@ class WorkspaceStore {
 		return this.sessions.find((session) => session.id === id) ?? null;
 	}
 
+	projectById(id: string | null): Project | null {
+		if (!id) return null;
+		return this.projects.find((project) => project.id === id) ?? null;
+	}
+
+	connectorById(id: string | null): Connector | null {
+		if (!id) return null;
+		return this.connectors.find((connector) => connector.id === id) ?? null;
+	}
+
 	async load(token: string): Promise<void> {
 		this.loading = true;
 		this.error = null;

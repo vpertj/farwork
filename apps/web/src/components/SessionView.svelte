@@ -7,7 +7,9 @@
 		sessionStatusLabel,
 		sessionStatusTone
 	} from '$lib/timeline';
+	import { workspace } from '$lib/workspace.svelte';
 	import ApprovalCard from './ApprovalCard.svelte';
+	import FilePanel from './FilePanel.svelte';
 	import TimelineEntry from './TimelineEntry.svelte';
 
 	let { sessionId, token }: { sessionId: string; token: string } = $props();
@@ -23,6 +25,11 @@
 	const showApprovals = $derived(
 		controller.approvalNotices.length > 0 || controller.pendingApprovalItems.length > 0
 	);
+	const project = $derived(workspace.projectById(session?.projectId ?? null));
+	const workspacePath = $derived(project?.workspacePath ?? session?.cwd ?? '');
+	const connectorOnline = $derived((session?.connectorStatus ?? 'offline') === 'online');
+
+	let filesOpen = $state(true);
 
 	const connectionLabel = $derived(
 		controller.connection === 'open'
@@ -85,151 +92,180 @@
 	}
 </script>
 
-<section class="session">
-	<header>
-		<a class="back" href="#/" title="返回任务台">←</a>
-		<div class="title-block">
-			<h1>{session?.title ?? '会话'}</h1>
-			<div class="meta mono">
-				<span>{sessionId}</span>
-				<span>·</span>
-				<span>{runtimeLabel(session?.runtime ?? 'unknown')}</span>
-				<span>·</span>
-				<span>游标 seq:{controller.cursorSeq}</span>
+<div class="session-layout">
+	<section class="session">
+		<header>
+			<a class="back" href="#/" title="返回任务台">←</a>
+			<div class="title-block">
+				<h1>{session?.title ?? '会话'}</h1>
+				<div class="meta mono">
+					<span>{sessionId}</span>
+					<span>·</span>
+					<span>{runtimeLabel(session?.runtime ?? 'unknown')}</span>
+					<span>·</span>
+					<span>游标 seq:{controller.cursorSeq}</span>
+				</div>
 			</div>
-		</div>
-		<div class="badges">
-			{#if status === 'waiting_approval'}
-				<span class="badge status-alert" data-tone="warn" role="status">等待审批 · 需要你决定</span>
-			{:else if controller.openNotices.length > 0}
-				<span class="badge" data-tone="warn">待审批 {controller.openNotices.length}</span>
-			{/if}
-			<span class="badge" data-tone={sessionStatusTone(status)}>
-				<span class="dot"></span>
-				{sessionStatusLabel(status)}
-			</span>
-			<span class="badge" data-tone={connectionTone}>{connectionLabel}</span>
-			{#if canInterrupt}
-				<button
-					class="btn"
-					type="button"
-					disabled={controller.interrupting}
-					onclick={() => void controller.interrupt()}
-				>
-					{controller.interrupting ? '中断中…' : '中断当前回合'}
-				</button>
-			{/if}
-		</div>
-	</header>
-
-	{#if controller.error}
-		<p class="alert banner">{controller.error}</p>
-	{/if}
-
-	{#if controller.runtimeState?.statusReason}
-		<p class="banner notice-line">状态原因：{controller.runtimeState.statusReason}</p>
-	{/if}
-
-	{#if controller.interruptError}
-		<p class="alert banner" role="alert">中断未下发：{controller.interruptError}</p>
-	{:else if controller.interruptStream && canInterrupt}
-		<p class="banner notice-line">
-			中断指令已下发（stream <code class="mono">{controller.interruptStream}</code>），等待运行时回推状态更新。
-		</p>
-	{/if}
-
-	{#if showApprovals}
-		<section class="approvals" aria-label="审批请求">
-			{#each controller.approvalNotices as notice (notice.id)}
-				<ApprovalCard
-					{notice}
-					action={controller.noticeAction(notice.id)}
-					onRespond={(decision) => void controller.respond(notice.id, decision)}
-				/>
-			{/each}
-			{#each controller.pendingApprovalItems as item (item.id)}
-				<article class="approval pending-item" data-item-id={item.id}>
-					<div class="pending-head">
-						<span class="badge" data-tone="warn">等待审批</span>
-						<span class="pending-title">{itemHeadline(item)}</span>
-					</div>
-					<p class="pending-hint">
-						时间线条目 <code class="mono">{item.id}</code> 处于等待审批，但 hub 尚未下发对应的审批详情（notice），因此这里没有可提交的决定。
-					</p>
-				</article>
-			{/each}
-		</section>
-	{/if}
-
-	<div class="timeline" bind:this={scroller} onscroll={handleScroll}>
-		{#if controller.loading}
-			<div class="empty"><p>正在加载会话快照…</p></div>
-		{:else if controller.visibleItems.length === 0 && controller.optimistic.length === 0}
-			<div class="empty">
-				<p>这个会话还没有时间线内容。</p>
-				<p>在下方输入框发送第一条消息。</p>
-			</div>
-		{:else}
-			{#each controller.visibleItems as item (item.id)}
-				<TimelineEntry {item} />
-			{/each}
-		{/if}
-
-		{#each controller.optimistic as row (row.clientMessageId)}
-			<article class="optimistic" class:failed={row.failed} data-type="message">
-				<header>
-					<span class="kind">
-						<span class="kind-label">消息</span>
-						<span class="role">用户</span>
-					</span>
-					<span class="right">
-						{#if row.failed}
-							<span class="badge" data-tone="err">发送失败</span>
-						{:else}
-							<span class="badge" data-tone="warn">发送中…</span>
-						{/if}
-						<span class="time">{formatClock(row.createdAt)}</span>
-					</span>
-				</header>
-				<p class="body">{row.content}</p>
-				{#if row.failed && row.error}
-					<p class="alert">{row.error}</p>
-					<button class="btn" type="button" onclick={() => controller.discardOptimistic(row.clientMessageId)}>
-						移除这条
+			<div class="badges">
+				{#if status === 'waiting_approval'}
+					<span class="badge status-alert" data-tone="warn" role="status">等待审批 · 需要你决定</span>
+				{:else if controller.openNotices.length > 0}
+					<span class="badge" data-tone="warn">待审批 {controller.openNotices.length}</span>
+				{/if}
+				<span class="badge" data-tone={sessionStatusTone(status)}>
+					<span class="dot"></span>
+					{sessionStatusLabel(status)}
+				</span>
+				<span class="badge" data-tone={connectionTone}>{connectionLabel}</span>
+				{#if canInterrupt}
+					<button
+						class="btn"
+						type="button"
+						disabled={controller.interrupting}
+						onclick={() => void controller.interrupt()}
+					>
+						{controller.interrupting ? '中断中…' : '中断当前回合'}
 					</button>
 				{/if}
-			</article>
-		{/each}
-	</div>
+				{#if session}
+					<button
+						class="btn"
+						type="button"
+						aria-expanded={filesOpen}
+						onclick={() => (filesOpen = !filesOpen)}
+					>
+						{filesOpen ? '收起文件' : '文件'}
+					</button>
+				{/if}
+			</div>
+		</header>
 
-	<form class="composer" onsubmit={(event) => { event.preventDefault(); void submit(); }}>
-		<textarea
-			class="input"
-			rows="2"
-			placeholder="输入消息，Enter 发送，Shift+Enter 换行"
-			bind:value={draft}
-			onkeydown={handleKeydown}
-			disabled={controller.session === null}
-		></textarea>
-		<div class="composer-actions">
-			<span class="hint">消息经 <code class="mono">POST /runtime/messages</code> 发送，随后由 WS 增量更新</span>
-			<button
-				class="btn"
-				data-variant="primary"
-				type="submit"
-				disabled={draft.trim().length === 0 || controller.session === null}
-			>
-				发送
-			</button>
+		{#if controller.error}
+			<p class="alert banner">{controller.error}</p>
+		{/if}
+
+		{#if controller.runtimeState?.statusReason}
+			<p class="banner notice-line">状态原因：{controller.runtimeState.statusReason}</p>
+		{/if}
+
+		{#if controller.interruptError}
+			<p class="alert banner" role="alert">中断未下发：{controller.interruptError}</p>
+		{:else if controller.interruptStream && canInterrupt}
+			<p class="banner notice-line">
+				中断指令已下发（stream <code class="mono">{controller.interruptStream}</code>），等待运行时回推状态更新。
+			</p>
+		{/if}
+
+		{#if showApprovals}
+			<section class="approvals" aria-label="审批请求">
+				{#each controller.approvalNotices as notice (notice.id)}
+					<ApprovalCard
+						{notice}
+						action={controller.noticeAction(notice.id)}
+						onRespond={(decision) => void controller.respond(notice.id, decision)}
+					/>
+				{/each}
+				{#each controller.pendingApprovalItems as item (item.id)}
+					<article class="approval pending-item" data-item-id={item.id}>
+						<div class="pending-head">
+							<span class="badge" data-tone="warn">等待审批</span>
+							<span class="pending-title">{itemHeadline(item)}</span>
+						</div>
+						<p class="pending-hint">
+							时间线条目 <code class="mono">{item.id}</code> 处于等待审批，但 hub 尚未下发对应的审批详情（notice），因此这里没有可提交的决定。
+						</p>
+					</article>
+				{/each}
+			</section>
+		{/if}
+
+		<div class="timeline" bind:this={scroller} onscroll={handleScroll}>
+			{#if controller.loading}
+				<div class="empty"><p>正在加载会话快照…</p></div>
+			{:else if controller.visibleItems.length === 0 && controller.optimistic.length === 0}
+				<div class="empty">
+					<p>这个会话还没有时间线内容。</p>
+					<p>在下方输入框发送第一条消息。</p>
+				</div>
+			{:else}
+				{#each controller.visibleItems as item (item.id)}
+					<TimelineEntry {item} />
+				{/each}
+			{/if}
+
+			{#each controller.optimistic as row (row.clientMessageId)}
+				<article class="optimistic" class:failed={row.failed} data-type="message">
+					<header>
+						<span class="kind">
+							<span class="kind-label">消息</span>
+							<span class="role">用户</span>
+						</span>
+						<span class="right">
+							{#if row.failed}
+								<span class="badge" data-tone="err">发送失败</span>
+							{:else}
+								<span class="badge" data-tone="warn">发送中…</span>
+							{/if}
+							<span class="time">{formatClock(row.createdAt)}</span>
+						</span>
+					</header>
+					<p class="body">{row.content}</p>
+					{#if row.failed && row.error}
+						<p class="alert">{row.error}</p>
+						<button class="btn" type="button" onclick={() => controller.discardOptimistic(row.clientMessageId)}>
+							移除这条
+						</button>
+					{/if}
+				</article>
+			{/each}
 		</div>
-	</form>
-</section>
+
+		<form class="composer" onsubmit={(event) => { event.preventDefault(); void submit(); }}>
+			<textarea
+				class="input"
+				rows="2"
+				placeholder="输入消息，Enter 发送，Shift+Enter 换行"
+				bind:value={draft}
+				onkeydown={handleKeydown}
+				disabled={controller.session === null}
+			></textarea>
+			<div class="composer-actions">
+				<span class="hint">消息经 <code class="mono">POST /runtime/messages</code> 发送，随后由 WS 增量更新</span>
+				<button
+					class="btn"
+					data-variant="primary"
+					type="submit"
+					disabled={draft.trim().length === 0 || controller.session === null}
+				>
+					发送
+				</button>
+			</div>
+		</form>
+	</section>
+
+	{#if filesOpen && session}
+		<FilePanel
+			{token}
+			connectorId={session.connectorId}
+			workspacePath={workspacePath}
+			connectorOnline={connectorOnline}
+		/>
+	{/if}
+</div>
 
 <style>
+	.session-layout {
+		display: flex;
+		height: 100vh;
+		min-height: 0;
+	}
+
 	.session {
 		display: flex;
 		flex-direction: column;
-		height: 100vh;
+		flex: 1;
+		min-width: 0;
+		height: 100%;
 		min-height: 0;
 	}
 

@@ -20,6 +20,33 @@ export function formatClock(iso: string | null): string {
 	return new Date(timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
 }
 
+export function formatBytes(bytes: number): string {
+	if (!Number.isFinite(bytes) || bytes < 0) return '—';
+	if (bytes < 1024) return `${Math.trunc(bytes)} B`;
+	const units = ['KB', 'MB', 'GB', 'TB'];
+	let value = bytes / 1024;
+	let unit = 0;
+	while (value >= 1024 && unit < units.length - 1) {
+		value /= 1024;
+		unit += 1;
+	}
+	const digits = value < 10 ? 1 : 0;
+	return `${value.toFixed(digits)} ${units[unit]}`;
+}
+
+export function formatModified(iso: string | null): string {
+	if (!iso) return '—';
+	const timestamp = Date.parse(iso);
+	if (Number.isNaN(timestamp)) return '—';
+	return new Date(timestamp).toLocaleString('zh-CN', {
+		year: 'numeric',
+		month: '2-digit',
+		day: '2-digit',
+		hour: '2-digit',
+		minute: '2-digit'
+	});
+}
+
 export function describeError(error: unknown): string {
 	if (error instanceof Error) return error.message;
 	if (typeof error === 'string') return error;

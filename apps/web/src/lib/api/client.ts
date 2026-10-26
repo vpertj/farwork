@@ -5,11 +5,13 @@ export const API_NAMESPACE = `${BASE}/api/v2`;
 
 export class ApiError extends Error {
 	readonly status: number;
+	readonly code: string | null;
 
-	constructor(status: number, message: string) {
+	constructor(status: number, message: string, code: string | null = null) {
 		super(message);
 		this.name = 'ApiError';
 		this.status = status;
+		this.code = code;
 	}
 }
 
@@ -51,7 +53,9 @@ export async function apiRequest(path: string, options: RequestOptions = {}): Pr
 	});
 	const text = await response.text();
 	const payload: unknown = text.length > 0 ? safeJson(text) : null;
-	if (!response.ok) throw new ApiError(response.status, errorMessage(payload, response.status));
+	if (!response.ok) {
+		throw new ApiError(response.status, errorMessage(payload, response.status), errorCode(payload));
+	}
 	return payload;
 }
 
@@ -80,6 +84,14 @@ function errorMessage(payload: unknown, status: number): string {
 	}
 	if (typeof payload === 'string' && payload.length > 0) return payload.slice(0, 240);
 	return `请求失败（HTTP ${status}）`;
+}
+
+function errorCode(payload: unknown): string | null {
+	const record = asRecord(payload);
+	if (!record) return null;
+	const nested = asRecord(record.detail);
+	const code = asString(nested?.code) || asString(record.code);
+	return code.length > 0 ? code : null;
 }
 
 const CLIENT_ID_KEY = 'farwork.client.id';

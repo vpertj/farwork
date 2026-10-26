@@ -1,9 +1,12 @@
-import { webSocketUrl, apiRequest, clientId } from './client';
+import { ApiError, webSocketUrl, apiRequest, clientId } from './client';
 import {
 	asRecord,
 	asString,
 	cursorToSeq,
 	parseConnectors,
+	parseFsListing,
+	parseFsText,
+	sortFsEntries,
 	parseCreateAndStart,
 	parseNotice,
 	parseNotices,
@@ -15,6 +18,9 @@ import {
 	type Connector,
 	type CreateAndStartResult,
 	type EventRecovery,
+	type FsFailure,
+	type FsListing,
+	type FsTextFile,
 	type NoticeDecision,
 	type Project,
 	type RuntimeNotice,
@@ -136,6 +142,46 @@ export async function createAndStartSession(
 	const result = parseCreateAndStart(payload);
 	if (!result) throw new Error('创建会话的响应格式无法识别。');
 	return result;
+}
+
+export async function listWorkspaceDir(
+	token: string,
+	connectorId: string,
+	path: string
+): Promise<FsListing> {
+	const payload = await apiRequest(`/connectors/${encodeURIComponent(connectorId)}/fs/list`, {
+		method: 'POST',
+		token,
+		body: { path }
+	});
+	const listing = parseFsListing(payload);
+	if (!listing) throw new Error('目录列表格式无法识别。');
+	return { ...listing, entries: sortFsEntries(listing.entries) };
+}
+
+export async function readWorkspaceText(
+	token: string,
+	connectorId: string,
+	path: string
+): Promise<FsTextFile> {
+	const payload = await apiRequest(`/connectors/${encodeURIComponent(connectorId)}/fs/readText`, {
+		method: 'POST',
+		token,
+		body: { path }
+	});
+	const file = parseFsText(payload);
+	if (!file) throw new Error('文件内容的响应格式无法识别。');
+	return file;
+}
+
+export function fsFailure(error: unknown): FsFailure {
+	if (error instanceof ApiError) {
+		return { status: error.status, code: error.code, message: error.message };
+	}
+	if (error instanceof Error) {
+		return { status: 0, code: null, message: error.message };
+	}
+	return { status: 0, code: null, message: typeof error === 'string' ? error : '未知错误' };
 }
 
 export { cursorToSeq, seqToCursor };
