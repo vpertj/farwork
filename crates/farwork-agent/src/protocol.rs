@@ -186,8 +186,15 @@ pub enum ServerFrame {
         #[serde(rename = "streamId")]
         stream_id: String,
         text: String,
-        #[serde(rename = "clientMessageId")]
-        client_message_id: String,
+        // Absent or null both mean "the caller did not supply one": the hub omits
+        // the key in that case, and dropping the turn over a missing idempotency
+        // token would lose a message the hub already recorded.
+        #[serde(
+            default,
+            rename = "clientMessageId",
+            skip_serializing_if = "Option::is_none"
+        )]
+        client_message_id: Option<String>,
     },
     #[serde(rename = "session.interrupt")]
     SessionInterrupt {
@@ -357,6 +364,44 @@ mod tests {
                 assert_eq!(cwd, "/tmp");
                 assert_eq!(prompt, "hi");
             }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_message_parses_without_a_client_message_id() {
+        let text = r#"{"type":"session.message","streamId":"s1","text":"hi"}"#;
+        match parse_server_frame(text) {
+            ParsedServerFrame::Frame(ServerFrame::SessionMessage {
+                stream_id,
+                text,
+                client_message_id,
+            }) => {
+                assert_eq!(stream_id, "s1");
+                assert_eq!(text, "hi");
+                assert_eq!(client_message_id, None);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_message_parses_a_present_client_message_id() {
+        let text =
+            r#"{"type":"session.message","streamId":"s1","text":"hi","clientMessageId":"cm_x"}"#;
+        match parse_server_frame(text) {
+            ParsedServerFrame::Frame(ServerFrame::SessionMessage {
+                client_message_id, ..
+            }) => assert_eq!(client_message_id.as_deref(), Some("cm_x")),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+
+        let null_text =
+            r#"{"type":"session.message","streamId":"s1","text":"hi","clientMessageId":null}"#;
+        match parse_server_frame(null_text) {
+            ParsedServerFrame::Frame(ServerFrame::SessionMessage {
+                client_message_id, ..
+            }) => assert_eq!(client_message_id, None),
             other => panic!("unexpected parse: {other:?}"),
         }
     }

@@ -326,12 +326,23 @@ pub fn session_message_frame(
     text: &str,
     client_message_id: Option<&str>,
 ) -> Value {
-    json!({
+    let mut frame = json!({
         "type": "session.message",
         "streamId": stream_id,
         "text": text,
-        "clientMessageId": client_message_id,
-    })
+    });
+    // The agent types this field as a string, so an absent id must omit the key
+    // rather than serialize null: null fails the connector's decode and the whole
+    // turn is dropped on the floor.
+    if let Some(client_message_id) = client_message_id {
+        if let Some(map) = frame.as_object_mut() {
+            map.insert(
+                String::from("clientMessageId"),
+                Value::String(client_message_id.to_string()),
+            );
+        }
+    }
+    frame
 }
 
 pub fn session_interrupt_frame(stream_id: &str) -> Value {
@@ -569,6 +580,27 @@ mod tests {
         assert_eq!(frame["message"], "boom");
         assert_eq!(frame["streamId"], "str_1");
         assert!(error_frame("boom", None).get("streamId").is_none());
+    }
+
+    #[test]
+    fn session_message_frame_omits_an_absent_client_message_id() {
+        let frame = session_message_frame("str_1", "hi", None);
+        assert_eq!(frame["type"], "session.message");
+        assert_eq!(frame["streamId"], "str_1");
+        assert_eq!(frame["text"], "hi");
+        // A missing id must be absent, never null: the agent parses this field as
+        // a string and drops the whole turn when it sees null.
+        assert!(frame.get("clientMessageId").is_none());
+        let encoded = serde_json::to_string(&frame).expect("serializes");
+        assert!(!encoded.contains("clientMessageId"));
+        assert_eq!(
+            frame.as_object().expect("object").keys().count(),
+            3,
+            "expected exactly type/streamId/text, got {encoded}"
+        );
+
+        let with_id = session_message_frame("str_1", "hi", Some("cm_x"));
+        assert_eq!(with_id["clientMessageId"], "cm_x");
     }
 
     #[test]

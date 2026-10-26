@@ -307,7 +307,12 @@ impl Connector {
                 &stream_id,
                 SessionCmd::Message {
                     text,
-                    client_message_id,
+                    // codex's turn/start needs a non-empty clientUserMessageId as
+                    // its own idempotency key, so an omitted one is minted here.
+                    // This id never reaches the hub: timeline idempotency stays
+                    // hub-side (unique session_id + client_message_id).
+                    client_message_id: client_message_id
+                        .unwrap_or_else(|| format!("cmid_{}", uuid::Uuid::new_v4().simple())),
                 },
             ),
             ServerFrame::SessionInterrupt { stream_id } => {
