@@ -110,6 +110,39 @@ cargo run -p farwork-agent -- \
   --dsh-endpoint ~/.farwork/dsh-bridge/endpoint.json
 ```
 
+## Sidebar panel (client half)
+
+The same package ships the browser half: `dsh.client` in `package.json` points DSH
+at `./client.js` — a hand-written CJS factory (no bundler, no JSX, inline styles)
+that registers one entry in the `sidebar.footer.action` slot, i.e. the row just
+above the settings gear. A collapsed sidebar shows the mark alone and keeps the
+accessible name.
+
+It reads the bridge over one RPC channel, `/farwork` (**not** `/api`: the Typert
+gateway owns that channel), with exactly three endpoints:
+
+| endpoint | answers |
+|---|---|
+| `status` | `{ ready, port, endpointPath, pid, lastError, version }` — a field whitelist; **the endpoint token is never sent** |
+| `command` | `{ command }` — the `farwork-agent … --dsh-endpoint <path>` line, built host-side so the template lives in one place |
+| `savePair` | `{ accepted, hasToken, hub }` — keeps a pasted `connectorToken` in host memory only (never logged, never echoed back) |
+
+`rpc.handle` is owned by the *connection* service's context, so the plugin keeps
+every disposer it is given — the registration and, when used, the `ctx.inject`
+subscription — and releases them on stop. Registration tries the first route the
+host supports: direct (`ctx.get('connection')` / `ctx.connection`), then
+`ctx.inject(['connection'], …)` so a host whose connection service is not up yet
+still gets the panel late, then a single actionable `warn` saying the host
+provides no connection service at all. A successful registration logs one `info`
+line with the channel and the mode (`direct` / `inject`) — that line is what to
+grep when the panel does not appear. A refused registration only logs; nothing
+here can throw into DSH.
+
+Panel contents, v1: the readiness badge plus the verbatim `lastError`, the endpoint
+path and port with copy buttons, the copyable agent command, a `connectorToken`
+input with "regenerate command", and one line stating the boundary — **approvals and
+questions are not part of this plugin in v1; answer them in DSH's own UI.**
+
 ## Uninstall
 
 ```bash

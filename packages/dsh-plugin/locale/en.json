@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Farwork bridge",
+    "description": "Expose this machine's DSH sessions as a loopback JSON-RPC endpoint for the Farwork workbench. The Farwork panel at the bottom of the sidebar shows its status and configuration."
+  }
+}

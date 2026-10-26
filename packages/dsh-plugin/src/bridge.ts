@@ -13,7 +13,7 @@ import { RuntimeRouter } from './router.js'
 import { Host, watchEvents } from './runtime.js'
 import type { HostChange } from './runtime.js'
 import { RuntimeServer } from './transport.js'
-import { isRecord } from './values.js'
+import { errorMessage, isRecord } from './values.js'
 
 export interface ResolvedConfig {
   endpointDir: string
@@ -24,6 +24,22 @@ export interface BridgeOptions {
   config: ResolvedConfig
   logger: Logger
   pid?: number
+}
+
+/**
+ * What the panel may know about the bridge.
+ *
+ * The endpoint token is deliberately absent: it is an equivalent credential for
+ * this runtime, and the browser half has no use for it (the agent reads the 0600
+ * endpoint file itself).
+ */
+export interface BridgeStatus {
+  ready: boolean
+  port: number
+  endpointPath: string
+  pid: number
+  /** Why the last start() failed, verbatim: a panel that only says "not ready" is useless. */
+  lastError: string | null
 }
 
 export class Bridge {
@@ -38,6 +54,7 @@ export class Bridge {
   private unwatch: (() => void) | null = null
   private endpointPublished = false
   private stopping = false
+  private lastError: string | null = null
 
   constructor(options: BridgeOptions) {
     this.ctx = options.ctx
@@ -54,8 +71,33 @@ export class Bridge {
     return this.server?.port ?? 0
   }
 
+  get status(): BridgeStatus {
+    return {
+      // Ready means the published endpoint, not a live listener: until
+      // endpoint.json exists no client can connect, so a port alone would
+      // overstate readiness.
+      ready: this.endpointPublished && !this.stopping,
+      port: this.port,
+      endpointPath: this.endpointFile,
+      pid: this.pid,
+      lastError: this.lastError,
+    }
+  }
+
   /** Throws only for the caller to log: DSH must start even when this fails. */
   async start(): Promise<void> {
+    this.lastError = null
+    try {
+      await this.startUnsafe()
+    } catch (error) {
+      // Recorded before rethrowing: the caller still logs it, but the reason has
+      // to survive in memory too, or the only trace of it is a log line.
+      this.lastError = errorMessage(error)
+      throw error
+    }
+  }
+
+  private async startUnsafe(): Promise<void> {
     const host = new Host(this.ctx)
     const router = new RuntimeRouter({
       host,

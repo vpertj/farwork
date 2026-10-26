@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Farwork 桥",
+    "description": "把本机 DSH 会话以 loopback JSON-RPC 端点暴露给 Farwork 工作台（侧栏底部的 Farwork 面板可查看状态与配置）。"
+  }
+}

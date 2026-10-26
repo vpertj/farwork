@@ -13,6 +13,7 @@ import { Bridge, resolveConfig } from './bridge.js'
 import type { ResolvedConfig } from './bridge.js'
 import { createLogger } from './logger.js'
 import type { Logger } from './logger.js'
+import { installPanel } from './panel.js'
 
 export type { ResolvedConfig } from './bridge.js'
 
@@ -53,10 +54,16 @@ export function apply(ctx: unknown, config: unknown): () => void {
   const logger: Logger = safeLogger(ctx)
   try {
     const bridge = new Bridge({ ctx, config: resolveConfig(config), logger })
+    // Registered before start(): the panel must be readable while the bridge is
+    // still failing, which is exactly when its lastError is the interesting part.
+    const panel = installPanel({ ctx, bridge, logger })
     let stopped = false
     const dispose = (): void => {
       if (stopped) return
       stopped = true
+      // Released first: the channel is owned by the connection service's context,
+      // so it outlives this plugin unless we drop it here.
+      panel.dispose()
       void bridge.stop().catch((error: unknown) => {
         logger.warn('the bridge could not shut down cleanly', error)
       })

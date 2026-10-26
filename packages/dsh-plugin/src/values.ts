@@ -50,6 +50,19 @@ export function bytesOf(value: unknown): number {
   }
 }
 
+/** A one-line description of a thrown value, for logs that must not swallow it. */
+export function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message.length > 0 ? error.message : error.name
+  if (typeof error === 'string' && error.length > 0) return error
+  try {
+    const text = JSON.stringify(error)
+    if (typeof text === 'string' && text.length > 0) return text
+  } catch {
+    // Circular or otherwise unprintable: the type name is all we can honestly say.
+  }
+  return 'unknown error'
+}
+
 export function timestampOf(value: unknown): string {
   const text = asString(value)
   if (text !== undefined) return text
