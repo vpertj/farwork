@@ -29,7 +29,7 @@
 | `farwork-server` | `crates/farwork-server` | **M1 遗留**：`/api/health`、`/api/devices`、`/ws/connector`、`/ws/client` 终端骨架 | 端口 7300（与 hub 冲突） |
 | `farwork-agent` | `crates/farwork-agent` | **M3 真正的 connector**：主动出站连 hub 的 `/connector/ws`，按 `session.start` 拉起本地 `codex app-server`（或 `--runtime echo` 的假后端），把 codex 的 JSON-RPC 翻成 Ingress Protocol v1 上行 | 无监听端口（只出站） |
 | `farwork-connector` | `crates/farwork-connector` | **M1 遗留**：按 `terminal.open` 起 PTY 并双向转发，只连 `farwork-server` 的 `/ws/connector`；**没有 ingress 协议，也没接 hub** | 出站连接 |
-| `apps/web` | `apps/web` | SvelteKit 静态 SPA：登录、connectors/项目/会话、timeline、发消息、WS 增量 | dev 端口 5173 |
+| `apps/web` | `apps/web` | SvelteKit 静态 SPA：登录、connectors/项目/会话、timeline、发消息、WS 增量、审批卡、新建会话表单（`#/new-session`）、会话中断 | dev 端口 5173 |
 
 > **`farwork-agent` 与 `farwork-connector` 是两件不同的东西，不是一次重命名。** `farwork-connector`（M1）说的是终端帧协议（`terminal.open` / `terminal.data` / `terminal.exit`），只跟 `farwork-server` 讲话，设备 id 每次启动重新生成；`farwork-agent`（M3）说的是 Ingress Protocol v1（`hello` / `session.*` / `item.upsert` / `notice.*`），只跟 `farwork-hub` 讲话，身份落盘在 `$FARWORK_HOME/agent.json`。两者不共享线协议也不共享代码路径；M3 没有删除 `farwork-connector`，它仍是 M1 终端探针。
 
@@ -203,24 +203,29 @@ hub 侧类型是 `crates/farwork-hub/src/ingress.rs:367-437` 的 `ConnectorFrame
 
 ### 5.3 下行（hub → connector）
 
-hub 用 `ingress.rs:286-347` 的五个构造函数产出帧；agent 用 `protocol.rs:166-215` 的 `ServerFrame` 解析。
+hub 用 `ingress.rs:286-354` 的六个构造函数产出帧；agent 用 `protocol.rs:166-215` 的 `ServerFrame` 解析。
 
 | `type` | wire 字段 | agent 侧行为 | hub 何时发 |
 | --- | --- | --- | --- |
 | `welcome` | `serverVersion`, `heartbeatSecs` | 握手完成；心跳间隔取 `max(heartbeatSecs,1)` | 握手成功后 |
 | `session.start` | `streamId`, `sessionId`, `runtime`, `cwd`, `prompt` | 校验 `runtime` 与本进程 `--runtime` 一致（不一致 → `error` + `session.exit{code:2}`，绝不冒充别的运行时）；一致则 spawn `codex app-server --stdio` 并回 `session.started` | `POST /sessions/create-and-start`（`sessions.rs:615-641`） |
-| `session.message` | `streamId`, `text`, `clientMessageId` | 追加到该流的 codex 线程（`turn/start`）；无该流 → `error` | `POST /sessions/{id}/runtime/messages`，且仅当该会话有活跃流 |
+| `session.message` | `streamId`, `text`, `clientMessageId`（**可选**：hub 无值时不发该键；agent 必须能解析缺失与 `null`） | 追加到该流的 codex 线程（`turn/start`），`clientMessageId` 缺失时本地生成 `cmid_<uuid>` 当幂等键；无该流 → `error` | `POST /sessions/{id}/runtime/messages`，且仅当该会话有活跃流 |
 | `session.interrupt` | `streamId` | 映射成 codex `turn/interrupt`；`turn/completed{status:"interrupted"}` 把在跑条目收成 `interrupted` | `POST /sessions/{id}/runtime/interrupt` |
 | `notice.respond` | `noticeId`, `decision`（**无** `streamId`，与上行同形） | 在所有 live worker 里按 noticeId 找提示并回 JSON-RPC result；找不到只 warn | `POST .../notices/{id}/respond` |
 | `error` | `message`, `streamId?` | 只记日志，**不断连** | 无法路由的入站帧、心跳超时、被新连接顶替 |
 
-**未知 `type` 必须丢帧不断连**：agent 的 `parse_server_frame` 把「未知类型」与「已知类型但 payload 不合法」分开（`protocol.rs:235-266`），前者 debug 后丢弃、后者 warn 后丢弃，socket 都不关。
+**未知 `type` 必须丢帧不断连**：agent 的 `parse_server_frame` 把「未知类型」与「已知类型但 payload 不合法」分开（`protocol.rs:242-266`），前者 debug 后丢弃、后者 warn 后丢弃，socket 都不关。
 
-### 5.4 两侧字段不一致（**真实缺陷，不是措辞问题**）
+### 5.4 `clientMessageId` 是可选字段（曾静默丢整轮，故两侧都必须宽容）
 
-逐字段对过一遍，只有一处会真的坏事：
+**当前契约**（三处已同改，见 `ingress.rs:324-346`、`protocol.rs:186-200`、`hub.rs:303-319`）：
 
-- **`session.message.clientMessageId`**：hub 侧是 `Option<&str>`（`ingress.rs:324-335`），浏览器不带 `clientMessageId` 时序列化成 `"clientMessageId": null`；agent 侧是**必填** `String`（`protocol.rs:185-191`）。serde 对 `null` 直接报错 → `parse_server_frame` 归入 `Malformed{ty:"session.message"}` → `hub.rs:237-239` 只 warn 然后**丢掉这一帧**。后果：hub 已落库并回了 `runtimeDispatched:true`，而 agent 从未收到这一轮 —— 界面显示「已发送」，运行时毫无动静。**影响范围**：Web UI 恒发 `cmid-<uuid>`（`apps/web/src/lib/session.svelte.ts:190`），所以现有页面不会踩到；省略该字段的 REST 调用者会踩。修法只能二选一（hub 改发 `""`/省略该字段，或 agent 改收 `Option`），且**两边都要动并同步本文**。
+- **hub 侧：可选字段**。`session_message_frame(stream_id, text, client_message_id: Option<&str>)` 在无值时**不输出 `clientMessageId` 键**，而不是序列化成 `null`（`ingress.rs:337-346`）。测试 `ingress::tests::session_message_frame_omits_an_absent_client_message_id`（`ingress.rs:586-604`）断言该键不存在、编码结果里不含这串字面量、键数恰为 `type`/`streamId`/`text` 三个。
+- **agent 侧：`Option<String>`**。`ServerFrame::SessionMessage.client_message_id` 带 `#[serde(default, rename = "clientMessageId", skip_serializing_if = "Option::is_none")]`，因此**缺失、`null`、字符串三种都能解析**（`protocol.rs:192-200`）；测试 `protocol::tests::session_message_parses_without_a_client_message_id`（`protocol.rs:372-385`）以及 `session_message_parses_a_present_client_message_id`（含 `null` 分支，`protocol.rs:388-406`）。
+- **agent 自造本地 id**：hub 未提供 id 时，agent 生成 `cmid_<uuid>` 交给 codex 的 `turn/start` 当它自己的幂等键；该 id **不回落 hub**，timeline 幂等仍只由 `unique (session_id, client_message_id)` 保证（§4.5；`hub.rs:303-319`）。
+- **契约结论**：`clientMessageId` 在 ingress 上是**可选**字段；hub 无值时不发该键；agent **必须**同时能解析「缺失」与 `null`。
+
+**为什么两侧都要宽容（踩过的坑，别改回去）**：这个缺陷真的发生过 —— hub 曾序列化 `"clientMessageId": null`，agent 曾要求必填 `String`，serde 报错后这一帧被 `parse_server_frame` 归入 `Malformed` 并丢弃（`hub.rs:237-239` 只 warn），而 hub 已经把这一轮落库并回了 `runtimeDispatched:true` —— 界面显示「已发送」，运行时毫无动静。省略该字段的 REST 调用者必踩；Web UI 恒发 `cmid-<uuid>`（`apps/web/src/lib/session.svelte.ts:194`），所以页面当时没暴露。经验：**下游可能不传的字段，上游必须能省、下游必须能缺；任一侧收紧成必填都会让整轮静默消失**。
 
 其余差异都是「hub 比 agent 宽松」，不构成破坏，但说明「hub 接受」不等于「契约要求」：
 

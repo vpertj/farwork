@@ -128,7 +128,9 @@ pnpm run preview                 # 4173，预览静态产物（CI 不跑）
 
 ### 4.9 connector ingress（M3）四条硬约束
 
-- **契约两侧同改**：ingress 帧的任何字段改动必须一次改完三处 —— `crates/farwork-hub/src/ingress.rs`（构造 + 解析）、`crates/farwork-agent/src/protocol.rs`（`ClientFrame` / `ServerFrame`）、`docs/architecture.md` §5 的两张帧表。只改一侧＝线上静默丢帧；现状就有一例（`session.message.clientMessageId`：hub 发 `null`、agent 要 `String`，省略该字段的 REST 调用者会让整轮被丢 —— Web UI 恒发该字段，所以现网页面暂时没暴露，见 `docs/architecture.md` §5.4）。
+- **契约两侧同改，且两侧都必须宽容**：ingress 帧的任何字段改动必须一次改完三处 —— `crates/farwork-hub/src/ingress.rs`（构造 + 解析）、`crates/farwork-agent/src/protocol.rs`（`ClientFrame` / `ServerFrame`）、`docs/architecture.md` §5 的两张帧表。只改一侧＝线上静默丢帧。
+  - `session.message.clientMessageId` 是**可选字段**：hub 无值时不发该键（`ingress.rs:324-346`，`session_message_frame` 只在 `Some` 时插入 `clientMessageId`）；agent 用 `Option<String>` + `#[serde(default)]` 同时接受缺失与 `null`（`protocol.rs:186-200`）；hub 没给时 agent 本地生成 `cmid_<uuid>` 交给 codex `turn/start`，该 id **不回落 hub**，hub 侧幂等仍只靠 `unique (session_id, client_message_id)`（`hub.rs:303-319`）。
+  - 两侧都**不许**把它收紧成必填或非 `null`：旧的「hub 发 `null`、agent 要 `String`」就是这样让整轮被当畸形帧丢掉（`hub.rs:237-239` 只 warn），而 hub 已落库并回了 `runtimeDispatched:true` —— 界面显示「已发送」、运行时毫无动静。这条经验是契约本身的理由：下游可能不传的字段，上游必须能省、下游必须能缺。细节见 `docs/architecture.md` §5.4；回归测试 `hub ingress::tests::session_message_frame_omits_an_absent_client_message_id`、`agent protocol::tests::session_message_parses_without_a_client_message_id`。
 - **hub 不得乐观 resolve notice**：`POST .../notices/{id}/respond` 只负责下发 `notice.respond`；把 `status` 写成 `resolved` 的**唯一**入口是 connector 回报的 `notice.resolved`。hub 抢先置为已解决，一旦投递失败就会留下「已批准但没人执行」的假状态。
 - **不得伪造 codex 的 `GrantedPermissionProfile`**：`item/permissions/requestApproval` 必须回 JSON-RPC error（`-32601`）并如实上报，绝不凭空构造一个用户没看过的授权对象。同理，任何地方都不许用假成功掩盖缺能力。
 - **connector 断连必须让在途流收敛为 error**：socket 结束 → 关掉该 connector 全部未关流、把对应会话标 `error`（`status_reason = "connector disconnected"`）并广播，而不是把在途流静默丢弃或让它永远挂在 `running`。同理，没有活跃流时 `POST runtime/messages` 只落库并回 `runtimeDispatched:false`。
@@ -137,9 +139,10 @@ pnpm run preview                 # 4173，预览静态产物（CI 不跑）
 
 - **M2 纵向切片已交付**：登录 → connectors/项目/会话 → timeline 渲染 → 发消息 → WS 增量 → `seq:N` 游标补拉，全部走真实 PostgreSQL。
 - **M3 部分交付**：connector ingress（`GET /api/v2/connector/ws`）+ 新 crate `farwork-agent` + 审批/中断（后端与协议），已用真二进制实测；`connectors.status` 现在有真实 `online`/`offline`。已验证/未验证的清单以 `docs/roadmap.md` 的 M3 为准，别在这里重新措辞。
-- **还没有**：Web 审批卡、新建会话表单、文件浏览、终端、分享、管理台；以及 codex 的**成功路径**（assistant 文本增量、工具执行、真实审批往返）—— 本机无 Codex 凭据，未验证。对应的 REST 仍在 `crates/farwork-hub/src/routes/unsupported.rs` 里统一回 `501 not_implemented`（**49 条**；M3 移出了 interrupt / notices / notices respond 三条），其余未注册路径回 `404`。**不要把 501 说成「已支持」，也不要把「协议跑通」说成「agent 能干活」。**
+- **Web 侧已交付审批卡与新建会话表单**（`apps/web/src/components/ApprovalCard.svelte`、`NewSessionPage.svelte`，`#/new-session`）：卡片三按钮 + 「已下发，等待运行时确认」、失败可重试、`resolved` 变灰；中断按钮与状态原因行在 `SessionView.svelte`。口径以 `docs/roadmap.md` 的 M3「已验证」为准。
+- **还没有**：文件浏览、终端、分享、管理台；以及 codex 的**成功路径**（assistant 文本增量、工具执行、真实审批往返）—— 本机无 Codex 凭据，未验证；`file_change` / `permissions` 两种 notice kind 也从未在联调中出现。对应的 REST 仍在 `crates/farwork-hub/src/routes/unsupported.rs` 里统一回 `501 not_implemented`（**49 条**；M3 移出了 interrupt / notices / notices respond 三条），其余未注册路径回 `404`。**不要把 501 说成「已支持」，也不要把「协议跑通」说成「agent 能干活」。**
 - `snapshot.approvals` 与 `runtime/capabilities` 仍是空值：Ingress Protocol v1 没有对应帧，空着是诚实值，不是待填的占位符。
-- 下一步顺序见 `docs/roadmap.md` 的 M3「下一批」：Web 审批卡 → 新建会话表单 → 文件浏览 → 终端 → 分享 → 管理台。
+- 下一步顺序见 `docs/roadmap.md` 的 M3「下一批」：文件浏览 → 终端 → 分享 → 管理台（Web 审批卡与新建会话表单已交付）。
 - App 属 M4，本轮不做；不要提前引入 Capacitor、移动平台目录或原生桥接代码。
 - **已实测的边界事实**：M1 `farwork-connector` 的设备 id 每次进程启动重新生成（`crates/farwork-connector/src/main.rs:28-30`，`Uuid::new_v4()`），**未持久化**；M3 的 `farwork-agent` 已把身份落盘（`$FARWORK_HOME/agent.json`，文件 0600 / 目录 0700）。两者身份策略不同，别照 M1 的写法去改 agent。
 
