@@ -22,7 +22,8 @@ import {
 	type FsFailure,
 	type FsListing,
 	type FsTextFile,
-	type NoticeDecision,
+	type NoticeActionId,
+	type NoticeInputData,
 	type Project,
 	type RuntimeNotice,
 	type Session,
@@ -107,11 +108,15 @@ export async function respondNotice(
 	token: string,
 	sessionId: string,
 	noticeId: string,
-	decision: NoticeDecision
+	actionId: NoticeActionId,
+	inputData: NoticeInputData | null
 ): Promise<RuntimeNotice | null> {
+	// 契约字段是 actionId；decision 是后端仍兼容的旧字段，留着让未升级的 hub 也认三个旧值。
+	const body: Record<string, unknown> = { actionId, decision: actionId };
+	if (inputData !== null) body.inputData = inputData;
 	const payload = await apiRequest(
 		`/sessions/${encodeURIComponent(sessionId)}/notices/${encodeURIComponent(noticeId)}/respond`,
-		{ method: 'POST', token, body: { decision } }
+		{ method: 'POST', token, body }
 	);
 	return parseNotice(asRecord(payload)?.notice);
 }

@@ -28,7 +28,8 @@ import {
 	parseSession,
 	parseTimelineItem,
 	parseTimelineItems,
-	type NoticeDecision,
+	type NoticeActionId,
+	type NoticeInputData,
 	type RuntimeCapabilities,
 	type RuntimeCapabilityFlags,
 	type RuntimeCatalogItem,
@@ -47,16 +48,16 @@ import { isVisibleItem, sortItems } from './timeline';
 
 export type NoticeAction = {
 	pending: boolean;
-	submitted: NoticeDecision | null;
+	submitted: NoticeActionId | null;
 	error: string | null;
-	lastDecision: NoticeDecision | null;
+	lastActionId: NoticeActionId | null;
 };
 
 const EMPTY_ACTION: NoticeAction = {
 	pending: false,
 	submitted: null,
 	error: null,
-	lastDecision: null
+	lastActionId: null
 };
 
 export type ConnectionState = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed';
@@ -370,28 +371,32 @@ export class SessionController {
 	 * hub keeps the notice open until the connector confirms with
 	 * `notice.resolved`, which arrives as a `runtime.notice.updated` delta.
 	 */
-	async respond(noticeId: string, decision: NoticeDecision): Promise<void> {
+	async respond(
+		noticeId: string,
+		actionId: NoticeActionId,
+		inputData: NoticeInputData | null
+	): Promise<void> {
 		if (this.noticeAction(noticeId).pending) return;
 		this.setNoticeAction(noticeId, {
 			pending: true,
 			submitted: null,
 			error: null,
-			lastDecision: decision
+			lastActionId: actionId
 		});
 		try {
-			await respondNotice(this.#token, this.sessionId, noticeId, decision);
+			await respondNotice(this.#token, this.sessionId, noticeId, actionId, inputData);
 			this.setNoticeAction(noticeId, {
 				pending: false,
-				submitted: decision,
+				submitted: actionId,
 				error: null,
-				lastDecision: decision
+				lastActionId: actionId
 			});
 		} catch (error) {
 			this.setNoticeAction(noticeId, {
 				pending: false,
 				submitted: null,
 				error: describeError(error),
-				lastDecision: decision
+				lastActionId: actionId
 			});
 		}
 	}

@@ -197,9 +197,17 @@ export function parseRuntimeState(value: unknown): RuntimeState | null {
 	};
 }
 
-export type NoticeDecision = 'approve' | 'approve_for_session' | 'reject';
+/** 操作 id 是自由字符串（DSH 的 actionId 直传），旧的 approve/approve_for_session/reject 只是它的一个子集。 */
+export type NoticeActionId = string;
 
-export const NOTICE_DECISIONS: readonly NoticeDecision[] = ['approve', 'approve_for_session', 'reject'];
+export type NoticeOption = {
+	id: string;
+	/** 旧字符串形态只带 id，label 为空，由渲染层回落。 */
+	label: string;
+	style: string | null;
+};
+
+export type NoticeInputData = { text: string };
 
 export type RuntimeNotice = {
 	id: string;
@@ -207,11 +215,26 @@ export type RuntimeNotice = {
 	status: string;
 	title: string;
 	body: Record<string, unknown> | null;
-	options: string[];
+	options: NoticeOption[];
+	/** 'approval' | 'question'；缺省时不猜，交给渲染层按审批处理。 */
+	interactionType: string | null;
 	decision: string | null;
 	createdAt: string;
 	updatedAt: string;
 };
+
+/** options 两种形态并存：旧数据是 id 字符串数组，新数据是 {id,label,style}。 */
+function parseNoticeOption(value: unknown): NoticeOption | null {
+	if (typeof value === 'string') {
+		const id = value.trim();
+		return id.length > 0 ? { id, label: '', style: null } : null;
+	}
+	const raw = asRecord(value);
+	if (!raw) return null;
+	const id = (asString(raw.id) || asString(raw.actionId)).trim();
+	if (id.length === 0) return null;
+	return { id, label: asString(raw.label).trim(), style: asNullableString(raw.style) };
+}
 
 export function parseNotice(value: unknown): RuntimeNotice | null {
 	const raw = asRecord(value);
@@ -224,7 +247,10 @@ export function parseNotice(value: unknown): RuntimeNotice | null {
 		status: asString(raw.status, 'open'),
 		title: asString(raw.title),
 		body: asRecord(raw.body),
-		options: asArray(raw.options).filter((option): option is string => typeof option === 'string'),
+		options: asArray(raw.options)
+			.map(parseNoticeOption)
+			.filter((option): option is NoticeOption => option !== null),
+		interactionType: asNullableString(raw.interactionType),
 		decision: asNullableString(raw.decision),
 		createdAt: asString(raw.createdAt),
 		updatedAt: asString(raw.updatedAt)
@@ -237,10 +263,6 @@ export function parseNotices(value: unknown): RuntimeNotice[] {
 
 export function isOpenNotice(notice: RuntimeNotice): boolean {
 	return notice.status !== 'resolved';
-}
-
-export function isNoticeDecision(value: string): value is NoticeDecision {
-	return NOTICE_DECISIONS.includes(value as NoticeDecision);
 }
 
 export type ConnectorResult = {

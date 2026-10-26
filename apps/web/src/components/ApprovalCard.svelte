@@ -1,12 +1,16 @@
 <script lang="ts">
-	import type { NoticeDecision, RuntimeNotice } from '$lib/api/types';
+	import type { NoticeActionId, NoticeInputData, RuntimeNotice } from '$lib/api/types';
 	import type { NoticeAction } from '$lib/session.svelte';
 	import { formatClock } from '$lib/format';
 	import {
+		noticeActionLabel,
 		noticeDecisionLabel,
 		noticeFields,
+		noticeInputSchemaText,
+		noticeIsQuestion,
 		noticeKindLabel,
-		noticeKindTone
+		noticeKindTone,
+		noticeOptionLabel
 	} from '$lib/notice';
 
 	let {
@@ -16,26 +20,40 @@
 	}: {
 		notice: RuntimeNotice;
 		action: NoticeAction;
-		onRespond: (decision: NoticeDecision) => void;
+		onRespond: (actionId: NoticeActionId, inputData: NoticeInputData | null) => void;
 	} = $props();
 
 	const resolved = $derived(notice.status === 'resolved');
-	const fields = $derived(noticeFields(notice.body));
+	const question = $derived(noticeIsQuestion(notice));
+	const fields = $derived(noticeFields(notice));
+	const schemaText = $derived(noticeInputSchemaText(notice));
 	const awaitingRuntime = $derived(!resolved && (action.pending || action.submitted !== null));
 	const buttonsDisabled = $derived(resolved || action.pending || action.submitted !== null);
+	let answer = $state('');
 
 	const statusText = $derived(
 		resolved
-			? noticeDecisionLabel(notice.decision)
+			? noticeDecisionLabel(notice)
 			: action.pending
 				? '提交中…'
 				: action.submitted
-					? `已下发「${noticeDecisionLabel(action.submitted)}」，等待运行时确认`
-					: '待审批'
+					? `已下发「${noticeActionLabel(notice, action.submitted)}」，等待运行时确认`
+					: question
+						? '待填写'
+						: '待审批'
 	);
 
+	function inputData(): NoticeInputData | null {
+		return schemaText === null ? null : { text: answer };
+	}
+
+	function submit(actionId: NoticeActionId): void {
+		onRespond(actionId, inputData());
+	}
+
 	function retry(): void {
-		onRespond(action.lastDecision ?? 'approve');
+		const actionId = action.lastActionId ?? notice.options[0]?.id;
+		if (actionId) onRespond(actionId, inputData());
 	}
 </script>
 
@@ -48,7 +66,7 @@
 				</span>
 				<span class="badge" data-tone={resolved ? 'muted' : 'warn'}>{statusText}</span>
 			</div>
-			<h3>{notice.title || '未命名审批请求'}</h3>
+			<h3>{notice.title || (question ? '未命名提问' : '未命名审批请求')}</h3>
 		</div>
 		<span class="time">{formatClock(notice.createdAt)}</span>
 	</header>
@@ -62,48 +80,52 @@
 		{/each}
 	</dl>
 
+	{#if question && schemaText !== null}
+		<div class="answer">
+			<label for="notice-answer-{notice.id}">需要你填写</label>
+			<pre class="schema mono">{schemaText}</pre>
+			<textarea
+				id="notice-answer-{notice.id}"
+				data-notice-input={notice.id}
+				bind:value={answer}
+				rows="3"
+				placeholder="按上面的字段描述填写"
+				disabled={buttonsDisabled}
+			></textarea>
+		</div>
+	{/if}
+
 	{#if action.error}
 		<p class="alert" role="alert">{action.error}</p>
 	{/if}
 
 	{#if !resolved}
 		<div class="actions">
-			<button
-				class="btn"
-				data-variant="primary"
-				type="button"
-				disabled={buttonsDisabled}
-				onclick={() => onRespond('approve')}
-			>
-				批准
-			</button>
-			<button
-				class="btn"
-				type="button"
-				disabled={buttonsDisabled}
-				onclick={() => onRespond('approve_for_session')}
-			>
-				本会话内总是批准
-			</button>
-			<button
-				class="btn"
-				type="button"
-				disabled={buttonsDisabled}
-				onclick={() => onRespond('reject')}
-			>
-				拒绝
-			</button>
-			{#if action.error && !action.pending}
+			{#each notice.options as option (option.id)}
+				<button
+					class="btn"
+					data-variant={option.style === 'primary' ? 'primary' : undefined}
+					data-action-id={option.id}
+					type="button"
+					disabled={buttonsDisabled}
+					onclick={() => submit(option.id)}
+				>
+					{noticeOptionLabel(option)}
+				</button>
+			{/each}
+			{#if action.error && !action.pending && notice.options.length > 0}
 				<button class="btn" data-variant="ghost" type="button" onclick={retry}>重试</button>
 			{/if}
 		</div>
-		{#if awaitingRuntime}
+		{#if notice.options.length === 0}
+			<p class="hint">运行时没有给出可选操作，无法从这里回应。</p>
+		{:else if awaitingRuntime}
 			<p class="hint">决定已送达 hub；卡片状态以运行时回推的 notice.resolved 为准。</p>
 		{:else}
 			<p class="hint">决定经 <code class="mono">POST /notices/{notice.id}/respond</code> 下发到设备。</p>
 		{/if}
 	{:else}
-		<p class="hint">运行时已确认：{noticeDecisionLabel(notice.decision)}</p>
+		<p class="hint">运行时已确认：{noticeDecisionLabel(notice)}</p>
 	{/if}
 </article>
 
@@ -186,7 +208,8 @@
 		word-break: break-word;
 	}
 
-	dd.mono {
+	dd.mono,
+	.schema {
 		font-size: 11.5px;
 		padding: 4px 6px;
 		border-radius: var(--radius-sm);
@@ -194,6 +217,35 @@
 		border: 1px solid var(--border);
 		max-height: 180px;
 		overflow: auto;
+	}
+
+	.answer {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+	}
+
+	.answer label {
+		font-size: 11px;
+		color: var(--muted-foreground);
+	}
+
+	.schema {
+		margin: 0;
+		white-space: pre-wrap;
+		word-break: break-word;
+	}
+
+	textarea {
+		width: 100%;
+		resize: vertical;
+		padding: 6px 8px;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border);
+		background: oklch(0.1 0 0 / 70%);
+		color: inherit;
+		font-size: 12px;
+		line-height: 1.55;
 	}
 
 	.actions {

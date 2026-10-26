@@ -333,7 +333,8 @@
 					<ApprovalCard
 						{notice}
 						action={controller.noticeAction(notice.id)}
-						onRespond={(decision) => void controller.respond(notice.id, decision)}
+						onRespond={(actionId, inputData) =>
+							void controller.respond(notice.id, actionId, inputData)}
 					/>
 				{/each}
 				{#each controller.pendingApprovalItems as item (item.id)}

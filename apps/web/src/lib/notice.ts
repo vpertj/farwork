@@ -1,4 +1,4 @@
-import { asRecord, asString, type RuntimeNotice } from './api/types';
+import { asRecord, asString, type NoticeOption, type RuntimeNotice } from './api/types';
 import type { Tone } from './timeline';
 
 export function noticeKindLabel(kind: string): string {
@@ -33,23 +33,54 @@ export function noticeStatusLabel(notice: RuntimeNotice): string {
 	return notice.status;
 }
 
-export function noticeDecisionLabel(decision: string | null): string {
-	switch (decision) {
-		case 'approve':
-			return '已批准（本次）';
-		case 'approve_for_session':
-			return '已批准（本会话内总是）';
-		case 'reject':
-			return '已拒绝';
-		default:
-			return decision ?? '未给出决定';
+/** 旧字符串形态只带 id，中文按既有口径补；未知 id 一律用服务端 label 或原样 id，绝不编造。 */
+const LEGACY_ACTION_LABELS: Record<string, string> = {
+	approve: '批准',
+	approve_for_session: '本会话内总是批准',
+	reject: '拒绝'
+};
+
+export function noticeOptionLabel(option: NoticeOption): string {
+	return option.label || LEGACY_ACTION_LABELS[option.id] || option.id;
+}
+
+export function noticeActionLabel(notice: RuntimeNotice, actionId: string | null): string {
+	if (!actionId) return '未给出决定';
+	const option = notice.options.find((item) => item.id === actionId);
+	return noticeOptionLabel(option ?? { id: actionId, label: '', style: null });
+}
+
+export function noticeDecisionLabel(notice: RuntimeNotice): string {
+	return noticeActionLabel(notice, notice.decision);
+}
+
+export function noticeIsQuestion(notice: RuntimeNotice): boolean {
+	return notice.interactionType === 'question';
+}
+
+/**
+ * 只有服务端真的给了 schema 才渲染输入框：各 runtime 的字段形状不同，
+ * 猜一个字段名等于给用户一个填了也没人看的框。
+ */
+export function noticeInputSchemaText(notice: RuntimeNotice): string | null {
+	const body = notice.body;
+	if (!body) return null;
+	const schema = body.inputSchema ?? body.fields;
+	if (schema === undefined || schema === null) return null;
+	if (Array.isArray(schema)) {
+		return schema.length > 0 ? clamp(JSON.stringify(schema, null, 1), INPUT_SCHEMA_LIMIT) : null;
 	}
+	const record = asRecord(schema);
+	if (!record || Object.keys(record).length === 0) return null;
+	return clamp(JSON.stringify(record, null, 1), INPUT_SCHEMA_LIMIT);
 }
 
 export type NoticeField = { label: string; value: string; mono: boolean };
 
 const COMMAND_HEAD_LIMIT = 400;
 const FILE_CHANGE_LIMIT = 8;
+const INPUT_SCHEMA_LIMIT = 400;
+const MESSAGE_LIMIT = 800;
 
 function commandText(value: unknown): string | null {
 	if (typeof value === 'string') return value.trim().length > 0 ? value.trim() : null;
@@ -83,9 +114,12 @@ function fileChangeText(value: unknown): string | null {
  * own shape (see farwork-agent codex mapper), so nothing is inferred per-kind —
  * a body with no known field falls back to the raw JSON instead of a guess.
  */
-export function noticeFields(body: Record<string, unknown> | null): NoticeField[] {
+export function noticeFields(notice: RuntimeNotice): NoticeField[] {
+	const body = notice.body;
 	if (!body) return [];
 	const fields: NoticeField[] = [];
+	const message = asString(body.message).trim();
+	if (message) fields.push({ label: '消息', value: clamp(message, MESSAGE_LIMIT), mono: false });
 	const command = commandText(body.command);
 	if (command) fields.push({ label: '命令', value: clamp(command, COMMAND_HEAD_LIMIT), mono: true });
 	const cwd = asString(body.cwd);
@@ -97,6 +131,8 @@ export function noticeFields(body: Record<string, unknown> | null): NoticeField[
 	const changes = fileChangeText(body.fileChanges);
 	if (changes) fields.push({ label: '变更文件', value: changes, mono: true });
 	if (fields.length === 0) {
+		// 提问类没有可读文本就不铺原始 JSON：schema 已在输入区单独展示。
+		if (noticeIsQuestion(notice)) return [];
 		fields.push({ label: '原始内容', value: clamp(JSON.stringify(body, null, 1), 600), mono: true });
 	}
 	return fields;
