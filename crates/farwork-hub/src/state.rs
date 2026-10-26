@@ -138,6 +138,9 @@ struct Inner {
     /// Last runtime capability report per session. In memory on purpose: it
     /// describes a live process, so it must not outlive the process.
     runtime_caps: crate::runtime_caps::RuntimeCapsCache,
+    /// Claim attempts per source address. In memory on purpose: it only has to
+    /// bound a brute-force budget, and a restart resetting it is harmless.
+    pairing_limiter: crate::pairing::ClaimLimiter,
 }
 
 #[derive(Clone)]
@@ -159,6 +162,7 @@ impl AppState {
                 fs_relay: crate::fsrelay::FsRelay::new(),
                 term_relay: crate::termrelay::TerminalRelay::new(),
                 runtime_caps: crate::runtime_caps::RuntimeCapsCache::new(),
+                pairing_limiter: crate::pairing::ClaimLimiter::new(),
             }),
         }
     }
@@ -202,5 +206,10 @@ impl AppState {
     /// The last capability report of each session (what it can do right now).
     pub fn runtime_caps(&self) -> &crate::runtime_caps::RuntimeCapsCache {
         &self.inner.runtime_caps
+    }
+
+    /// Sliding window that bounds `POST /pairing/claim` attempts per address.
+    pub fn pairing_limiter(&self) -> &crate::pairing::ClaimLimiter {
+        &self.inner.pairing_limiter
     }
 }

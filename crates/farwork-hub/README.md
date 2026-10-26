@@ -213,14 +213,18 @@ test p0_journey_login_to_websocket_delta ... ok
 | POST | `/api/v2/admin/users` | `201 {user, serverTime}`；body `{email, password, role:"admin"\|"member"}`，密码由服务端派生 verifier 落库（与注册同一条 PBKDF2 路径）；重复邮箱 409 |
 | PATCH | `/api/v2/admin/users/{id}` | `200 {user, serverTime}`；body `{role?, disabled?, displayName?}`；会把自己或最后一个 admin 锁在门外时 409 `{code:"admin_lockout", reason, message}` |
 | GET/PATCH | `/api/v2/admin/settings` | `{settings:{registrationOpen, emailVerificationRequired}, serverTime}`；写 `app_settings` 的 `registration_open` / `email_verification_required`，`GET /auth/config` 读同一行 |
+| POST | `/api/v2/pairing/start` | `201 {pairing:{id, code, expiresAt}, serverTime}`；body `{ttlSeconds?}`（默认 600，60..=3600，越界 422）。`code` 形如 `4F2K-9QXM`，**只出现这一次**（库里只存 HMAC 摘要） |
+| POST | `/api/v2/pairing/claim` | **免鉴权**（code 就是凭据）：body `{code, name, platform?}` → `200 {connector:{id,name,deviceOs,status}, connectorToken, serverTime}`；在配对所属用户名下建 connector 并标记 claimed（一次性）。错误 `404 invalid_code` / `409 code_already_claimed` / `410 code_expired` / `429 too_many_attempts`（同源 IP 滑动窗口 10 次/分钟） |
+| GET | `/api/v2/pairing/{id}` | 供 Web 轮询：`{pairing:{id, status:"pending"\|"claimed"\|"expired"\|"unknown", connectorId?, expiresAt}, serverTime}`；别人的 id 与不存在的 id 都回 `unknown`（不泄露存在性） |
 
-### 501 清单（`{"error":"not_implemented","detail":...,"serverTime":...}`）· **37 条**
+### 501 清单（`{"error":"not_implemented","detail":...,"serverTime":...}`）· **35 条**
 
 `POST|DELETE /sessions/{id}/takeover` / `POST /sessions/{id}/sync` / 账号级分享列表
 （`/shares/**`；会话/消息分享的三条端点已实现，见上表）/ 批量 archive|unarchive|read / device runtime 管理
 （`/connectors/{id}/runtimes/**`、`/runtimes/**`、`/devices/**`）/ OAuth（`/auth/oauth/*`）/
 扫码登录（`/auth/mobile-login/*`）/ 邮箱验证码、改密、换头像 / announcements、agents、
-pairing、usage。**会话命名空间整体已实现**：`/sessions/{id}/files/list`、`/files/readText`、
+usage。**配对码已实现**（上表三条，`/pairing*` 已从清单移出）；`/connectors/{id}/pairing` 仍在表里
+——那是每台设备的运行时开关，与配对码不是同一件事。**会话命名空间整体已实现**：`/sessions/{id}/files/list`、`/files/readText`、
 `/sessions/{id}/terminal` 与 `/terminal/{terminalId}/stream`、`runtime/capabilities`、
 `runtime/catalogs/{catalog}`、`runtime/commands`、`runtime/steer`、`runtime/selections` 都不在这份清单里。
 管理台（`/admin/**`）已实现，见上表四条，不再在这份清单里。未知路径返回 404

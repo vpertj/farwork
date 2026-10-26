@@ -94,6 +94,46 @@ pub async fn find_connector_by_token(
     .await
 }
 
+/// Create a connector row together with the one-time device token.
+///
+/// Shared with `routes::pairing`: a device that claimed a pairing code *is* a
+/// connector registered by `POST /connectors`, so both paths must mint the same
+/// object (same id shape, same token digest, same `offline` start). The caller
+/// receives the plaintext token once; the row keeps only its digest.
+pub async fn insert_connector<'e, E>(
+    executor: E,
+    connector_id: &str,
+    user_id: &str,
+    name: &str,
+    connector_kind: &str,
+    device_os: Option<&str>,
+) -> ApiResult<(ConnectorRow, String)>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let token = ids::connector_token();
+    let prefix: String = token.chars().take(12).collect();
+    let now = timeutil::utc_now();
+    let connector = sqlx::query_as::<_, ConnectorRow>(&format!(
+        "insert into connectors
+            (id, user_id, name, connector_kind, device_os, status, token_hash, token_prefix,
+             revoked, created_at, updated_at)
+         values ($1, $2, $3, $4, $5, 'offline', $6, $7, false, $8, $8)
+         returning {CONNECTOR_COLUMNS}"
+    ))
+    .bind(connector_id)
+    .bind(user_id)
+    .bind(name)
+    .bind(connector_kind)
+    .bind(device_os)
+    .bind(sha256_hex(token.as_bytes()))
+    .bind(&prefix)
+    .bind(&now)
+    .fetch_one(executor)
+    .await?;
+    Ok((connector, token))
+}
+
 async fn owned_connector(
     state: &AppState,
     user_id: &str,
@@ -168,30 +208,13 @@ async fn create_connector(
         })));
     }
 
-    let token = ids::connector_token();
-    let prefix: String = token.chars().take(12).collect();
-    let now = timeutil::utc_now();
-    let connector = sqlx::query_as::<_, ConnectorRow>(&format!(
-        "insert into connectors
-            (id, user_id, name, connector_kind, status, token_hash, token_prefix, revoked,
-             created_at, updated_at)
-         values ($1, $2, $3, $4, 'offline', $5, $6, false, $7, $7)
-         returning {CONNECTOR_COLUMNS}"
-    ))
-    .bind(&connector_id)
-    .bind(&user_id)
-    .bind(&name)
-    .bind(&kind)
-    .bind(sha256_hex(token.as_bytes()))
-    .bind(&prefix)
-    .bind(&now)
-    .fetch_one(state.pool())
-    .await?;
+    let (connector, token) =
+        insert_connector(state.pool(), &connector_id, &user_id, &name, &kind, None).await?;
 
     Ok(Json(json!({
         "connector": connector.view(),
         "connectorToken": token,
-        "tokenPrefix": prefix,
+        "tokenPrefix": connector.token_prefix,
     })))
 }
 

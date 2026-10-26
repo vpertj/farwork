@@ -22,6 +22,8 @@ export type RequestOptions = {
 	body?: unknown;
 	token?: string | null;
 	query?: Query;
+	/** 状态类端点必须绕过 HTTP 缓存：轮询拿到的旧响应会让界面停在假状态上。 */
+	cache?: RequestCache;
 };
 
 export function apiPath(path: string): string {
@@ -49,6 +51,7 @@ export async function apiRequest(path: string, options: RequestOptions = {}): Pr
 	const response = await fetch(url.toString(), {
 		method: options.method ?? 'GET',
 		headers,
+		cache: options.cache,
 		body: options.body === undefined ? undefined : JSON.stringify(options.body)
 	});
 	const text = await response.text();

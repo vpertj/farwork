@@ -176,3 +176,11 @@ pnpm run preview                 # 4173，预览静态产物（CI 不跑）
 1. 先读 `docs/architecture.md` 再动协议。不要边写实现边发明字段——契约优先于手感。
 2. 新增帧/字段的顺序是：域类型（`farwork-timeline` / `farwork-protocol` / ingress 帧）→ 文档（`docs/architecture.md`）→ 各方实现（hub、agent、web）。顺序反了就会产出两份互不兼容的真相。
 3. 不引入新依赖（数据库驱动、前端 UI 框架、状态库、原生壳）而不在 PR 里说明理由与替代方案。
+
+## 7. 并行工作的环境纪律（实测踩出来的，必须遵守）
+
+本仓经常有多个 agent/多个人同时改不同 crate。以下三条不是建议，是事故复现条件：
+
+1. **每个并行测试进程用自己的数据库**。`cargo test` 的 hub 集成测试会在 bootstrap 阶段 truncate 目标库；两路同时指向 `farwork_test` 时，对方的 setup token / 用户行被抹掉，表现为成批 `invalid or expired setup token` 假失败（真实发生过，一次 5 条红）。并行时用 `farwork_test_<话题>` 之类的一次性库，跑完 drop。
+2. **子代理必须隔离 `FARWORK_HOME`**。默认 `~/.farwork/agent.json` 是**用户真实凭证**；任何测试（尤其是 "在 `~` 下真跑一遍" 这类验收）都必须 `FARWORK_HOME=/tmp/...`，否则会把用户正在用的设备凭证覆盖成指向测试桩的假地址——真实发生过两次，表现为「怎么改命令都连不上」。
+3. **不要动别人正在用的端口，也不要 kill 不是自己起的进程**。`7300`（hub）与 `5173`（web dev）是演示/联调常驻口。测试一律用 `7400+`（临时后端）与 `5199+`（临时前端），收尾按 PID 收拾自己起的那几个。清理时用 `pkill -f '<自己的完整命令行>'`，不要 `pkill -f farwork-hub` 这种模糊模式。

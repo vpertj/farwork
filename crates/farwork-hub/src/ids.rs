@@ -63,6 +63,12 @@ pub fn share_id() -> String {
     format!("shr_{}", token_urlsafe(24))
 }
 
+/// Pairing id. The code a user types is not this id: the id is what the browser
+/// polls (`GET /pairing/{id}`) and never leaves the account that minted it.
+pub fn pairing_id() -> String {
+    format!("pair_{}", token_urlsafe(10))
+}
+
 /// Connector device credential (`cxt_` prefix, 32 random bytes).
 pub fn connector_token() -> String {
     format!("cxt_{}", token_urlsafe(32))

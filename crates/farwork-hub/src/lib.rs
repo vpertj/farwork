@@ -13,6 +13,7 @@ pub mod fsrelay;
 pub mod ids;
 pub mod ingress;
 pub mod models;
+pub mod pairing;
 pub mod routes;
 pub mod runtime_caps;
 pub mod state;

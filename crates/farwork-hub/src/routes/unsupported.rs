@@ -64,13 +64,14 @@ pub fn router() -> Router<AppState> {
         // (routes::admin) and is not listed here — that is 2 fewer paths than
         // the 47 M3 left behind: 45. The session namespace then took it to 37:
         // /sessions/{id}/terminal, /terminal/{*rest}, /files, /files/{*rest} and
-        // the four runtime/* entries are all implemented now.
+        // the four runtime/* entries are all implemented now. Pairing codes then
+        // took it to 35: /pairing and /pairing/{*rest} are now routes::pairing
+        // (start, claim, status). /connectors/{id}/pairing stays here — it is the
+        // per-device runtime switch, a different thing that has no contract yet.
         "/announcements",
         "/announcements/{*rest}",
         "/agents",
         "/agents/{*rest}",
-        "/pairing",
-        "/pairing/{*rest}",
         "/usage",
         "/usage/{*rest}",
     )

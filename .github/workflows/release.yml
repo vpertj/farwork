@@ -1,0 +1,158 @@
+name: Release
+
+# Trigger: pushing a tag such as v0.1.0. Nothing else — a release must never be
+# a side effect of a branch push.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# GITHUB_TOKEN is the only credential: the job uploads assets to the release
+# created for the pushed tag. No repository secrets are referenced anywhere, so
+# this workflow runs on a fork with default settings.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Never cancel a half-finished release: the upload step would be interrupted
+  # between assets, leaving a tag with some but not all platforms.
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple: both binaries are built on the arm64 runner. rustup installs
+          # the other std, and clang cross-links x86_64 against the same SDK.
+          - target: x86_64-apple-darwin
+            os: macos-14
+            cross: false
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-14
+            cross: false
+            archive: tar.gz
+          # Linux x86_64 is the runner's own target: plain cargo, no container.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+            archive: tar.gz
+          # Linux arm64 needs cross (its crosstool-ng image carries the linker).
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+            archive: tar.gz
+          # Windows ships a .zip: there is no tar.gz convention on that platform
+          # and the installer there is manual (install.sh is POSIX-only).
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+            archive: zip
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Same action as ci.yml; 'targets' is what makes the cross targets'
+          # std available (a no-op for the runner's native target).
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross
+        if: ${{ matrix.cross }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      # The workspace has six crates; only this one binary is published, so the
+      # build is pinned to -p farwork-agent --bin farwork-agent.
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: cargo build -p farwork-agent --bin farwork-agent --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: ${{ matrix.cross }}
+        shell: bash
+        run: cross build -p farwork-agent --bin farwork-agent --release --target ${{ matrix.target }}
+
+      - name: Package tar.gz
+        if: ${{ matrix.archive == 'tar.gz' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/farwork-agent" dist/farwork-agent
+          chmod 755 dist/farwork-agent
+          # Root of the archive is the bare binary: install.sh extracts it and
+          # expects ./farwork-agent, no wrapping directory.
+          tar -czf "farwork-agent-${{ matrix.target }}.tar.gz" -C dist farwork-agent
+
+      - name: Package zip
+        if: ${{ matrix.archive == 'zip' }}
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/farwork-agent.exe" -DestinationPath "farwork-agent-${{ matrix.target }}.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: farwork-agent-${{ matrix.target }}
+          path: farwork-agent-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: publish ${{ github.ref_name }}
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Add the installer to the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp install.sh dist/install.sh
+          chmod 755 dist/install.sh
+
+      - name: Write SHA256SUMS
+        working-directory: dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          # sha256sum format: '<hash>  <name>'. install.sh matches on this exact
+          # name and verifies before unpacking anything.
+          sha256sum farwork-agent-* install.sh > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          # gh release create fails when the release already exists (re-run of a
+          # failed job), so create only when missing and --clobber the upload.
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "$tag" --verify-tag --generate-notes
+          fi
+          gh release upload "$tag" dist/* --clobber

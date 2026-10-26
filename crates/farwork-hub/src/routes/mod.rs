@@ -7,6 +7,7 @@ pub mod connectors;
 pub mod extract;
 pub mod fs;
 pub mod notices;
+pub mod pairing;
 pub mod projects;
 pub mod runtime;
 pub mod sessions;
@@ -27,6 +28,10 @@ pub fn api() -> Router<AppState> {
         .merge(connectors::router())
         .merge(fs::router())
         .merge(notices::router())
+        .merge(pairing::router())
+        // The second unauthenticated surface: the device claiming a pairing code
+        // has no account yet, so the code itself is the credential.
+        .merge(pairing::public_router())
         .merge(projects::router())
         .merge(runtime::router())
         .merge(sessions::router())

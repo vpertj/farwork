@@ -44,9 +44,9 @@ Farwork 是 [anywhere-labs/Agents-Anywhere](https://github.com/anywhere-labs/Age
 - **`file_change` / `permissions` 两种 notice kind 未在联调中出现**：echo 后端只发 `command_execution`，codex 的这两个审批分支因无凭据从未被触发；页面上的「文件变更」「权限申请」标签只是代码就位，没有联调证据。
 - **审批卡在浏览器里的端到端流程没有留证据**：已验收的是 `pnpm run check`（0 error）/ `pnpm run build` 通过与「hub 不乐观 resolve」的代码层核对，不是「点批准 → 卡片转已解决」的实机记录。
 - **DSH 的 `session.commands` 没有兑现**：真桥会报 `session.commands: true`，但本仓**没有实现 `session.executeCommand`**，所以能力位固定报 `false`、`GET .../runtime/commands` 对 DSH 会话是空表——一个填得满、点了不执行的命令框比不出现的按钮更糟。同理：**还没有在真 DSH 上建过会话**（`createAndStart` → `batch` → `ack` → `item` → `notice` → `respondInteraction` 这条链只在脚本化的假 bridge 上验过），`userQuestions` 也没有对着真 DSH 问答验证过。
-- **仍有 37 条路径是 `501 not_implemented`**（不会伪造成功）：账号级分享清单 `/shares`、设备运行时管理 `/runtimes*` `/devices*` `/connectors/{id}/runtimes*`、OAuth / 邮件码 / 移动端扫码登录，以及 `/announcements*`、`/agents*`、`/pairing*`、`/usage*`——**管理台只交付了「用户目录 + 实例开关」**，这四组仍在表里。**会话命名空间已补齐**：`/sessions/{id}/files/list`、`/files/readText`、`/terminal`、`/terminal/{terminalId}/stream` 与 `runtime/capabilities|catalogs/{catalog}|commands|steer|selections` 都实到了；它们复用**同一套** `fsrelay`/`termrelay`，只多一层「由 session 解析出 connector + workspace」。文件浏览**只有只读**的 list/readText：写操作、大文件/二进制流式仍未实现；终端**只有交互式 PTY**：没有 scrollback 持久化、没有接管别人已开的终端，`farwork-server`（M1 探针）也还没退场。
+- **仍有 35 条路径是 `501 not_implemented`**（不会伪造成功）：账号级分享清单 `/shares`、设备运行时管理 `/runtimes*` `/devices*` `/connectors/{id}/runtimes*`、OAuth / 邮件码 / 移动端扫码登录，以及 `/announcements*`、`/agents*`、`/usage*`——**管理台只交付了「用户目录 + 实例开关」**，这三组仍在表里。**配对码已实现**（`/pairing/start`、`/pairing/claim`、`/pairing/{id}`），因此 `/pairing*` 已从这份清单里移出。**会话命名空间已补齐**：`/sessions/{id}/files/list`、`/files/readText`、`/terminal`、`/terminal/{terminalId}/stream` 与 `runtime/capabilities|catalogs/{catalog}|commands|steer|selections` 都实到了；它们复用**同一套** `fsrelay`/`termrelay`，只多一层「由 session 解析出 connector + workspace」。文件浏览**只有只读**的 list/readText：写操作、大文件/二进制流式仍未实现；终端**只有交互式 PTY**：没有 scrollback 持久化、没有接管别人已开的终端，`farwork-server`（M1 探针）也还没退场。
 
-当前端点数：`/api/v2` 下 **59 个已实现的 method+path**（**49 条** `route()` 注册，含文件浏览、设备终端、设备/会话两种终端、会话运行时控制 4 条、分享三条与管理台 3 次注册，也含 §5 单独记录的 `GET /connector/ws`）+ `GET /healthz`；另有 **37 条路径**在 `routes/unsupported.rs` 里统一回 `501`（分享把 `/sessions/{id}/shares` 与 `/sessions/{id}/shares/{*rest}` 两条从表里移走了 49 → 47，管理台再把 `/admin` 与 `/admin/{*rest}` 两条移走 47 → 45，会话命名空间的 8 条 —— `/sessions/{id}/terminal`、`/terminal/{*rest}`、`/files`、`/files/{*rest}` 与 `runtime/{steer,commands,selections,catalogs/{catalog}}` —— 再减到 37）。逐条清单见 [docs/architecture.md](./docs/architecture.md) §3。
+当前端点数：`/api/v2` 下 **62 个已实现的 method+path**（**52 条** `route()` 注册，含文件浏览、设备终端、设备/会话两种终端、会话运行时控制 4 条、分享三条、配对码三条与管理台 3 次注册，也含 §5 单独记录的 `GET /connector/ws`）+ `GET /healthz`；另有 **35 条路径**在 `routes/unsupported.rs` 里统一回 `501`（分享把 `/sessions/{id}/shares` 与 `/sessions/{id}/shares/{*rest}` 两条从表里移走了 49 → 47，管理台再把 `/admin` 与 `/admin/{*rest}` 两条移走 47 → 45，会话命名空间的 8 条 —— `/sessions/{id}/terminal`、`/terminal/{*rest}`、`/files`、`/files/{*rest}` 与 `runtime/{steer,commands,selections,catalogs/{catalog}}` —— 再减到 37，配对码的 `/pairing` 与 `/pairing/{*rest}` 两条再减到 35）。`/connectors/{id}/pairing` 仍在 `501` 表里：那是每台设备的运行时开关，与配对码不是同一件事。逐条清单见 [docs/architecture.md](./docs/architecture.md) §3。
 
 路线图：[docs/roadmap.md](./docs/roadmap.md)。
 
@@ -79,6 +79,50 @@ Farwork 是 [anywhere-labs/Agents-Anywhere](https://github.com/anywhere-labs/Age
 - `apps/web`：SvelteKit + `adapter-static` 的静态 SPA；dev 期经 Vite 代理 `/api`、`/ws` 到 `127.0.0.1:7300`。
 
 协议与端点的逐条定义以 [docs/architecture.md](./docs/architecture.md) 为唯一事实来源。
+
+## 安装（设备端：一个二进制，不需要 Rust，也不需要源码）
+
+`farwork-agent` 是单个可执行文件，由 [`.github/workflows/release.yml`](./.github/workflows/release.yml) 在推 `v*` tag 时构建，覆盖 macOS（Intel / Apple Silicon）、Linux（x86_64 / aarch64）与 Windows（x86_64，`.zip`）。
+
+### macOS / Linux
+
+```sh
+curl -fsSL https://github.com/vpertj/farwork/releases/latest/download/install.sh | sh
+```
+
+`install.sh` 只做四件事：按 `uname -s` / `uname -m` 选资产 → 下载 `farwork-agent-<target>.tar.gz` 与 `SHA256SUMS` → **校验 sha256，不一致就拒绝安装** → 解包到 `~/.local/bin`（不存在则创建）。它不碰系统包管理器、不要 root、不依赖 Python/Node，可以重复执行：同一个 tag 重装就是覆盖安装，校验失败时旧的二进制**原样保留**。
+
+装完在 Web 的「连接设备」页（`#/connect`）生成一个 8 位配对码，然后：
+
+```sh
+# 换成凭据后立刻开始连 hub（同一个进程接着跑 connector）
+farwork-agent pair --hub https://<你的服务器> --code <配对码>
+
+# 以后重启不用再带参数：hub 与 token 已在 ~/.farwork/agent.json
+farwork-agent
+```
+
+也可以跳过配对码，直接用 `POST /api/v2/connectors` 响应里的 `connectorToken`（明文只出现这一次）：
+
+```sh
+farwork-agent --hub wss://<你的服务器> --token '<connectorToken>'
+```
+
+`install.sh` 认这几个环境变量：
+
+| 变量 | 默认 | 用途 |
+| --- | --- | --- |
+| `FARWORK_VERSION` | `latest` | 装指定 tag，例如 `v0.1.0` |
+| `FARWORK_INSTALL_DIR` | `$HOME/.local/bin` | 换安装目录（目录不在 PATH 上时会提示加 PATH） |
+| `FARWORK_RELEASE_BASE_URL` | GitHub releases | 走镜像/内网地址；该地址下需要平铺 `install.sh`、`farwork-agent-*.tar.gz` 与 `SHA256SUMS` |
+
+### Windows
+
+没有 POSIX sh：从 release 页面下 `farwork-agent-x86_64-pc-windows-msvc.zip`，解压后把 `farwork-agent.exe` 放进 PATH（例如 `%LOCALAPPDATA%\Programs\farwork`），再用同样的 `pair` / `--token` 参数启动。
+
+### 升级与卸载
+
+升级＝重跑同一条 `curl ... | sh`。卸载＝删掉 `~/.local/bin/farwork-agent`；设备身份在 `~/.farwork/agent.json`（0600），删掉它会换一个新的 `agent_id`。
 
 ## 快速开始
 
@@ -194,4 +238,4 @@ Farwork is an open-source, cross-device agent workbench: open a real agent sessi
 
 This repository is an **unofficial** rewrite of [anywhere-labs/Agents-Anywhere](https://github.com/anywhere-labs/Agents-Anywhere) in **Rust + Svelte**. It shares no source code with upstream and only borrows the product shape; upstream is MIT-licensed (see NOTICE). We are not affiliated with or endorsed by the upstream maintainers.
 
-Status: the M2 vertical slice is delivered (login, connectors/projects/sessions, timeline, sending messages, WebSocket deltas, cursor catch-up), and M3 is delivered — connector ingress (`/api/v2/connector/ws`, Ingress Protocol v1) plus `farwork-agent`, which drives a local `codex app-server` and relays approvals; `connectors.status` now reflects real presence. M3's planned feature blocks are all delivered, including the file browser, the device terminal, sharing and the admin console (user directory + instance switches, `role=admin` only, no hash material in responses, and no way to lock the instance out of its last admin). Session runtime control (`session.capabilities` / `session.steer` / `session.selections`, Ingress Protocol v1.3) and the session namespace (`/sessions/{id}/files*`, `/terminal*`, `runtime/{capabilities,catalogs,commands,steer,selections}`) are delivered on top of the same fs/terminal relays. Still missing: the remaining 37 `501` paths (`/agents*`, `/usage*`, `/announcements*`, `/pairing*`, `/shares`, runtimes/devices, OAuth and email-code), and — importantly — the codex success path (assistant streaming, tool execution, a real approval round trip) is unverified because there are no Codex credentials on the test machine. Details in [docs/](./docs). Licensed under MIT.
+Status: the M2 vertical slice is delivered (login, connectors/projects/sessions, timeline, sending messages, WebSocket deltas, cursor catch-up), and M3 is delivered — connector ingress (`/api/v2/connector/ws`, Ingress Protocol v1) plus `farwork-agent`, which drives a local `codex app-server` and relays approvals; `connectors.status` now reflects real presence. M3's planned feature blocks are all delivered, including the file browser, the device terminal, sharing and the admin console (user directory + instance switches, `role=admin` only, no hash material in responses, and no way to lock the instance out of its last admin). Session runtime control (`session.capabilities` / `session.steer` / `session.selections`, Ingress Protocol v1.3) and the session namespace (`/sessions/{id}/files*`, `/terminal*`, `runtime/{capabilities,catalogs,commands,steer,selections}`) are delivered on top of the same fs/terminal relays. Pairing codes are delivered as well: `POST /pairing/start` (logged in) mints a one-time `XXXX-XXXX` code, and `POST /pairing/claim` (unauthenticated — the code is the only credential) trades it for a connector token, so a device never has to be handed a `cxt_` token by hand. Still missing: the remaining 35 `501` paths (`/agents*`, `/usage*`, `/announcements*`, `/shares`, runtimes/devices, OAuth and email-code), and — importantly — the codex success path (assistant streaming, tool execution, a real approval round trip) is unverified because there are no Codex credentials on the test machine. Details in [docs/](./docs). Licensed under MIT.

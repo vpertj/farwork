@@ -1,143 +1,222 @@
 <script lang="ts">
+	import { API_NAMESPACE } from '$lib/api/client';
+	import { fetchPairing, startPairing, type PairingCode } from '$lib/api/pairing';
+	import { listConnectors } from '$lib/api/workspace';
 	import { workspace } from '$lib/workspace.svelte';
-	import { createConnector, listConnectors } from '$lib/api/workspace';
 	import { describeError } from '$lib/format';
 	import RuntimeAvailability from './RuntimeAvailability.svelte';
 	import type { Connector } from '$lib/api/types';
 
 	let { token }: { token: string } = $props();
 
-	type Step = 'setup' | 'command' | 'connected' | 'timeout';
+	type Step = 'generate' | 'waiting' | 'claimed' | 'connected' | 'expired' | 'lost';
 	type Runtime = 'codex' | 'dsh' | 'echo';
 
-	/** agent 的编译期默认值：命令里与它相同的一律不写，少一个参数就少一次抄错。 */
-	const AGENT_DEFAULT_HUB = 'ws://127.0.0.1:7300';
 	const AGENT_DEFAULT_RUNTIME: Runtime = 'codex';
-	const POLL_INTERVAL_MS = 2_000;
-	const POLL_TIMEOUT_MS = 90_000;
-	/** 仓库路径在浏览器里无从得知：命令里留占位符，由用户换成本机路径。 */
+	const PAIRING_POLL_MS = 2_000;
+	const DEVICE_POLL_MS = 2_000;
+	const DEVICE_WAIT_MS = 90_000;
+	/** 仓库路径在浏览器里无从得知：只在开发者折叠块里留占位符。 */
 	const REPO_PLACEHOLDER = '/path/to/farwork';
-	const COMMAND_VARIANTS: { value: 'binary' | 'source'; label: string }[] = [
-		{ value: 'source', label: '从源码跑（默认）' },
-		{ value: 'binary', label: '已编译（更快）' }
-	];
+	const API_SUFFIX = '/api/v2';
 	const RUNTIMES: { value: Runtime; label: string }[] = [
 		{ value: 'codex', label: 'Codex' },
 		{ value: 'dsh', label: 'dsh' },
 		{ value: 'echo', label: 'echo' }
 	];
 
-	let step = $state<Step>('setup');
-	let deviceName = $state('我的 Mac');
-	let hubUrl = $state(defaultHubUrl());
+	// install.sh 与 pair 都指向真实 origin：部署时静态产物由 hub 自己托管，origin 就是 hub。
+	// PUBLIC_FARWORK_API 指向别的 host 时以它为准，否则用当前页面 origin。
+	function apiOrigin(): string {
+		const base = API_NAMESPACE.endsWith(API_SUFFIX)
+			? API_NAMESPACE.slice(0, -API_SUFFIX.length)
+			: '';
+		if (base.length > 0) return base;
+		return typeof window === 'undefined' ? '' : window.location.origin;
+	}
+
+	const installOrigin = apiOrigin();
+
+	let step = $state<Step>('generate');
+	let hubUrl = $state('');
 	let workdir = $state('');
 	let runtime = $state<Runtime>(AGENT_DEFAULT_RUNTIME);
-	let variant = $state<'binary' | 'source'>('source');
 	let busy = $state(false);
 	let errorMessage = $state<string | null>(null);
 	let pollError = $state<string | null>(null);
-	let elapsedSeconds = $state(0);
-	let createdToken = $state('');
-	let createdConnectorId = $state('');
+	let pairing = $state<PairingCode | null>(null);
+	let claimedConnectorId = $state<string | null>(null);
 	let liveConnector = $state<Connector | null>(null);
+	let clockMs = $state(Date.now());
+	let serverOffsetMs = $state(0);
+	let expiredNote = $state('');
 	let copyState = $state<'idle' | 'done' | 'manual'>('idle');
 	let commandField = $state<HTMLTextAreaElement | null>(null);
 
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
-	let pollGeneration = 0;
-	let pollStartedAt = 0;
+	// 轮询只活在这个向导页里，离开即停；generation 用来丢弃旧一轮的迟到响应。
+	let generation = 0;
+	let countdownTimer: ReturnType<typeof setInterval> | null = null;
+	let pairingTimer: ReturnType<typeof setInterval> | null = null;
+	let deviceTimer: ReturnType<typeof setInterval> | null = null;
+	/** 生成配对码之前的设备集合：claimed 但 hub 没给 connectorId 时用它认出「新上线的那台」。 */
+	let knownConnectorIds: string[] = [];
 
-	// 静态产物由 hub 自己托管时 origin 就是 hub；dev server（5173/5199…）背后另有 hub，统一按 7300 推。
-	// 这样默认值恰好等于 agent 的 --hub 默认，命令里可以整段省掉。
-	// localhost 在 macOS 上先解析成 ::1，而 hub 只监听 IPv4，所以一律换成 127.0.0.1。
-	function defaultHubUrl(): string {
-		if (typeof window === 'undefined') return AGENT_DEFAULT_HUB;
-		const raw = window.location.hostname;
-		const host = raw === 'localhost' || raw.length === 0 ? '127.0.0.1' : raw;
-		return window.location.protocol === 'https:' ? `wss://${host}` : `ws://${host}:7300`;
-	}
-
-	const effectiveHub = $derived(hubUrl.trim() || AGENT_DEFAULT_HUB);
-
-	function agentArgs(): string {
-		const parts = ['--token', createdToken];
-		if (effectiveHub !== AGENT_DEFAULT_HUB) parts.push('--hub', effectiveHub);
+	const effectiveHub = $derived(hubUrl.trim() || installOrigin);
+	const installCommand = $derived(`curl -fsSL ${installOrigin}/install.sh | sh`);
+	const pairCommand = $derived.by(() => {
+		if (pairing === null) return '';
+		const parts = ['farwork-agent', 'pair', '--hub', effectiveHub, '--code', pairing.code];
 		const dir = workdir.trim();
 		if (dir.length > 0) parts.push('--workdir', dir);
 		if (runtime !== AGENT_DEFAULT_RUNTIME) parts.push('--runtime', runtime);
 		return parts.join(' ');
+	});
+	const commandText = $derived(pairing === null ? '' : `${installCommand}\n${pairCommand}`);
+	const sourceCommand = $derived(
+		pairing === null ? '' : `cd ${REPO_PLACEHOLDER} && ${pairCommand.replace(/^farwork-agent/, 'cargo run -p farwork-agent --')}`
+	);
+	const remainingMs = $derived.by(() => {
+		if (pairing === null) return 0;
+		const expiresAt = Date.parse(pairing.expiresAt);
+		if (Number.isNaN(expiresAt)) return 0;
+		return Math.max(0, expiresAt - (clockMs + serverOffsetMs));
+	});
+	const remainingLabel = $derived(formatRemaining(remainingMs));
+
+	function formatRemaining(ms: number): string {
+		const total = Math.max(0, Math.ceil(ms / 1000));
+		const minutes = Math.floor(total / 60);
+		const seconds = total % 60;
+		return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 	}
 
-	// 两条变体都能真跑：已编译的不依赖 cwd（cargo run 只在仓库根有效），从源码跑的必须先进仓库。
-	const commands = $derived.by(() => {
-		if (createdToken.length === 0) return { binary: '', source: '' };
-		const args = agentArgs();
-		return {
-			binary: `${REPO_PLACEHOLDER}/target/debug/farwork-agent ${args}`,
-			source: `cd ${REPO_PLACEHOLDER} && cargo run -p farwork-agent -- ${args}`
-		};
-	});
-
-	const command = $derived(variant === 'binary' ? commands.binary : commands.source);
+	// fetch 失败只给一句 "Failed to fetch"：补上它连的是谁，用户才知道要看哪里。
+	function pairingError(error: unknown): string {
+		if (error instanceof TypeError) {
+			return `连不上 ${installOrigin}：${error.message}（确认 hub 在跑，地址与协议对得上）`;
+		}
+		return describeError(error);
+	}
 
 	function isAbsolutePath(value: string): boolean {
-		return value.startsWith('/') || /^[A-Za-z]:[\/]/.test(value);
+		return value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value);
 	}
 
-	function stopPoll(): void {
-		pollGeneration += 1;
-		if (pollTimer !== null) {
-			clearInterval(pollTimer);
-			pollTimer = null;
+	function stopTimers(): void {
+		generation += 1;
+		if (countdownTimer !== null) clearInterval(countdownTimer);
+		if (pairingTimer !== null) clearInterval(pairingTimer);
+		if (deviceTimer !== null) clearInterval(deviceTimer);
+		countdownTimer = null;
+		pairingTimer = null;
+		deviceTimer = null;
+	}
+
+	$effect(() => () => stopTimers());
+
+
+	function startCountdown(): void {
+		const current = generation;
+		clockMs = Date.now();
+		countdownTimer = setInterval(() => {
+			if (current !== generation) return;
+			clockMs = Date.now();
+			// 本地先到时也立刻收尾：不能让界面在一个已过期的码上继续假装在等。
+			if (remainingMs <= 0 && (step === 'waiting' || step === 'claimed')) {
+				stopTimers();
+				expiredNote = '倒计时已走完，服务端也不会再接受这个码。';
+				step = 'expired';
+			}
+		}, 1_000);
+	}
+
+	function applySnapshot(
+		status: 'pending' | 'claimed' | 'expired' | 'unknown',
+		connectorId: string | null
+	): void {
+		if (status === 'pending') {
+			step = 'waiting';
+			return;
 		}
+		if (status === 'claimed') {
+			claimedConnectorId = connectorId;
+			step = 'claimed';
+			if (pairingTimer !== null) clearInterval(pairingTimer);
+			pairingTimer = null;
+			startDevicePoll();
+			return;
+		}
+		stopTimers();
+		expiredNote =
+			status === 'expired'
+				? '服务端已经把这个码标成过期。'
+				: 'hub 不认识这个配对码：它可能属于另一个 hub 实例，或者数据被重建过。';
+		step = 'expired';
 	}
 
-	// 轮询只活在这个向导页里：它在 hub 侧看 status，浏览器的会话页一条请求都不多。
-	function startPoll(connectorId: string): void {
-		stopPoll();
-		const generation = pollGeneration;
-		pollStartedAt = Date.now();
-		elapsedSeconds = 0;
-		pollError = null;
-
+	function startPairingPoll(): void {
+		const current = generation;
 		const tick = async (): Promise<void> => {
-			if (generation !== pollGeneration) return;
-			elapsedSeconds = Math.round((Date.now() - pollStartedAt) / 1000);
+			if (current !== generation || pairing === null) return;
+			try {
+				const result = await fetchPairing(token, pairing.id);
+				if (current !== generation) return;
+				pollError = null;
+				serverOffsetMs = result.serverNowMs - Date.now();
+				applySnapshot(result.pairing.status, result.pairing.connectorId);
+			} catch (error) {
+				if (current !== generation) return;
+				pollError = pairingError(error);
+			}
+		};
+		void tick();
+		pairingTimer = setInterval(() => void tick(), PAIRING_POLL_MS);
+	}
+
+	function resolveClaimedConnector(rows: Connector[]): Connector | null {
+		if (claimedConnectorId !== null) {
+			return rows.find((row) => row.id === claimedConnectorId) ?? null;
+		}
+		return rows.find((row) => row.status === 'online' && !knownConnectorIds.includes(row.id)) ?? null;
+	}
+
+	function startDevicePoll(): void {
+		const current = generation;
+		const deadline = Date.now() + DEVICE_WAIT_MS;
+		const tick = async (): Promise<void> => {
+			if (current !== generation) return;
 			try {
 				const rows = await listConnectors(token);
-				if (generation !== pollGeneration) return;
+				if (current !== generation) return;
 				pollError = null;
-				const row = rows.find((item) => item.id === connectorId) ?? null;
-				if (row) liveConnector = row;
-				if (row && row.status === 'online') {
-					stopPoll();
+				const row = resolveClaimedConnector(rows);
+				if (row !== null) liveConnector = row;
+				if (row !== null && row.status === 'online') {
+					stopTimers();
 					step = 'connected';
 					void workspace.load(token);
 					return;
 				}
 			} catch (error) {
-				if (generation !== pollGeneration) return;
-				pollError = describeError(error);
+				if (current !== generation) return;
+				pollError = pairingError(error);
 			}
-			if (generation !== pollGeneration) return;
-			if (Date.now() - pollStartedAt >= POLL_TIMEOUT_MS) {
-				stopPoll();
-				step = 'timeout';
+			if (current !== generation) return;
+			if (Date.now() >= deadline) {
+				stopTimers();
+				step = 'lost';
 			}
 		};
-
 		void tick();
-		pollTimer = setInterval(() => void tick(), POLL_INTERVAL_MS);
+		deviceTimer = setInterval(() => void tick(), DEVICE_POLL_MS);
 	}
 
-	$effect(() => () => stopPoll());
-
-	async function submitDevice(event: SubmitEvent): Promise<void> {
-		event.preventDefault();
+	async function beginPairing(): Promise<void> {
 		errorMessage = null;
+		pollError = null;
 		const hub = hubUrl.trim();
-		if (hub.length > 0 && !/^wss?:\/\/.+/.test(hub)) {
-			errorMessage = `hub 地址要形如 ${AGENT_DEFAULT_HUB}，留空则用 agent 默认值。`;
+		if (hub.length > 0 && !/^https?:\/\/.+/i.test(hub)) {
+			errorMessage = `hub 地址要形如 ${installOrigin}：pair 用 http(s)，ws 地址由它自己算。`;
 			return;
 		}
 		const dir = workdir.trim();
@@ -146,35 +225,42 @@
 			return;
 		}
 		busy = true;
+		stopTimers();
 		try {
-			// 设备名留空就交给 hub 定（它有自己的兜底名），界面事后显示的是真实名字。
-			const result = await createConnector(token, deviceName.trim());
-			createdConnectorId = result.connector.id;
-			createdToken = result.connectorToken;
-			liveConnector = result.connector;
-			step = 'command';
+			knownConnectorIds = (await listConnectors(token)).map((row) => row.id);
+			const started = await startPairing(token);
+			pairing = started.pairing;
+			serverOffsetMs = started.serverNowMs - Date.now();
+			claimedConnectorId = null;
+			liveConnector = null;
+			expiredNote = '';
 			copyState = 'idle';
-			void workspace.load(token);
-			startPoll(result.connector.id);
+			pollError = null;
+			step = 'waiting';
+			startCountdown();
+			startPairingPoll();
 		} catch (error) {
-			errorMessage = describeError(error);
+			errorMessage = pairingError(error);
+			step = 'generate';
 		} finally {
 			busy = false;
 		}
 	}
 
 	function retryWait(): void {
-		step = 'command';
-		startPoll(createdConnectorId);
+		pollError = null;
+		step = 'claimed';
+		startDevicePoll();
 	}
 
 	function restart(): void {
-		stopPoll();
-		step = 'setup';
-		createdToken = '';
-		createdConnectorId = '';
+		stopTimers();
+		step = 'generate';
+		pairing = null;
+		claimedConnectorId = null;
 		liveConnector = null;
 		pollError = null;
+		expiredNote = '';
 		copyState = 'idle';
 		errorMessage = null;
 	}
@@ -186,7 +272,7 @@
 
 	async function copyCommand(): Promise<void> {
 		try {
-			await navigator.clipboard.writeText(command);
+			await navigator.clipboard.writeText(commandText);
 			copyState = 'done';
 		} catch {
 			// 非安全上下文或权限被拒时剪贴板不可用，退化为「已选中，手动复制」（同 ShareLinkCard）。
@@ -201,16 +287,20 @@
 		<a class="back" href="#/" title="返回任务台">←</a>
 		<div>
 			<h1>连接设备</h1>
-			<p>只需要一个 token，其余参数都有默认值。</p>
+			<p>生成一个 8 位配对码，在设备上执行两行命令即可，不用装 Rust、不用源码、不用抄 token。</p>
 		</div>
 	</header>
 
-	{#if step !== 'setup'}
+	{#if step !== 'generate'}
 		<ol class="steps" aria-label="连接设备的步骤">
-			<li class="done">1 · 生成命令</li>
-			<li class:active={step === 'command' || step === 'timeout'} class:done={step === 'connected'}>
-				2 · 等设备上线
+			<li class:done={pairing !== null}>1 · 生成配对码</li>
+			<li
+				class:active={step === 'waiting' || step === 'claimed'}
+				class:done={step === 'connected'}
+			>
+				2 · 设备配对
 			</li>
+			<li class:active={step === 'claimed'} class:done={step === 'connected'}>3 · 设备上线</li>
 		</ol>
 	{/if}
 
@@ -218,13 +308,11 @@
 		<p class="alert" role="alert">{errorMessage}</p>
 	{/if}
 
-	{#if step === 'setup'}
-		<form onsubmit={submitDevice}>
-			<label class="field">
-				<span>设备名（可留空）</span>
-				<input class="input" bind:value={deviceName} placeholder="我的 Mac" autocomplete="off" />
-			</label>
-
+	{#if step === 'generate'}
+		<form onsubmit={(event) => {
+			event.preventDefault();
+			void beginPairing();
+		}}>
 			<div class="runtime">
 				<p class="label">运行时</p>
 				<div class="segmented" role="group" aria-label="运行时">
@@ -255,10 +343,12 @@
 							bind:value={hubUrl}
 							spellcheck="false"
 							autocomplete="off"
-							placeholder={AGENT_DEFAULT_HUB}
+							placeholder={installOrigin}
 						/>
 					</label>
-					<p class="hint">设备得能自己连到这个 ws(s) 地址，不一定是浏览器里的地址。</p>
+					<p class="hint">
+						只影响命令里的 <code class="mono">--hub</code>；留空就用本页面的 origin。
+					</p>
 
 					<label class="field">
 						<span>工作目录</span>
@@ -271,50 +361,37 @@
 						/>
 					</label>
 					<p class="hint">要填就必须是绝对路径：它是文件浏览与终端的沙箱根。</p>
-
 				</div>
 			</details>
 
 			<button class="btn" data-variant="primary" type="submit" disabled={busy}>
-				{busy ? '正在创建设备…' : '生成连接命令'}
+				{busy ? '正在生成配对码…' : '生成配对码'}
 			</button>
 		</form>
-	{:else if step === 'command'}
+	{:else if step === 'waiting' || step === 'claimed'}
 		<div class="card">
-			<p class="card-title">在这台设备上执行这一条</p>
-			<div class="segmented" role="group" aria-label="命令形式">
-				{#each COMMAND_VARIANTS as item (item.value)}
-					<button
-						class="seg"
-						class:on={variant === item.value}
-						type="button"
-						aria-pressed={variant === item.value}
-						onclick={() => (variant = item.value)}
-						data-testid={`connect-variant-${item.value}`}
-					>
-						{item.label}
-					</button>
-				{/each}
-			</div>
+			<p class="card-title">把这台设备的配对码输给它</p>
+			<p class="code mono" data-testid="connect-code">{pairing?.code ?? ''}</p>
+			<p class="hint">
+				配对码 <strong data-testid="connect-countdown">{remainingLabel}</strong> 后过期（只显示这一次，离开本页就取不回来）。
+			</p>
+
+			<p class="card-title">也可以直接在这台设备上执行这两行</p>
 			<textarea
 				class="input mono command"
 				data-testid="connect-command"
 				readonly
-				rows="3"
+				rows="2"
 				bind:this={commandField}
-				value={command}
+				value={commandText}
 			></textarea>
-			<p class="hint">
-				把 <code class="mono">{REPO_PLACEHOLDER}</code> 换成本仓库路径就行，其余不用改。
-			</p>
-			{#if workdir.trim().length === 0}
-				<p class="hint">不填工作目录时用 agent 当前目录（也是文件浏览沙箱根）。</p>
-			{/if}
 			<div class="row">
 				<button class="btn" data-variant="primary" type="button" onclick={() => void copyCommand()}>
 					复制命令
 				</button>
-				<button class="btn" data-variant="ghost" type="button" onclick={restart}>重新开始</button>
+				<button class="btn" data-variant="ghost" type="button" onclick={() => void beginPairing()}>
+					重新生成
+				</button>
 			</div>
 			{#if copyState === 'done'}
 				<p class="hint ok-line">命令已复制到剪贴板。</p>
@@ -323,13 +400,24 @@
 					浏览器没有允许写入剪贴板，命令已选中：请按系统复制快捷键（⌘/Ctrl + C）或右键复制。
 				</p>
 			{/if}
-			<p class="hint">token 只显示这一次（hub 只存 sha256），离开本页就取不回来。</p>
-			<p class="hint">
-				执行完不用点按钮：这里已经在自动检测，已等
-				<strong data-testid="connect-elapsed">{elapsedSeconds}</strong> 秒。
-			</p>
+
+			<details class="advanced" data-testid="connect-source">
+				<summary>从源码运行（开发者）</summary>
+				<div class="advanced-body">
+					<pre class="mono source-command" data-testid="connect-source-command">{sourceCommand}</pre>
+					<p class="hint">
+						把 <code class="mono">{REPO_PLACEHOLDER}</code> 换成本仓库路径；这条路依赖本机 Rust 工具链，客户不用。
+					</p>
+				</div>
+			</details>
+
+			{#if step === 'claimed'}
+				<p class="hint ok-line" data-testid="connect-claimed">该码已被领取，正在等设备上线…</p>
+			{:else}
+				<p class="hint">执行完不用点按钮：这里每 2 秒查一次配对状态。</p>
+			{/if}
 			{#if pollError}
-				<p class="alert" role="alert">查询设备状态失败：{pollError}</p>
+				<p class="alert" role="alert">查询配对状态失败：{pollError}</p>
 			{/if}
 		</div>
 	{:else if step === 'connected'}
@@ -348,37 +436,47 @@
 				<button class="btn" data-variant="ghost" type="button" onclick={restart}>再连一台设备</button>
 			</div>
 		</div>
+	{:else if step === 'expired'}
+		<div class="card warn-card">
+			<p class="card-title warn-line" data-testid="connect-expired">配对码已过期</p>
+			<p>{expiredNote}</p>
+			<p class="hint">过期后这个码不会再被任何设备领取，换一个新码即可。</p>
+			<div class="row">
+				<button class="btn" data-variant="primary" type="button" onclick={() => void beginPairing()}>
+					重新生成
+				</button>
+				<button class="btn" data-variant="ghost" type="button" onclick={restart}>返回</button>
+			</div>
+		</div>
 	{:else}
 		<div class="card warn-card">
-			<p class="card-title warn-line">90 秒内没等到设备上线</p>
+			<p class="card-title warn-line" data-testid="connect-lost">该码已被领取，但设备没连上来</p>
 			<p>
-				设备 <span class="mono">{createdConnectorId}</span> 仍是
-				<strong>{liveConnector?.status ?? 'offline'}</strong>，hub 没收到它的连入。
+				码已经绑定到 {claimedConnectorId ?? '某台设备'}，它 {DEVICE_WAIT_MS / 1000} 秒内没有连上 hub；
+				如果领走它的不是你正在配的这台机器，就得换一个新码。
 			</p>
 			{#if pollError}
 				<p class="alert" role="alert">最后一次查询失败：{pollError}</p>
 			{/if}
 			<ol class="checklist">
 				<li>
-					最可能：token 已失效 —— hub 换过实例、重启或重建过数据库、设备被 revoke，或者 token 是从别的进程（例如占过 7300 的桩服务）拿的。
-					动作：回上一步「重新建一台设备」，用新 token 重来。
-				</li>
-				<li>
 					命令还在跑吗：回设备那个终端看 agent 是否已退出（缺 token、<code class="mono">--workdir</code>
 					不是绝对路径都会以退出码 1 结束）。
 				</li>
 				<li>
-					hub 地址通吗：<code class="mono">{effectiveHub}</code> 要能从设备上连到（hub 默认监听 7300）；
-					别把 <code class="mono">127.0.0.1</code> 换成 <code class="mono">localhost</code>（macOS 先解析 ::1，hub 只监听 IPv4）。
+					hub 地址通吗：<code class="mono">{effectiveHub}</code> 要能从设备上连到。
 				</li>
 				<li>
-					日志就在那个终端的 stdout/stderr；<code class="mono">$FARWORK_HOME/agent.json</code>
-					只是身份文件（不含 token），删掉会换新的 agent_id。
+					配对码有 TTL，领了就作废一次：客户端要重试得重新生成一个码。
 				</li>
 			</ol>
 			<div class="row">
-				<button class="btn" data-variant="primary" type="button" onclick={retryWait}>再等 90 秒</button>
-				<button class="btn" data-variant="ghost" type="button" onclick={restart}>重新建一台设备</button>
+				<button class="btn" data-variant="primary" type="button" onclick={retryWait}>
+					再等 {DEVICE_WAIT_MS / 1000} 秒
+				</button>
+				<button class="btn" data-variant="ghost" type="button" onclick={() => void beginPairing()}>
+					重新生成
+				</button>
 			</div>
 		</div>
 	{/if}
@@ -547,13 +645,34 @@
 		font-weight: 600;
 	}
 
+	.code {
+		font-size: 34px;
+		font-weight: 600;
+		letter-spacing: 0.18em;
+		line-height: 1.2;
+		color: var(--foreground);
+		user-select: all;
+	}
+
 	.command {
 		height: auto;
-		min-height: 64px;
+		min-height: 56px;
 		padding: 10px 12px;
 		line-height: 1.6;
 		resize: vertical;
 		font-size: 11.5px;
+		word-break: break-all;
+	}
+
+	.source-command {
+		margin: 0;
+		padding: 10px 12px;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border);
+		background: oklch(1 0 0 / 4%);
+		font-size: 11px;
+		line-height: 1.6;
+		white-space: pre-wrap;
 		word-break: break-all;
 	}
 

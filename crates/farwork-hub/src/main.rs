@@ -47,6 +47,12 @@ async fn run() -> anyhow::Result<()> {
         port = config.port,
         "farwork-hub listening"
     );
-    axum::serve(listener, app(state)).await?;
+    // Connect info, not a forwarded header: the pairing claim limiter keys on the
+    // real peer address (see `routes::pairing`).
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

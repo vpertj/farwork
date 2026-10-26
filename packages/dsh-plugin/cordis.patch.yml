@@ -1,0 +1,6 @@
+# A bundle ships its own patch: adding this package to a profile's
+# `dsh.profile.bundles` list is what inserts it into the loader tree.
+- insert:
+    - id: farwork-dsh-bridge
+      name: '@farwork/dsh-bridge'
+      config: {}
