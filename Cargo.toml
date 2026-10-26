@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/farwork-protocol", "crates/farwork-server", "crates/farwork-connector"]
+members = [
+    "crates/farwork-protocol",
+    "crates/farwork-server",
+    "crates/farwork-connector",
+    "crates/farwork-hub",
+    "crates/farwork-timeline",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,15 +15,25 @@ license = "MIT"
 
 [workspace.dependencies]
 farwork-protocol = { path = "crates/farwork-protocol" }
+farwork-timeline = { path = "crates/farwork-timeline" }
+anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+pbkdf2 = "0.12"
 portable-pty = "0.9"
+rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "time", "migrate", "macros"] }
+thiserror = "2"
+time = { version = "0.3", features = ["serde", "macros"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.26"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
