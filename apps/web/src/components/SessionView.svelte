@@ -1,6 +1,9 @@
 <script lang="ts">
 	import { SessionController } from '$lib/session.svelte';
-	import { formatClock } from '$lib/format';
+	import { createSessionShare } from '$lib/api/shares';
+	import type { SessionShare } from '$lib/api/types';
+	import { absoluteHref } from '$lib/router';
+	import { describeError, formatClock } from '$lib/format';
 	import {
 		itemHeadline,
 		runtimeLabel,
@@ -12,6 +15,7 @@
 	import FilePanel from './FilePanel.svelte';
 	import TerminalPanel from './TerminalPanel.svelte';
 	import TimelineEntry from './TimelineEntry.svelte';
+	import ShareLinkCard from './ShareLinkCard.svelte';
 
 	let { sessionId, token }: { sessionId: string; token: string } = $props();
 
@@ -96,6 +100,28 @@
 			void submit();
 		}
 	}
+
+	let shareBusy = $state(false);
+	let shareError = $state<string | null>(null);
+	let shareLink = $state<SessionShare | null>(null);
+	let shareLabel = $state('');
+
+	type ShareInput = { scope: 'session' } | { scope: 'message'; messageId: string };
+
+	async function share(input: ShareInput): Promise<void> {
+		if (shareBusy) return;
+		shareBusy = true;
+		shareError = null;
+		try {
+			const created = await createSessionShare(token, sessionId, input);
+			shareLink = created;
+			shareLabel = created.scope === 'message' ? '单条消息分享' : '整段会话分享';
+		} catch (error) {
+			shareError = describeError(error);
+		} finally {
+			shareBusy = false;
+		}
+	}
 </script>
 
 <div class="session-layout">
@@ -134,6 +160,14 @@
 					</button>
 				{/if}
 				{#if session}
+					<button
+						class="btn"
+						type="button"
+						disabled={shareBusy}
+						onclick={() => void share({ scope: 'session' })}
+					>
+						{shareBusy ? '生成链接中…' : '分享整段会话'}
+					</button>
 					<div class="panel-switch" role="group" aria-label="侧边面板">
 						<button
 							class="btn"
@@ -158,6 +192,19 @@
 
 		{#if controller.error}
 			<p class="alert banner">{controller.error}</p>
+		{/if}
+
+		{#if shareError}
+			<p class="alert banner" role="alert">分享链接未创建：{shareError}</p>
+		{/if}
+
+		{#if shareLink}
+			<ShareLinkCard
+				url={absoluteHref({ page: 'share', shareId: shareLink.id })}
+				label={shareLabel}
+				createdAt={shareLink.createdAt}
+				ondismiss={() => (shareLink = null)}
+			/>
 		{/if}
 
 		{#if controller.runtimeState?.statusReason}
@@ -205,7 +252,10 @@
 				</div>
 			{:else}
 				{#each controller.visibleItems as item (item.id)}
-					<TimelineEntry {item} />
+					<TimelineEntry
+						{item}
+						onshare={(shared) => void share({ scope: 'message', messageId: shared.id })}
+					/>
 				{/each}
 			{/if}
 

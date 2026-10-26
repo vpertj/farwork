@@ -10,7 +10,8 @@
 		isCollapsible
 	} from '$lib/timeline';
 
-	let { item }: { item: TimelineItem } = $props();
+	let { item, onshare }: { item: TimelineItem; onshare?: (item: TimelineItem) => void } =
+		$props();
 
 	let expanded = $state(false);
 
@@ -38,6 +39,16 @@
 				<span class="badge" data-tone={itemStatusTone(item.status)}>
 					{itemStatusLabel(item.status)}
 				</span>
+			{/if}
+			{#if onshare}
+				<button
+					class="share"
+					type="button"
+					title="分享这条消息"
+					onclick={() => onshare?.(item)}
+				>
+					分享
+				</button>
 			{/if}
 			<span class="time">{formatClock(item.createdAt)}</span>
 		</span>
@@ -154,5 +165,18 @@
 
 	.toggle:hover {
 		color: var(--foreground);
+	}
+
+	.share {
+		padding: 1px 7px;
+		border-radius: 999px;
+		border: 1px solid var(--border);
+		font-size: 10.5px;
+		color: var(--muted-foreground);
+	}
+
+	.share:hover {
+		border-color: color-mix(in oklch, var(--info) 45%, transparent);
+		color: var(--info);
 	}
 </style>

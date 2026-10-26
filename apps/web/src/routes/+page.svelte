@@ -2,22 +2,27 @@
 	import { onMount } from 'svelte';
 	import { auth } from '$lib/auth.svelte';
 	import { workspace } from '$lib/workspace.svelte';
-	import { isAuthRoute, parseHash } from '$lib/router';
+	import { isAuthRoute, isPublicRoute, parseHash } from '$lib/router';
 	import AuthScreen from '../components/AuthScreen.svelte';
 	import WorkspaceShell from '../components/WorkspaceShell.svelte';
 	import TaskHome from '../components/TaskHome.svelte';
 	import SessionView from '../components/SessionView.svelte';
 	import NewSessionPage from '../components/NewSessionPage.svelte';
 	import PlaceholderPage from '../components/PlaceholderPage.svelte';
+	import SharePage from '../components/SharePage.svelte';
 
-	let hash = $state('#/');
+	function currentHash(): string {
+		return typeof window === 'undefined' ? '#/' : window.location.hash || '#/';
+	}
+
+	let hash = $state(currentHash());
 
 	const route = $derived(parseHash(hash));
 	const token = $derived(auth.token);
 
 	onMount(() => {
 		const sync = (): void => {
-			hash = window.location.hash || '#/';
+			hash = currentHash();
 		};
 		sync();
 		window.addEventListener('hashchange', sync);
@@ -28,7 +33,7 @@
 	$effect(() => {
 		if (!auth.ready) return;
 		const current = window.location.hash || '#/';
-		if (!auth.token && !isAuthRoute(route) && current !== '#/login') {
+		if (!auth.token && !isPublicRoute(route) && current !== '#/login') {
 			window.location.hash = '#/login';
 			return;
 		}
@@ -43,10 +48,12 @@
 </script>
 
 <svelte:head>
-	<title>Farwork · 工作台</title>
+	<title>{route.page === 'share' ? 'Farwork · 分享' : 'Farwork · 工作台'}</title>
 </svelte:head>
 
-{#if !auth.ready}
+{#if route.page === 'share'}
+	<SharePage shareId={route.shareId} />
+{:else if !auth.ready}
 	<div class="boot">
 		<span class="glyph" aria-hidden="true">◈</span>
 		<p>正在加载工作台…</p>

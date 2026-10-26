@@ -5,7 +5,8 @@ export type Route =
 	| { page: 'session'; sessionId: string }
 	| { page: 'settings'; tab: string }
 	| { page: 'device'; connectorId: string }
-	| { page: 'new-session'; projectId: string | null };
+	| { page: 'new-session'; projectId: string | null }
+	| { page: 'share'; shareId: string };
 
 export function parseHash(hash: string): Route {
 	const path = (hash.replace(/^#\/?/, '').split('?')[0] ?? '').trim();
@@ -28,6 +29,8 @@ export function parseHash(hash: string): Route {
 				page: 'new-session',
 				projectId: parts[1] ? decodeURIComponent(parts[1]) : null
 			};
+		case 'share':
+			return parts[1] ? { page: 'share', shareId: decodeURIComponent(parts[1]) } : { page: 'home' };
 		default:
 			return { page: 'home' };
 	}
@@ -51,6 +54,8 @@ export function hrefFor(route: Route): string {
 			return route.projectId
 				? `#/new-session/${encodeURIComponent(route.projectId)}`
 				: '#/new-session';
+		case 'share':
+			return `#/share/${encodeURIComponent(route.shareId)}`;
 	}
 }
 
@@ -62,4 +67,13 @@ export function navigate(route: Route): void {
 
 export function isAuthRoute(route: Route): boolean {
 	return route.page === 'login' || route.page === 'register';
+}
+
+/** 公开路由：未登录也必须渲染，登录守卫不得改写这些 hash。 */
+export function isPublicRoute(route: Route): boolean {
+	return isAuthRoute(route) || route.page === 'share';
+}
+
+export function absoluteHref(route: Route): string {
+	return `${window.location.origin}${window.location.pathname}${hrefFor(route)}`;
 }

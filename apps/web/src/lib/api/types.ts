@@ -335,7 +335,8 @@ export function parseTimelineItem(value: unknown): TimelineItem | null {
 		orderSeq: asNumber(raw.orderSeq),
 		updatedSeq: asNumber(raw.updatedSeq),
 		revision: asNumber(raw.revision, 1),
-		createdAt: asString(raw.createdAt),
+		// 公开分享只暴露白名单字段，时间叫 `itemTime`；普通快照仍是 `createdAt`。
+		createdAt: asString(raw.createdAt) || asString(raw.itemTime),
 		content: asRecord(raw.content) ?? {},
 		source: parseTimelineSource(raw.source)
 	};
@@ -608,3 +609,51 @@ export function parseTerminalFrame(value: unknown): TerminalServerFrame | null {
 			return null;
 	}
 }
+
+export type ShareScope = 'session' | 'message';
+
+function narrowShareScope(value: unknown): ShareScope | null {
+	const raw = asString(value);
+	return raw === 'session' || raw === 'message' ? raw : null;
+}
+
+export type SessionShare = {
+	id: string;
+	scope: ShareScope;
+	urlPath: string;
+	createdAt: string;
+};
+
+export function parseSessionShare(value: unknown): SessionShare | null {
+	const raw = asRecord(asRecord(value)?.share ?? value);
+	if (!raw) return null;
+	const id = asString(raw.id);
+	const scope = narrowShareScope(raw.scope);
+	if (!id || !scope) return null;
+	return { id, scope, urlPath: asString(raw.urlPath), createdAt: asString(raw.createdAt) };
+}
+
+export type PublicShare = {
+	id: string;
+	scope: ShareScope;
+	sessionTitle: string;
+	createdAt: string;
+	items: TimelineItem[];
+};
+
+export function parsePublicShare(value: unknown): PublicShare | null {
+	const raw = asRecord(asRecord(value)?.share ?? value);
+	if (!raw) return null;
+	const id = asString(raw.id);
+	const scope = narrowShareScope(raw.scope);
+	if (!id || !scope) return null;
+	const timeline = asRecord(raw.timeline) ?? {};
+	return {
+		id,
+		scope,
+		sessionTitle: asString(raw.sessionTitle),
+		createdAt: asString(raw.createdAt),
+		items: parseTimelineItems(timeline.items)
+	};
+}
+
