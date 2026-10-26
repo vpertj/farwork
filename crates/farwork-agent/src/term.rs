@@ -425,6 +425,19 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(20);
     const SHELL: &str = "/bin/sh";
 
+    /// The shell under test. On Ubuntu /bin/sh is dash and on macOS it is bash in
+    /// sh mode, and the two place the prompt differently — the difference that
+    /// made these tests pass on one and fail on the other. Point the suite at a
+    /// specific shell to reproduce either:
+    ///   FARWORK_TEST_SHELL=/bin/dash cargo test -p farwork-agent term::tests
+    fn test_shell() -> String {
+        std::env::var("FARWORK_TEST_SHELL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| String::from(SHELL))
+    }
+
     struct TempDir {
         path: PathBuf,
     }
@@ -471,7 +484,7 @@ mod tests {
             });
             let (sender, frames) = unbounded_channel();
             Self {
-                host: TerminalHost::new(sandbox, Some(String::from(SHELL))),
+                host: TerminalHost::new(sandbox, Some(test_shell())),
                 sender,
                 frames,
                 output: HashMap::new(),
@@ -570,19 +583,42 @@ mod tests {
                 .any(|window| window == needle)
     }
 
-    /// Full-line match. The PTY echoes whatever was typed, so a substring test for
-    /// "TERM_OK" also passes on the echoed "echo TERM_OK" and proves nothing.
-    fn has_line(output: &[u8], line: &str) -> bool {
-        output.split(|byte| *byte == b'\n').any(|candidate| {
-            let trimmed = candidate.strip_suffix(b"\r").unwrap_or(candidate);
-            trimmed == line.as_bytes()
-        })
+    /// Interactive shells disagree about *where* the prompt goes: bash prints it
+    /// before the echoed input, dash prints it after the echo and directly in front
+    /// of the command's own output ("echo TERM_OK\r\n$ TERM_OK\r\n$ " on Ubuntu,
+    /// where /bin/sh is dash). Strip at most one leading prompt marker, so a line
+    /// comparison is about what the shell printed rather than which shell printed
+    /// it. Exactly one: "$ echo TERM_OK" must stay a line that is not "TERM_OK".
+    fn strip_prompt(line: &[u8]) -> &[u8] {
+        for prompt in [
+            b"$ ".as_slice(),
+            b"# ".as_slice(),
+            b"% ".as_slice(),
+            b"> ".as_slice(),
+        ] {
+            if let Some(rest) = line.strip_prefix(prompt) {
+                return rest;
+            }
+        }
+        line
     }
 
-    fn line_of(output: &[u8], prefix: &str) -> Option<String> {
+    /// Output lines as a shell-independent comparison sees them.
+    fn normalized_lines(output: &[u8]) -> impl Iterator<Item = &[u8]> {
         output
             .split(|byte| *byte == b'\n')
             .map(|candidate| candidate.strip_suffix(b"\r").unwrap_or(candidate))
+            .map(strip_prompt)
+    }
+
+    /// Full-line match. The PTY echoes whatever was typed, so a substring test for
+    /// "TERM_OK" also passes on the echoed "echo TERM_OK" and proves nothing.
+    fn has_line(output: &[u8], line: &str) -> bool {
+        normalized_lines(output).any(|candidate| candidate == line.as_bytes())
+    }
+
+    fn line_of(output: &[u8], prefix: &str) -> Option<String> {
+        normalized_lines(output)
             .map(String::from_utf8_lossy)
             .find(|line| line.starts_with(prefix))
             .map(|line| line.into_owned())
@@ -785,6 +821,55 @@ mod tests {
             .expect_err("too wide");
         assert_eq!(failure.code, INVALID_SIZE);
         harness.host.close_all();
+    }
+
+    #[test]
+    fn prompt_normalization_keeps_line_matching_strict() {
+        // The same fact, told by four prompts: bash puts the marker before the
+        // echoed input, dash puts it in front of the command's own output.
+        assert!(has_line(b"$ TERM_OK\n", "TERM_OK"));
+        assert!(has_line(b"# TERM_OK\n", "TERM_OK"), "root prompt");
+        assert!(has_line(b"% TERM_OK\n", "TERM_OK"), "zsh style prompt");
+        assert!(has_line(b"> TERM_OK\n", "TERM_OK"), "continuation prompt");
+        assert!(has_line(b"TERM_OK\n", "TERM_OK"), "no prompt at all");
+
+        // Nothing about the strictness is given up: echoing the command is still
+        // not the command's output, with or without a prompt in front of it.
+        assert!(!has_line(b"echo TERM_OK\n", "TERM_OK"));
+        assert!(!has_line(b"$ echo TERM_OK\n", "TERM_OK"));
+        assert!(!has_line(b"$ echo TERM_OK\r\n", "TERM_OK"));
+        assert!(!has_line(b"$ TERM_OK_extra\n", "TERM_OK"));
+
+        // One marker, not a loop: a doubled prompt is not an output line either.
+        assert!(has_line(b"$ $ TERM_OK\n", "$ TERM_OK"));
+        assert!(!has_line(b"$ $ TERM_OK\n", "TERM_OK"));
+    }
+
+    /// The payloads CI reported for dash, quoted verbatim: this is the regression
+    /// the test exists for (/bin/sh on Ubuntu is dash, which prints the prompt in
+    /// front of the output instead of before the echo).
+    #[test]
+    fn dash_style_output_matches_the_same_lines_as_bash() {
+        assert!(has_line(b"echo TERM_OK\r\n$ TERM_OK\r\n$ ", "TERM_OK"));
+
+        let resize = b"stty size\r\n$ 24 80\r\n$ ";
+        assert!(has_line(resize, "24 80"));
+        assert_eq!(line_of(resize, "24 80").as_deref(), Some("24 80"));
+
+        let pwd = b"pwd\r\n$ /srv/work/inside\r\n$ ";
+        assert!(has_line(pwd, "/srv/work/inside"));
+        assert_eq!(
+            line_of(pwd, "/srv/work/inside").as_deref(),
+            Some("/srv/work/inside")
+        );
+
+        // bash's shape keeps working from the same helper, including the terminal
+        // capability report bash prints before the prompt.
+        assert!(has_line(
+            b"\x1b[?1034hsh-3.2$ echo TERM_OK\r\nTERM_OK\r\n",
+            "TERM_OK"
+        ));
+        assert!(!has_line(b"\x1b[?1034hsh-3.2$ echo TERM_OK\r\n", "TERM_OK"));
     }
 
     #[test]

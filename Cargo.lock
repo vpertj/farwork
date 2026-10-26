@@ -332,7 +332,9 @@ name = "farwork-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "futures-util",
+ "portable-pty",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
