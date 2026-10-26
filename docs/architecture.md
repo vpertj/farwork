@@ -13,12 +13,14 @@
         |   WS    /api/v2/sessions/{id}/ws?ticket=...
         v
  farwork-hub (:7300, axum)  --->  PostgreSQL (唯一状态来源)
-        |                          migrations/0001_init.sql … 0005_session_terminal_scope.sql，启动时自动应用
+        |                          migrations/0001_init.sql … 0006_notice_interaction_type.sql，启动时自动应用
         ^
         |   WS  /api/v2/connector/ws?token=...    (Ingress Protocol v1，见 §5)
         |   连接由设备侧主动发起（出站），hub 从不反向拨号
         |
- farwork-agent（被接管的设备，常驻）  ---stdio JSON-RPC-->  codex app-server（`codex app-server --stdio`）
+ farwork-agent（被接管的设备，常驻）
+        |--- stdio JSON-RPC ----------->  codex app-server（`codex app-server --stdio`，agent 拉起子进程）
+        |--- TCP 127.0.0.1 JSON-RPC --->  DSH bridge（本机已在运行，agent 只是客户端；见 §10）
 ```
 
 | 组件 | 位置 | 职责 | 对外 |
@@ -27,7 +29,7 @@
 | `farwork-timeline` | `crates/farwork-timeline` | timeline **纯域逻辑**：seq 分配、`content_hash` 去重、`order_seq`、游标恢复、每会话写栅栏。无 IO、无时钟 | 库 |
 | `farwork-protocol` | `crates/farwork-protocol` | **M1 遗留**：M1 线协议类型，仅 server/connector 使用 | 库 |
 | `farwork-server` | `crates/farwork-server` | **M1 遗留**：`/api/health`、`/api/devices`、`/ws/connector`、`/ws/client` 终端骨架 | 端口 7300（与 hub 冲突） |
-| `farwork-agent` | `crates/farwork-agent` | **M3 真正的 connector**：主动出站连 hub 的 `/connector/ws`，按 `session.start` 拉起本地 `codex app-server`（或 `--runtime echo` 的假后端），把 codex 的 JSON-RPC 翻成 Ingress Protocol v1 上行；另应答只读 `fs.request`、按 `terminal.open` 起 PTY 并双向转发（`src/term.rs`）——两者的沙箱根都是 `--workdir`（`src/fsops.rs`） | 无监听端口（只出站） |
+| `farwork-agent` | `crates/farwork-agent` | **M3 真正的 connector**：主动出站连 hub 的 `/connector/ws`，按 `session.start` 拉起本地 `codex app-server`（或 `--runtime echo` 的假后端），把 codex 的 JSON-RPC 翻成 Ingress Protocol v1 上行；另应答只读 `fs.request`、按 `terminal.open` 起 PTY 并双向转发（`src/term.rs`）——两者的沙箱根都是 `--workdir`（`src/fsops.rs`）；`--runtime dsh` 时改为**连**一个本机已在运行的 DSH bridge（`src/dsh/`，生命周期与 codex 相反，见 §10） | 无监听端口（只出站） |
 | `farwork-connector` | `crates/farwork-connector` | **M1 遗留**：按 `terminal.open` 起 PTY 并双向转发，只连 `farwork-server` 的 `/ws/connector`；**没有 ingress 协议，也没接 hub** | 出站连接 |
 | `apps/web` | `apps/web` | SvelteKit 静态 SPA：登录、connectors/项目/会话、timeline、发消息、WS 增量、审批卡、新建会话表单（`#/new-session`）、会话中断、文件面板（只读浏览 + 文本预览）、会话页终端面板（xterm.js，`src/components/TerminalPanel.svelte`） | dev 端口 5173 |
 
@@ -62,6 +64,7 @@
 | `FARWORK_CONNECTOR_TOKEN` | 未设置 | **仅 agent**：`--token` 的等价环境变量（`--token` 优先）。两者都没有时 agent 退出码 1，报 `no connector token` | `farwork-agent/src/cli.rs:8,127-134`；`main.rs:43-45` |
 | `FARWORK_CODEX_BIN` | `codex` | **仅 agent**：codex 可执行文件路径（`--codex-bin` 覆盖）。agent 以 `app-server --stdio` 拉起它 | `cli.rs:9,135-143`；`hub.rs:375` |
 | `FARWORK_HOME` | `~/.farwork` | **仅 agent**：身份文件目录；文件是 `$FARWORK_HOME/agent.json`，未设置时 `~/.farwork/agent.json` | `identity.rs:37-47` |
+| `DSH_HOME` | 未设置时回退 `$HOME/.dsh` | **仅 agent 的 `--runtime dsh`**：bridge 端点的**回退**查找根，读 `$DSH_HOME/agents-anywhere/bridge/endpoint.json`。主路径是 `$HOME/.agents-anywhere/dsh-bridge/endpoint.json`，两者都被 `--dsh-endpoint <path>` 覆盖（§10.1） | `dsh/discovery.rs:15-22,90-108` |
 
 ## 3. `/api/v2` 端点（已实现）
 
@@ -154,15 +157,35 @@
 
 | 方法 | 路径 | 说明 | 源码 |
 | --- | --- | --- | --- |
-| `GET` | `/sessions/{session_id}/runtime/notices` | 该会话的审批列表，字段 `id/kind/status/title/body/options/decision/createdAt/updatedAt`。`decision` 是 hub 侧的**附加**字段：契约的 notice 形状没有表达「怎么关掉的」的位置，而只看 `status` 会让浏览器分不清 approve 与 reject | `notices.rs:25,253-277` |
-| `POST` | `/sessions/{session_id}/notices/{notice_id}/respond` | 浏览器契约里的拼法；body `{"decision":"approve"\|"approve_for_session"\|"reject"}` | `notices.rs:29-32,279-341` |
+| `GET` | `/sessions/{session_id}/runtime/notices` | 该会话的审批列表，字段 `id/kind/status/title/body/options/interactionType/decision/createdAt/updatedAt`。`interactionType`（`approval` / `question` / … ，可空）是**运行时自己声明的交互种类**，单独一列（`session_notices.interaction_type`，`0006_notice_interaction_type.sql`；读写在 `notices.rs:46-67,93,145-171`）。**为什么不复用 `kind`**：`kind` 那三个值（`command_execution` / `file_change` / `permissions`）是 codex 的词汇，DSH 的一个 approval 是通用的 runtime interaction——把 `kind` 改义会让浏览器已渲染的 codex 审批变样。`decision` 是 hub 侧的**附加**字段：契约的 notice 形状没有表达「怎么关掉的」的位置，而只看 `status` 会让浏览器分不清 approve 与 reject | `notices.rs:25,57-90` |
+| `POST` | `/sessions/{session_id}/notices/{notice_id}/respond` | 浏览器契约里的拼法；body 三选一（见下）：`{"actionId":"<运行时按钮 id>"}`、`{"decision":"approve"\|"approve_for_session"\|"reject"}`、`{"input":<结构化答案>}`（别名 `inputData`） | `notices.rs:29-32,342-470` |
 | `POST` | `/sessions/{session_id}/runtime/notices/{notice_id}/respond` | 同一 handler 的别名（原 `501` 表用的就是 runtime 命名空间，为兼容保留） | `notices.rs:33-36` |
 
 三条行为契约（M3 时定死，别改成「看起来更快」的版本）：
 
-- **只下发，不乐观 resolve**：respond 成功时响应里的 `notice.status` 仍是 `open`；`resolved` 只有 connector 的 `notice.resolved` 能写（`notices.rs:330-341`）。
+- **只下发，不乐观 resolve**：respond 成功时响应里的 `notice.status` 仍是 `open`；`resolved` 只有 connector 的 `notice.resolved` 能写（`notices.rs:459-470`）。
 - **投递失败就报错**：connector 不在线或 socket 已断 → `409 connector_offline`，审批保持 `open`。浏览器点了按钮不等于 agent 收到了决定。
 - **状态机**：非 `open` 的 notice 再 respond → `409 notice_already_resolved`；未知 notice → `409 notice_not_found`；`decision` 不在三值内 → 422。
+
+**`options` 的契约扩展：对象是规范形态，旧字符串数组照收**
+
+wire 上现在是 `[{"id":"allow-once","label":"允许一次","style":"primary"}, …]`，而 v1.3 的 `["approve","reject"]` **仍然合法**：`NoticeOption` 是 `#[serde(untagged)]` 的 `Action | Legacy(String)`（`ingress.rs:785-799`），一个裸字符串按「id 就是那个词」读成对象，`label` 由 `default_label` 补中文默认值（`approve`/`allow`/`allow-once` → 批准；`approve_for_session`/`approve-for-session`/`allow-always` → 本会话内批准；`reject`/`deny` → 拒绝；`cancel` → 取消；`submit` → 提交；其余原样返回；`ingress.rs:824-836`）。`to_wire` 出来的一律是对象、空 label 也补默认（`ingress.rs:801-822`），落库与 REST 都只有对象形态——**旧卡片渲染的仍是同样的三个按钮**，多出来的是 `id`/`label`/`style` 三个位置。
+
+**`actionId` 与 `decision` 都带，也都可缺**
+
+- 下行 `notice.respond` 与上行 `notice.resolved` 都可带 `actionId`（运行时的按钮 id）。**缺键就不发该键**，不发 `null`：`notice_respond_frame` 只在 `Some` 时插入（`ingress.rs:472-499`），`NoticeResolved` 的 `decision`/`actionId` 都是 `Option` + `#[serde(default)]`（`ingress.rs:570-585`）。
+- **为什么保留 `decision`**：升级期的 Web 会**同时**发 `actionId` 和镜像过来的 `decision`，这样「只认识旧三值」的一侧仍然读得懂。hub 因此只把**不一致**当歧义（`notices.rs:389-414`）：值相同就是正常答案，值不同才是 422。保留它不是历史包袱，是升级期的兼容面。
+
+**四种 422（都是 `unprocessable`，不是 409）**
+
+| 情况 | 结果 | 源码 |
+| --- | --- | --- |
+| 两个字段都没给（空 body / 空串） | `422 {"code":"empty_answer"}` | `notices.rs:389-394` |
+| `decision` 与 `actionId` 同时给出但**不相等** | `422 {"code":"ambiguous_answer"}`（带两个值，便于定位） | `notices.rs:395-405` |
+| `actionId` 不在这条 notice 真正给出的 options 里 | `422 {"code":"unknown_action"}` + `expected` 列表 | `notices.rs:437-448` |
+| `input`/`inputData` 都接受 | `inputData` 是 `input` 的 `serde(alias)`；转发给设备时键名恒为 `input` | `notices.rs:349-355`；`ingress.rs:488-496` |
+
+`actionId` **两处都校验**：respond 时对着 `session_notices.options_json` 查（`notices.rs:437-448`），connector 回报 `notice.resolved` 时再查一次（`notices.rs:218-228`）。一个晚到的标签页、或桥在期间换掉的按钮，宁可 422 也不要落一个没人按过的答案。另外：只给 `decision` 而不给 `actionId` 时，仍按老规则要求它属于三值闭集（`notices.rs:407-411`）。
 
 ### 3.8 分享 —— `routes/shares.rs`
 
@@ -290,8 +313,8 @@ hub 侧类型是 `crates/farwork-hub/src/ingress.rs:460-547` 的 `ConnectorFrame
 | `session.exit` | `streamId`, `code` | 关流（`closed_at`）；`code == 0` → `idle`，非 0 → `error`。流是单次性的：退出后 `session.message` 无处可投 |
 | `session.capabilities` | `streamId`, `capabilities: {steer?, interrupt?, selections?, commands?}`, `catalogs: {models?, permissions?}`, `commands?` | Ingress Protocol v1.3 的能力上报：按 `streamId` 定位会话，整份写进进程内缓存（`runtime_caps`），`revision` 由 hub 自增；**不落库**（它描述的是一个活着的进程）。hub 侧三个子键都是 `#[serde(default)]`：缺键不断连、缺省即 `false` / 空表。四布尔与两份 catalog 的含义、清除时机见 §5.13 |
 | `item.upsert` | `streamId`, `item: {id, type, status, role?, content, itemTime}` | 交给 timeline 的 `apply_runtime_item`：`{type,status,role,content}` 哈希去重，未变更不提交也不广播；未知 `type`/`status`/`role` 报错，**不强转** |
-| `notice.upsert` | `streamId`, `notice: {id, kind, status?, title?, body?, options?}` | upsert 进 `session_notices`（同 id 可被细化 title/options），广播 `runtime.notice.updated` |
-| `notice.resolved` | `noticeId`, `decision`（**无** `streamId`） | 按 `id` + 「该 connector 拥有的会话」定位，写 `status='resolved'` 与 `decision`，广播 `runtime.notice.updated` 和整份 `runtime.notice.snapshot` |
+| `notice.upsert` | `streamId`, `notice: {id, kind, status?, title?, body?, options?, interactionType?}` | upsert 进 `session_notices`（同 id 可被细化 title/options/interactionType），广播 `runtime.notice.updated`。`options` 每项是 `{id,label,style?}`，旧的字符串数组**仍合法**并被归一化成对象（§3.7）；`interactionType` 落 `interaction_type` 列（`ingress.rs:838-849`；`notices.rs:145-171`） |
+| `notice.resolved` | `noticeId`, `decision?`, `actionId?`（**无** `streamId`） | 按 `id` + 「该 connector 拥有的会话」定位，写 `status='resolved'` 与答案，广播 `runtime.notice.updated` 和整份 `runtime.notice.snapshot`。两个字段都可缺（别的客户端答的、或运行时撤回了提示）：`(None,None)` 记为「已关闭，无答案」而不是替谁编一个决定（`notices.rs:230-241`）；带 `actionId` 时校验它在这条 notice 给出的 options 里，否则 `422 unknown_action`（`notices.rs:218-228`） |
 | `fs.response` | `requestId`, `ok`, `op?`, `path?`, `entries?`, `sizeBytes?`, `content?`, `truncated?`, `error?` | 交给 `FsRelay` 按 `requestId` 配给等待中的 REST 请求，**不走流路由**（`ConnectorFrame::stream_id()` 对它返回 `None`，`ingress.rs:562`）。三种形态（list 成功 / readText 成功 / 失败）见 §5.5 |
 | `terminal.opened` | `terminalId` | 按 `terminalId` 路由（**不是** `streamId`）：`termrelay.mark_opened` 记住「这个终端已经起过」，并向已挂着的浏览器推 `{"type":"terminal.opened"}`；没人订阅时只记 debug（`connector_ws.rs:500-514`） |
 | `terminal.data` | `terminalId`, `data`（standard padded base64） | 原样转发给该终端的浏览器 socket，hub **不解码不重编码**；没有订阅者就丢弃并记 debug（`connector_ws.rs:516-529`） |
@@ -311,7 +334,7 @@ hub 用 `ingress.rs:308-466` 的**十三个**构造函数产出帧（终端四�
 | `session.interrupt` | `streamId` | 映射成 codex `turn/interrupt`；`turn/completed{status:"interrupted"}` 把在跑条目收成 `interrupted` | `POST /sessions/{id}/runtime/interrupt` |
 | `session.steer` | `streamId`, `text` | 给正在跑的回合再补一条指令。`text` 缺失或 `trim()` 后为空 → **丢弃并 warn，不断连**（`hub.rs:357-373`）；echo 后端把这条指令写成一条 user 条目 + 一条 assistant 回执（`echo.rs:179-186`），codex 没有 steer 方法，回 `error` 明说没应用（`codex/session.rs:110-121`） | `POST /sessions/{id}/runtime/steer`（`runtime.rs:188`） |
 | `session.selections` | `streamId`, `model?`, `permissionMode?` | 改模型 / 权限模式。**缺省不发键**（不是发 `null`，`ingress.rs:387-404`）：agent 把缺失读成「保持当前值」，两个键都没有时丢帧并 warn（`hub.rs:374-391`）。echo 记下并回同状态（`echo.rs:187-202`）；codex 无奈拒绝并如实说明（`codex/session.rs:122-139`） | `PATCH /sessions/{id}/runtime/selections`（`runtime.rs:273`） |
-| `notice.respond` | `noticeId`, `decision`（**无** `streamId`，与上行同形） | 在所有 live worker 里按 noticeId 找提示并回 JSON-RPC result；找不到只 warn | `POST .../notices/{id}/respond` |
+| `notice.respond` | `noticeId`, `decision?`, `actionId?`, `input?`（**无** `streamId`，与上行同形；缺键不发键） | 在所有 live worker 里按 noticeId 找提示并回 JSON-RPC result（带 `actionId` 时先按该 notice 记录过的 action 列表**重新校验**，不合法回 error 帧并把提示放回队列：`interaction.rs:95-126`；`mod.rs:683-706`）；找不到只 warn | `POST .../notices/{id}/respond` |
 | `fs.request` | `requestId`, `op`, `path` | 按 `op`（`list` / `readText`）在**阻塞线程池**里应答，回一条同 `requestId` 的 `fs.response`；沙箱外一律 `permission_denied`（§5.6），没有沙箱时也 `permission_denied`（`hub.rs:453-480`） | `POST /connectors/{id}/fs/list`、`POST /connectors/{id}/fs/readText`（`routes/fs.rs:120-124`） |
 | `terminal.open` | `terminalId`, `cols`, `rows`, `cwd?`, `shell?` | 用 `--workdir` 沙箱校验 `cwd` 后起 shell（`term.rs:148-190,275-287`）；成功回 `terminal.opened`，失败回 `terminal.error`。`cwd`/`shell` 缺省时 hub **不发这两个键**（`ingress.rs:388-411`），agent 缺省语义是 `--workdir` / `--shell` / `$SHELL` | `POST /connectors/{id}/terminals`（`terminals.rs:133-139`） |
 | `terminal.data` | `terminalId`, `data` | base64 解码后写进 PTY master（按字节，不断言 UTF-8）；不是合法 base64 就丢帧并 warn，未知 terminalId 只记 debug（`hub.rs:415-427`） | 浏览器 `terminal.input` |
@@ -593,7 +616,7 @@ v1.3 只加了三帧，方向不对称：**能力只能由运行时上报**（�
 - **从没收到过帧 → 四个布尔全 `false`**、`revision: 0`、`reportedAt: null`（`runtime.rs:45-62`；单测 `runtime_caps.rs:230-244`）。**不是全 `true`**：那会给用户四个不工作的按钮。
 - **写接口对「还没上报」故意乐观**：只有在**上报过** `steer:false` / `selections:false` 时才回 `501`；缓存为空时照常下发（`runtime.rs:171-182,259-267`）——把慢到的第一帧当成「没有这个功能」，会让首帧延迟看起来像缺功能。
 
-**两个后端的真实上报（别把 echo 的能力当成产品能力）**：echo 四项全 `true` 并带占位 catalog，模型 id 就叫 `echo-fast` / `echo-slow`，描述明写「echo placeholder model: it echoes, it does not think」（`echo.rs:25-68`）；codex 只有 `interrupt: true`，其余三项 `false`、两份 catalog 为空（`codex/mod.rs:20-38`）。**这就是「运行中干预」今天的真实覆盖面**：协议与管道通了，真 codex 只支持中断。
+**两个后端的真实上报（别把 echo 的能力当成产品能力）**：echo 四项全 `true` 并带占位 catalog，模型 id 就叫 `echo-fast` / `echo-slow`，描述明写「echo placeholder model: it echoes, it does not think」（`echo.rs:25-68`）；codex 只有 `interrupt: true`，其余三项 `false`、两份 catalog 为空（`codex/mod.rs:20-38`）。**这就是「运行中干预」今天的真实覆盖面**：协议与管道通了，真 codex 只支持中断。DSH 是第三个后端：它的实测能力值、`session.commands` 报 `false` 的理由见 §10.5。
 
 ## 6. timeline 语义（由 `farwork-timeline` 定义）
 
@@ -638,9 +661,9 @@ hub 侧的对应行为：`routes/sessions.rs:766-812` —— `after` 不可解�
 
 ## 7. 持久化
 
-- 迁移文件 **5 个**：`crates/farwork-hub/migrations/0001_init.sql` + `0002_connector_ingress.sql`（M3 ingress）+ `0003_terminals.sql`（设备终端）+ `0004_shares.sql`（分享）+ `0005_session_terminal_scope.sql`（Ingress Protocol v1.3：给 `terminals` 加可空的 `session_id`，不建第二张表）。启动时由 `db::migrate` 通过 `sqlx::migrate!("./migrations")` 应用，sqlx 自带 ledger，重复启动是 no-op（`db.rs:17-22`；`main.rs` 的启动序列）。
-- **12 张表**（`create table` 计数）：0001 的 `users`、`app_settings`、`connectors`、`projects`、`sessions`、`session_runtime_states`、`timeline_items`、`ws_tickets`，加 0002 的 `session_streams`、`session_notices`，加 0003 的 `terminals`，加 0004 的 `shares`（`snapshot_json` 存一次写死的快照、`deleted_at` 是软删，见 §3.8）。后三张的存在理由见 §5.7：一张让 `streamId` 跨 hub 重启存活，一张让审批跨刷新存活，`terminals` 让「终端已结束 / 从未存在」可区分并让 agent 的拒绝原因活过它被报告的那一刻（列含 `closed_at`、`error_code`、`error_message`，`0003_terminals.sql:13-29`）。
-- **16 个索引**（0001 十个 + 0002 两个 + 0003 两个 + 0004 一个 + 0005 一个），其中数条是语义承载点：
+- 迁移文件 **6 个**：`crates/farwork-hub/migrations/0001_init.sql` + `0002_connector_ingress.sql`（M3 ingress）+ `0003_terminals.sql`（设备终端）+ `0004_shares.sql`（分享）+ `0005_session_terminal_scope.sql`（Ingress Protocol v1.3：给 `terminals` 加可空的 `session_id`，不建第二张表）+ `0006_notice_interaction_type.sql`（给 `session_notices` 加**可空**的 `interaction_type`：DSH 的 approval 是通用 runtime interaction，不是 `kind` 那三个值能表达的，所以加列而不是改义 `kind`；**不建表、不加索引**）。启动时由 `db::migrate` 通过 `sqlx::migrate!("./migrations")` 应用，sqlx 自带 ledger，重复启动是 no-op（`db.rs:17-22`；`main.rs` 的启动序列）。
+- **12 张表**（`create table` 计数）：0001 的 `users`、`app_settings`、`connectors`、`projects`、`sessions`、`session_runtime_states`、`timeline_items`、`ws_tickets`，加 0002 的 `session_streams`、`session_notices`，加 0003 的 `terminals`，加 0004 的 `shares`（`snapshot_json` 存一次写死的快照、`deleted_at` 是软删，见 §3.8）。`0006_notice_interaction_type.sql` 只加列，**表数不变**。后三张的存在理由见 §5.7：一张让 `streamId` 跨 hub 重启存活，一张让审批跨刷新存活，`terminals` 让「终端已结束 / 从未存在」可区分并让 agent 的拒绝原因活过它被报告的那一刻（列含 `closed_at`、`error_code`、`error_message`，`0003_terminals.sql:13-29`）。
+- **16 个索引**（`create index` / `create unique index` 计数：0001 十个 + 0002 两个 + 0003 两个 + 0004 一个 + 0005 一个；`0006` 一个也没加，**索引数不变**），其中数条是语义承载点：
   - `uq_timeline_items_client_message`：`unique (session_id, client_message_id)`（`0001_init.sql:132`）——`clientMessageId` 幂等的**唯一**保证。
   - `idx_timeline_items_session_updated_seq` / `_session_order_seq`：游标补拉与展示排序的查询路径（`0001_init.sql:129-130`）。
   - `idx_session_notices_id`：`notice.resolved` 只带 notice id，解析时先按 id 找行、再校验它属于发帧的 connector（`0002_connector_ingress.sql:37-39`）。
@@ -654,6 +677,8 @@ hub 侧的对应行为：`routes/sessions.rs:766-812` —— `after` 不可解�
 - `TEST_DATABASE_URL` **未设置** → 打印 `SKIP farwork-hub integration test: TEST_DATABASE_URL is not set.` 并附上怎么设置，然后 `return`（`e2e.rs:127-134`）。测试仍然是「通过」的——这就是 CI 必须提供数据库的原因。
 - `TEST_DATABASE_URL` 为空串 → 打印 `SKIP farwork-hub integration test: TEST_DATABASE_URL is empty.` 并返回（`e2e.rs:135-138`）。
 - 有值 → `bootstrap()` 连库、`db::migrate()` 建表、再 `truncate` 清空，然后跑「登录 → connectors/项目/会话 → timeline → 发消息 → WS 增量」整条链路（`e2e.rs:62-72`）。**目标库会被清空，只能指向一次性库。**
+
+另一类测试在 agent 侧、**不碰数据库**：`crates/farwork-agent/tests/dsh_live.rs` 是对**本机真 DSH bridge** 的只读探测（`initialize` + `session.list` + 两份 catalog，**不建会话、不跑一轮**），因此用 `#[ignore]` 关掉（`dsh_live.rs:21,103-104`）。跑法：`cargo test -p farwork-agent --test dsh_live -- --ignored --nocapture`（`dsh_live.rs:10-11`）。没有桥时它打印 `PROBE SKIP: no DSH bridge endpoint (…)` 然后**正常返回**（`dsh_live.rs:25-31`）——「本机没有 DSH」不算测试失败，但也不算验过。CI 不跑它。
 
 ## 9. 与上游的形态差异（本仓不是 byte-compatible）
 
@@ -710,6 +735,91 @@ hub 侧的对应行为：`routes/sessions.rs:766-812` —— `after` 不可解�
 5. `PATCH /sessions/{id}/runtime/selections`：把 `{selections:{k:v}}` 映射到 `{model, permissionMode}`，其余键 `422`；回 `{ok, state, connectorResult}`（`state` 取 `GET /runtime/state`）。
 6. 终端：加复数 alias —— `POST /sessions/{id}/terminals`（等价 create）、`GET /sessions/{id}/terminals`（按 `terminals.session_id` 列）、`PATCH` / `DELETE`（只能改/关本地行；`DELETE` 等价 WS 的 `terminal.close`）、`POST …/{terminalId}/resize`（映射成 WS 帧 `terminal.resize`，做不到就 `501`）。
 7. **反方向不需要 alias**：`/sessions/{id}/files/list|readText` 与单数 `/sessions/{id}/terminal*` 是本仓独有，上游客户端不会调用。别把它们写进「上游兼容」清单。
+
+## 10. agent 的第二个 runtime：DSH（`--runtime dsh`）
+
+`--runtime` 有三个值：`codex`（默认，agent 拉起子进程）、`echo`（假后端）、`dsh`（连一个**已经在跑**的 DSH bridge；`cli.rs:18,26,34`，`--help` 的说明在 `cli.rs:112-117`）。三者共用同一套 ingress，hub 侧看不出区别；区别全在 agent 的 `crates/farwork-agent/src/dsh/`（九个文件：`mod.rs` 主循环、`client.rs` 方法封装、`rpc.rs` 分帧与 id、`discovery.rs` 端点、`handshake.rs` 握手与能力位、`sync.rs` 批次/快照/checkpoint、`projection.rs` 帧投影、`interaction.rs` 待答队列、`selections.rs` 目录短名解析）。
+
+### 10.1 生命周期与 codex 相反
+
+| | codex | DSH |
+| --- | --- | --- |
+| 谁起谁 | agent `spawn` 子进程 `codex app-server --stdio`（`hub.rs:341`、`hub.rs:634` 起会话 worker） | bridge **本来就在跑**；agent 只是 TCP 客户端。每个会话各连一次：`rpc::dial`（`rpc.rs:206`）在 `mod.rs:132` |
+| 进程从哪来 | `$FARWORK_CODEX_BIN`（默认 `codex`） | 用户自己启动 DSH，并在其中**启用 agents-anywhere 桥插件** |
+| 端点 | 无此概念 | 读 `endpoint.json`（见下） |
+| 缺一个会怎样 | 该会话 `session.exit{code:2}` | 启动阶段就失败：退出码 `1`，connector **根本不上线**（`main.rs:73-80`） |
+
+端点发现（`discovery.rs`）按优先级：① `--dsh-endpoint <path>`（`cli.rs:49-51,150`）；② `$HOME/.agents-anywhere/dsh-bridge/endpoint.json`（`PRIMARY_SUFFIX`，`discovery.rs:15`）；③ `$DSH_HOME/agents-anywhere/bridge/endpoint.json`，`$DSH_HOME` 未设置时回退 `$HOME/.dsh`（`discovery.rs:17-18,100-108`；候选顺序 `discovery.rs:76-108`，入口 `discovery.rs:90`）。
+
+读到的 JSON 必须逐字过四项校验（`discovery.rs:137-183`），任何一项不过都是**拒绝拨号**而不是猜一个：
+- `version == 1`（`ENDPOINT_VERSION`，`discovery.rs:21,144-152`）——版本变了说明文件布局变了，按旧布局读等于「静默拨错端口」；
+- `host == "127.0.0.1"`（`discovery.rs:22,157-163`）——只连 loopback，不把 token 发到别的地址；
+- `port` 在 `1..=65535`、`token` 非空白。
+
+失败时的错误文本会列出**试过的路径**并提示「start DSH with the agents-anywhere bridge enabled」（`discovery.rs:50-56`）。**为什么把发现放在启动阶段**：`main.rs:67-72` 的注释就是理由——先连上 hub 再发现没有 DSH，hub 会照常接受 `session.start`，然后这个会话什么也驱动不了。缺端点 = **启动失败或会话失败**，没有「假装可用」这一档。
+
+### 10.2 传输与分帧
+
+- **换行分隔的 JSON-RPC 2.0 over TCP**：一帧一行、以 `\n` 结束；`\r\n` 也接受（行尾 `\r` 先剥掉，`rpc.rs:67-77`，单测 `rpc.rs:405`）。
+- **单帧硬上限 8 MiB**（`MAX_FRAME_BYTES`，`rpc.rs:23`）：超限直接报错（`rpc.rs:36-42`），内部缓冲也按同一上限截断（`rpc.rs:79-88`）——不为「读完这一帧」把内存吃光。
+- **非 UTF-8 拒绝**：`String::from_utf8` 失败即报错，不做有损解码（`rpc.rs:82-87`；单测 `rpc.rs:447-455`）。
+- **请求 id 是 `aa-<n>`**，从 `aa-1` 单调递增（`IdGen`，`rpc.rs:96-114`）：字符串前缀让「这条 id 是本 agent 发的」一眼可辨，也不会跟对端自己的数字 id 相撞。
+- **超时发 `$/cancelRequest`**（`CANCEL_METHOD`，`rpc.rs:26`；单测 `rpc.rs:587-616`）：超时后光放弃而不告诉对端，对端会继续算一条已经没人要的结果——所以取消必须发出去。
+- **对端发来的请求一律回 `-32601`**（`METHOD_NOT_FOUND`，`rpc.rs:27,280`）：本 agent 不是 bridge 的服务端，只实现自己发起的那些方法；一个明确的「方法不存在」比沉默或断连更容易诊断。
+
+### 10.3 握手：能力位只能来自上报
+
+`initialize` 带 `authToken` / `connectorId` / `sessionNamespace` / `clientVersion`（`InitializeParams`，`handshake.rs:81-98`；调用在 `handshake.rs:129` 起）。回包两件事被硬校验（`handshake.rs:148-158`）：`identity.runtime == "dsh"`（`RUNTIME`，`handshake.rs:13`；不符是 `WrongRuntime`——连上的不是 DSH 桥），以及 `identity.protocolVersion` 的 **major 段**与 `1.0` 相同（`PROTOCOL_VERSION`，`handshake.rs:12,167-169`）。minor 不卡：major 变了才意味着另一套协议。
+
+`features` 的**每一个字段都是 `#[serde(default)]`**（`handshake.rs:32-55`），因此**缺键 = `false`**，这是唯一的默认值：`approval` / `userQuestions` / `readOnly` / `sessionDiscovery` / `timelineSuffixRead` / `snapshotPagination` / `syncMode` / `projectionVersion`。
+
+**门禁只认上报值**，不允许「看起来应该有」：
+- 审批通知只在 `features.approval && !features.readOnly` 时转发（`approval_available`，`handshake.rs:71-73`；丢弃点 `projection.rs:180-187`）——只读姿态下桥已经说了「不会执行」，这时给一个点了没用的批准按钮就是骗人。
+- 问题通知同理看 `userQuestions && !readOnly`（`handshake.rs:75-77`；`projection.rs:188-195`）。
+- `syncMode != "events"` → 该会话直接 `code 2` 失败，不退化成轮询（`mod.rs:183-192`）；轮询会让 timeline 静默变旧。
+- `projectionVersion` 默认 `3`（`DEFAULT_PROJECTION_VERSION`，`handshake.rs:17`），`2` 仍接受。
+
+### 10.4 同步语义：subscribe → batch → **ack**，序号严格 +1
+
+1. `runtime.sync.subscribe`（方法名 `client.rs:355`，调用点 `mod.rs:748-773`）；
+2. bridge 以 `runtime.sync.batch` 通知推事件（分发 `mod.rs:266`）；
+3. agent 把批次翻成 ingress 帧后**必须**回 `runtime.sync.ack`（方法名 `client.rs:375`，调用点 `mod.rs:780-800`）。ack 同时是 checkpoint 的出口：有 checkpoint 就带上、没有就发 `null`，**不省略键**（`mod.rs:465-467`）。
+
+- **`batchSeq` 必须严格 +1**（`sync.rs:6-8,26,63-66`）：跳号或乱序意味着事件已经丢了，**唯一安全的恢复是重新订阅**，不是「从下一个号接着跑」（`mod.rs:308,322` → `resubscribe`，`mod.rs:774-779`）。重新订阅会重置序号（`sync.rs:89-99`）。
+- **快照 `begin → items → commit` 先暂存、后提交**（`sync.rs:152-277`）：`commit` 核对**条数**与 **id 唯一性**，不匹配整份丢弃并报错（`sync.rs:34-42,233-266`）；新的 `begin` 直接替换半份旧快照（`sync.rs:191-210`），`abort` 抛掉它（`sync.rs:268-277`）。理由在 `sync.rs:9-11`：**半份快照比没有快照更糟**。
+- **checkpoint 按 native session 保存**（`sync.rs:281-300`）：key 是 `externalSessionId`，它只是加速手段——丢了只是多一次全量快照，不会丢事件（`sync.rs:281-283`）。
+
+### 10.5 能力诚实：真机只读探测的实测值
+
+DSH 的四个能力布尔不是常量，而是从 `session.getCapabilities`（`client.rs:257-262`）的条目里查（`capability_flags`，`projection.rs:248-267`）：`steer ← session.steer`、`interrupt ← session.interrupt`、`selections` ← 两份 catalog 非空 且（`catalog.model` 或 `catalog.permission`）（`projection.rs:253-260`）。catalog **只**来自 `catalog.listModels` / `catalog.listPermissions`（`client.rs:241-245`），空表就报空表（`projection.rs:230-231`）——不编占位项。
+
+下表是 `crates/farwork-agent/tests/dsh_live.rs` 的**真机只读探测记录**（只跑 `initialize` + `session.list` + 两份 catalog，**不建会话**）。**本轮只改文档、没有重跑**；要复核就按 §8 的命令跑那条 `#[ignore]` 测试。
+
+| 项 | 实测值 | 我们的处理 |
+| --- | --- | --- |
+| `identity.runtimeVersion` | `0.2.1-rc.2` | 只写日志（`mod.rs:173-181`），不做版本分支 |
+| `identity.bridgeVersion` | `2.1.0-desktop…` | 同上 |
+| `identity.protocolVersion` | `1.0` | 只比 major（`handshake.rs:154-158`） |
+| `features.approval` | `true` | 审批通知照转（`projection.rs:182`） |
+| `features.userQuestions` | `true` | 问题通知照转（`projection.rs:188-195`） |
+| `features.projectionVersion` | `3` | 保留字段，事件按 v3 解读 |
+| `features.syncMode` | `events` | 唯一支持的模式（`mod.rs:183-192`） |
+| `session.steer` | `supported=false` | `steer:false` → 浏览器不显示补充指令框 |
+| `session.interrupt` | `true` | `interrupt:true` |
+| 选择（model / permission） | 两份 catalog 都非空 | `selections:true` |
+| `catalog.listModels` | **2 条** | 原样上报两条 |
+| `catalog.listPermissions` | **4 条**：`read-only` / `workspace-write` / `danger-full-access` / `Auto review` | 原样上报；`--dsh-permission` 的短名就解析到这里（`selections.rs`；`cli.rs:163-175` 只允许在 `--runtime dsh` 下用） |
+| `session.commands` | 桥报 `true`，**我们报 `false`** | 见下 |
+
+**`session.commands` 是「不假装」的样板**：真桥确实上报了 `session.commands: true`，但本仓**没有实现 `session.executeCommand`**，也没有能填满 `GET /sessions/{id}/runtime/commands` 的真实数据源，所以 `capability_flags` 把 `commands` 固定成 `false`（`projection.rs:261-264`），`session.capabilities` 帧里的 `commands` 数组恒为空（`projection.rs:268-283`）。一个「填得满、点了不执行」的命令框比一个不出现的按钮更糟：能力位只能声明我们真的能兑现的东西。桥报的 `true` 也不许透传——那等于拿桥的能力冒充本 agent 的能力。
+
+### 10.6 通知与回答：`actionId` 的闭环
+
+DSH 的通知不是「`kind` + 三个决定」，而是带 `interactionType` 和一组**运行时自己命名的按钮**。agent 侧的处理是：
+
+- **入**：批次里的 `notice.upsert` 操作 → `projection::notice`（`mod.rs:501-544`；`projection.rs:159-229`）。`options` 由桥的 actions 归一化成 `{id,label,style?}`（`projection.rs:114-157`）；`interactionType` 既进 `body` 也进 notice 顶层字段（`projection.rs:216,224`；ingress 侧 `ingress.rs:838-849`）。`responseRequired` 却**没有任何 action** 的通知直接丢弃并 warn（`projection.rs:202-207`）——发出去就是一张点不了任何按钮的卡。不是本 `sessionId` 的通知直接不转发（`projection.rs:160-162`）。
+- **回答**：hub 的 `notice.respond` 带 `actionId` 下来（`ingress.rs:472-499`），agent 先按这条 notice **记录下来的 action 列表重新校验**（`interaction.rs:95-126`），不合法就回 error 帧并把通知放回队列（`mod.rs:683-706`）；桥回 `{ok:false}`（业务失败，不是 RPC 错误）同样算失败：恢复队列、回 error（`mod.rs:711-726`），**不写「已解决」**。只有成功才发 `notice.resolved`，并在能映射到闭集时附带 `decision`（`projection.rs:284-300`；`mod.rs:726-736`）。
+- 于是 **hub 的 `422 unknown_action` 与 agent 的二次校验是两道闸**：前者防一个晚到的浏览器标签页塞进桥没给过的按钮，后者防 hub 与 agent 版本错位。
 
 ## 附录 A · M1 遗留：终端线协议
 

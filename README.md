@@ -36,11 +36,14 @@ Farwork 是 [anywhere-labs/Agents-Anywhere](https://github.com/anywhere-labs/Age
 - **运行中干预（M3，Ingress Protocol v1.3）**：会话跑到一半还能**补充指令**——`POST /api/v2/sessions/{id}/runtime/steer` 回 `202`（「已投递给设备」，执行结果由设备写进 timeline，不靠 HTTP 回答）；**模型 / 权限选择**——`GET .../runtime/catalogs/{model|permission}` 取目录、`PATCH .../runtime/selections` 提交，**只有帧真的送到设备才回 `200`**；**斜杠命令**——`GET .../runtime/commands` 取命令清单，输入框里以 `/` 开头时给出建议。能力本身来自设备上报（`session.capabilities`）：`GET .../runtime/capabilities` 的四个布尔**没上报就是全 `false`**，页面据此决定这几个控件出不出现（**有 catalog 才显示选择器**、`state=running` 且有 `steer` 才显示补充指令框，只有 `selections` 能力为真才显示模型/权限下拉）。对着真 `codex` 时如实只报 `interrupt`——协议通了不等于后端支持。
 - **文件与终端改用会话命名空间**：文件面板与终端面板现在走 `POST /api/v2/sessions/{id}/files/list|readText`、`POST /api/v2/sessions/{id}/terminal` 与 `GET /api/v2/sessions/{id}/terminal/{terminalId}/stream`——**同一个会话页不再需要先知道 device id**。这两组与 connector 级的 `/connectors/{id}/fs/*`、`/connectors/{id}/terminals*` **共用同一条中继**（没有第二套实现），差别只是「设备与工作目录由会话解析出来」；终端行绑定 `session_id`（`migrations/0005` 在既有表上加可空列，没建第二张表）。**别人的会话一律 `404`**（不是 `403`：不泄露存在性），终端取票与握手两关都校验归属。语义见 [docs/architecture.md](./docs/architecture.md) §3.5/§3.6 与 §5.13；**本仓 REST 形状不是上游的镜像**，逐条差异见 §9。
 
+- **DSH 作为第二个运行时（M3）**：`farwork-agent --runtime dsh` 连的是**你这台机器上已经在跑的 DSH**——需要先在 DSH 里**启用 agents-anywhere 桥插件**（它会写出 `~/.agents-anywhere/dsh-bridge/endpoint.json`，可用 `--dsh-endpoint` 指定别的路径）。DSH 不是 agent 拉起的子进程：桥没开就**连不上，agent 直接启动失败**（退出码 1），不会假装可用。接上以后会话照常跑：能力（steer/interrupt/selections）、审批与问题通知都来自桥的**上报值**，模型/权限下拉来自桥的两份 catalog（真机只读探测：models 2 条、permissions 4 条 `read-only`/`workspace-write`/`danger-full-access`/`Auto review`）。审批按钮用运行时自己的 id（`actionId`）回答，旧的三值 `decision` 仍兼容。语义见 [docs/architecture.md](./docs/architecture.md) §10。
+
 **还不能做**（诚实清单）：
 
 - **codex 的成功路径未验证**：assistant 文本增量、工具执行、真实审批往返都还没有跑通过，原因是本机没有 Codex 凭据。已验证的是「codex 起得来、401 如实落到 timeline」和「用 `--runtime echo` 把审批管道跑通」。
 - **`file_change` / `permissions` 两种 notice kind 未在联调中出现**：echo 后端只发 `command_execution`，codex 的这两个审批分支因无凭据从未被触发；页面上的「文件变更」「权限申请」标签只是代码就位，没有联调证据。
 - **审批卡在浏览器里的端到端流程没有留证据**：已验收的是 `pnpm run check`（0 error）/ `pnpm run build` 通过与「hub 不乐观 resolve」的代码层核对，不是「点批准 → 卡片转已解决」的实机记录。
+- **DSH 的 `session.commands` 没有兑现**：真桥会报 `session.commands: true`，但本仓**没有实现 `session.executeCommand`**，所以能力位固定报 `false`、`GET .../runtime/commands` 对 DSH 会话是空表——一个填得满、点了不执行的命令框比不出现的按钮更糟。同理：**还没有在真 DSH 上建过会话**（`createAndStart` → `batch` → `ack` → `item` → `notice` → `respondInteraction` 这条链只在脚本化的假 bridge 上验过），`userQuestions` 也没有对着真 DSH 问答验证过。
 - **仍有 37 条路径是 `501 not_implemented`**（不会伪造成功）：账号级分享清单 `/shares`、设备运行时管理 `/runtimes*` `/devices*` `/connectors/{id}/runtimes*`、OAuth / 邮件码 / 移动端扫码登录，以及 `/announcements*`、`/agents*`、`/pairing*`、`/usage*`——**管理台只交付了「用户目录 + 实例开关」**，这四组仍在表里。**会话命名空间已补齐**：`/sessions/{id}/files/list`、`/files/readText`、`/terminal`、`/terminal/{terminalId}/stream` 与 `runtime/capabilities|catalogs/{catalog}|commands|steer|selections` 都实到了；它们复用**同一套** `fsrelay`/`termrelay`，只多一层「由 session 解析出 connector + workspace」。文件浏览**只有只读**的 list/readText：写操作、大文件/二进制流式仍未实现；终端**只有交互式 PTY**：没有 scrollback 持久化、没有接管别人已开的终端，`farwork-server`（M1 探针）也还没退场。
 
 当前端点数：`/api/v2` 下 **59 个已实现的 method+path**（**49 条** `route()` 注册，含文件浏览、设备终端、设备/会话两种终端、会话运行时控制 4 条、分享三条与管理台 3 次注册，也含 §5 单独记录的 `GET /connector/ws`）+ `GET /healthz`；另有 **37 条路径**在 `routes/unsupported.rs` 里统一回 `501`（分享把 `/sessions/{id}/shares` 与 `/sessions/{id}/shares/{*rest}` 两条从表里移走了 49 → 47，管理台再把 `/admin` 与 `/admin/{*rest}` 两条移走 47 → 45，会话命名空间的 8 条 —— `/sessions/{id}/terminal`、`/terminal/{*rest}`、`/files`、`/files/{*rest}` 与 `runtime/{steer,commands,selections,catalogs/{catalog}}` —— 再减到 37）。逐条清单见 [docs/architecture.md](./docs/architecture.md) §3。
@@ -69,7 +72,7 @@ Farwork 是 [anywhere-labs/Agents-Anywhere](https://github.com/anywhere-labs/Age
                                               [ codex app-server（stdio JSON-RPC） ]
 ```
 
-- `farwork-hub`：`/api/v2` 服务端。REST + 4 个 WS 端点（dashboard / session / **connector ingress** / **设备终端流**）+ `POST /ws-ticket`，PostgreSQL 持久化，启动时自动跑迁移（5 个迁移、12 张表；`0005` 只给 `terminals` 加一列）。
+- `farwork-hub`：`/api/v2` 服务端。REST + 4 个 WS 端点（dashboard / session / **connector ingress** / **设备终端流**）+ `POST /ws-ticket`，PostgreSQL 持久化，启动时自动跑迁移（6 个迁移、12 张表、16 个索引；`0005` 只给 `terminals` 加一列、`0006` 只给 `session_notices` 加一列，都不建表、不加索引）。
 - `farwork-agent`：M3 的设备侧常驻进程。主动出站连 hub，按 `session.start` 拉起 `codex app-server --stdio`，把 JSON-RPC 翻成 ingress 帧；身份落盘 `~/.farwork/agent.json`（0600）。
 - `farwork-timeline`：timeline 的**纯域逻辑**（排序、`seq:N` 事件游标与补拉、`content_hash` 去重、每会话写栅栏），无 IO、无时钟、可用内存后端单测。hub 只负责持久化与传输。
 - `farwork-server` / `farwork-connector` / `farwork-protocol`：**M1 遗留**，保留为终端探针，尚未与 hub 打通。
