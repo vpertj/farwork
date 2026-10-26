@@ -34,6 +34,8 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
+    "prepare": "node scripts/build.mjs",
+    "prepack": "node scripts/build.mjs",
     "test": "node scripts/build.mjs && node --test dist/__tests__/*.test.js",
     "self-test": "node scripts/build.mjs && node scripts/selftest-bridge.mjs",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""

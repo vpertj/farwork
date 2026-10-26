@@ -230,3 +230,46 @@ dependency of this package).
 
 No test and no self test touches `~/.dsh`, `~/.farwork`, port 62082 or a running
 DSH: the endpoint directory is always a fresh `mkdtemp`.
+
+## Install
+
+DSH installs plugins by running pnpm inside a profile directory, so the three supported
+forms differ only in what that specifier resolves to. All of them need DSH restarted
+afterwards, and all of them write the rendezvous under `~/.farwork/dsh-bridge/`.
+
+### 1. Link from a checkout (what development uses)
+
+```bash
+node packages/dsh-plugin/scripts/build.mjs
+dsh plugin --profile desktop add "link:$PWD/packages/dsh-plugin"
+# then add @farwork/dsh-bridge to dsh.profile.bundles in
+# ~/.dsh/profiles/desktop/package.json, and restart DSH
+```
+
+`link:` needs `dist/` to already exist, because nothing runs a build for a symlinked
+package.
+
+### 2. Tarball from a release (recommended for anyone else)
+
+```bash
+dsh plugin --profile desktop add "https://github.com/vpertj/farwork/releases/download/<tag>/farwork-dsh-bridge-0.1.0.tgz"
+```
+
+`prepack` runs the build, so the artefact always carries `dist/` — a tarball without it
+would install "successfully" and then fail to provide the host half, which looks like a
+broken panel rather than a broken package.
+
+### 3. Straight from git
+
+```bash
+dsh plugin --profile desktop add "git+https://github.com/vpertj/farwork.git#path:/packages/dsh-plugin"
+```
+
+The repository root has no `package.json`, so the bare `github:vpertj/farwork` shorthand
+cannot work — the monorepo package lives in `packages/dsh-plugin`. This form relies on
+`prepare` running the build after the checkout; DSH runs pnpm non-interactively, so it may
+also require approving that build script in the profile's `pnpm-workspace.yaml`
+(`allowBuilds`). Method 2 avoids both questions.
+
+Downloading anything from GitHub requires the network to reach it. On an air-gapped
+machine, mirror the tarball and install it from the local path instead.
