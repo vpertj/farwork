@@ -89,11 +89,22 @@ async fn run() -> Result<()> {
     // The DSH bridge is located once, at startup. Starting as `--runtime dsh`
     // without one is a configuration error the operator must see before the
     // connector goes online: a session would otherwise be accepted and have
-    // nothing to drive.
+    // nothing to drive. Which candidate answered is part of that record: with
+    // two bridges installable side by side, an operator who installed ours must
+    // be able to see that ours — not the upstream one — is the endpoint in use.
+    let mut dsh_endpoint_source = "none";
     let (dsh_endpoint, dsh_selections, dsh_agent_preset) = match cli.runtime {
         RuntimeKind::Dsh => {
-            let endpoint = dsh::discovery::resolve(cli.dsh_endpoint.as_deref(), &env_lookup)
+            let located = dsh::discovery::resolve(cli.dsh_endpoint.as_deref(), &env_lookup)
                 .map_err(|error| anyhow!("{error}"))?;
+            dsh_endpoint_source = located.source.tag();
+            tracing::info!(
+                dsh_endpoint_source = dsh_endpoint_source,
+                dsh_endpoint_file = %located.path.display(),
+                address = %located.endpoint.address(),
+                "dsh bridge endpoint resolved"
+            );
+            let endpoint = located.endpoint;
             // A short name is resolved against the bridge right here: an unknown
             // or ambiguous permission must refuse to start, never quietly fall
             // back to DSH's default.
@@ -149,6 +160,7 @@ async fn run() -> Result<()> {
         runtime = cli.runtime.as_str(),
         workdir = %workdir.display(),
         dsh_endpoint = ?dsh_endpoint.as_ref().map(|endpoint| endpoint.address()),
+        dsh_endpoint_source = dsh_endpoint_source,
         dsh_selections = ?dsh_selections,
         dsh_agent_preset = ?dsh_agent_preset,
         "configured"

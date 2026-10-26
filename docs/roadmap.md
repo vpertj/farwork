@@ -1,6 +1,6 @@
 # Farwork 路线图
 
-**当前**：M2 纵向切片已交付；**M3 全部计划项已交付** —— connector ingress + `farwork-agent` + 审批/中断、文件浏览、设备终端、分享、管理台，以及本轮的**运行中干预（Ingress Protocol v1.3：`session.capabilities` / `session.steer` / `session.selections`）与会话命名空间（`/sessions/{id}/files*`、`/terminal*`、`runtime/{capabilities,catalogs/{catalog},commands,steer,selections}`）** 都已落地并验收（各条的验收证据见 M3 的「已验证」）。**roadmap 上计划的功能块到此全部交付**；剩下的不是新功能，而是 `codex` 成功路径（阻塞于本机无凭据）与 **37 条** `501` 的广度补齐。技术栈既定：Rust（hub / connector）+ Svelte（web），数据库 PostgreSQL，移动 App 用 Capacitor 包装静态 Web 产物并后置到 M4。
+**当前**：M2 纵向切片已交付；**M3 全部计划项已交付** —— connector ingress + `farwork-agent` + 审批/中断、文件浏览、设备终端、分享、管理台、**运行中干预（Ingress Protocol v1.3：`session.capabilities` / `session.steer` / `session.selections`）与会话命名空间（`/sessions/{id}/files*`、`/terminal*`、`runtime/{capabilities,catalogs/{catalog},commands,steer,selections}`）**、以及**配对码（`/pairing/*` + `farwork-agent pair`）与 `GET /meta`** 都已落地并验收（各条的验收证据见 M3 的「已验证」）。另有自研 DSH 桥插件 `packages/dsh-plugin`（`@farwork/dsh-bridge`），把 DSH 那一侧的上游插件与 Python connector 一起去掉。**roadmap 上计划的功能块到此全部交付**；剩下的不是新功能，而是 `codex` 成功路径（阻塞于本机无凭据）与 **35 条** `501` 的广度补齐。技术栈既定：Rust（hub / connector）+ Svelte（web），数据库 PostgreSQL，移动 App 用 Capacitor 包装静态 Web 产物并后置到 M4。
 
 里程碑状态一览：
 
@@ -8,7 +8,7 @@
 | --- | --- |
 | M1 可行走骨架 | **已被 M2 取代**，代码保留为终端探针（`farwork-server` / `farwork-connector` / `farwork-protocol`） |
 | M2 `/api/v2` 纵向切片 | **已交付**（2026-10-26，commit `2079149`） |
-| M3 ingress / 审批 / 文件 / 终端 / 分享 / 管理台 / 运行中干预 / 会话命名空间 | **已交付**：ingress、`farwork-agent`、审批与中断（后端 + 协议）已实测；Web 审批卡与新建会话表单已交付；文件浏览（只读）、设备终端、分享、管理台、运行中干预与会话命名空间全部交付并逐条验收（11/11、11/11、9/9、12/12、14/14） |
+| M3 ingress / 审批 / 文件 / 终端 / 分享 / 管理台 / 运行中干预 / 会话命名空间 / 配对码 / `meta` / DSH 桥插件 | **已交付**：ingress、`farwork-agent`、审批与中断（后端 + 协议）已实测；Web 审批卡与新建会话表单已交付；文件浏览（只读）、设备终端、分享、管理台、运行中干预与会话命名空间全部交付并逐条验收（11/11、11/11、9/9、12/12、14/14）；配对码（hub 三条 REST + agent `pair` 子命令）、`GET /meta` 与自研 DSH 桥插件 `packages/dsh-plugin` 随后补齐 |
 | M4 Capacitor Android App（其后 iOS） | 规划中 |
 
 ## M1 · 可行走骨架（已被 M2 取代，保留为终端探针）
@@ -38,7 +38,7 @@ M1 的契约细节保留在 `docs/architecture.md` 附录 A（标注为遗留）
 - **timeline**：`GET /sessions/{id}/snapshot` 建投影；`seq:N` 事件游标补拉；条目按 `order_seq` 排序渲染。语义由新 crate `farwork-timeline`（纯域逻辑）承担，hub 只做持久化与传输。
 - **发消息**：`POST /sessions/{id}/runtime/messages` 持久化到 `timeline_items`，`clientMessageId` 由唯一索引保证幂等。
 - **WS 增量**：`POST /ws-ticket` 换一次性票据 → `/sessions/{id}/ws` 事件流 / `/dashboard/ws` 总览；`snapshotRequired` 时客户端整块重拉。
-- **诚实兜底**：52 条未实现路径统一 `501 not_implemented`，未注册路径 `404`；`GET /connectors` 的 `status` 当时恒为 `offline`（没有 ingress 就没有在线值）——这条已被 M3 取代：`status` 有真实 `online`/`offline`；`501` 表现在是 **37 条**（M3 移出 3 条 → 49，分享再移出 2 条 → 47，管理台再移出 `/admin` 与 `/admin/{*rest}` 两条 → 45，会话命名空间与运行时控制再移出 8 条 → 37）。
+- **诚实兜底**：52 条未实现路径统一 `501 not_implemented`，未注册路径 `404`；`GET /connectors` 的 `status` 当时恒为 `offline`（没有 ingress 就没有在线值）——这条已被 M3 取代：`status` 有真实 `online`/`offline`；`501` 表现在是 **35 条**（M3 移出 3 条 → 49，分享再移出 2 条 → 47，管理台再移出 `/admin` 与 `/admin/{*rest}` 两条 → 45，会话命名空间与运行时控制再移出 8 条 → 37，配对码再移出 `/pairing` 与 `/pairing/{*rest}` 两条 → 35）。
 - **CI 硬化**：`rust` job 挂 `postgres:18-alpine` service 并注入 `TEST_DATABASE_URL`，让 hub 集成测试从「静默 SKIP」变成真跑。
 
 ### 已验收
@@ -50,7 +50,7 @@ M1 的契约细节保留在 `docs/architecture.md` 附录 A（标注为遗留）
 
 ### 明确未含（当时都是 `501`）
 
-connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终端 · 分享 · 管理台（admin / agents / usage / announcements / pairing）。其中 connector ingress、审批/中断、文件浏览与设备终端已由 M3 交付（见下），分享也已交付，管理台交付的是**用户目录 + 实例开关**这一块；同条列里的 `/agents*`、`/usage*`、`/announcements*`、`/pairing*` 四组没有随这一批交付，仍回 `501`。
+connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终端 · 分享 · 管理台（admin / agents / usage / announcements / pairing）。其中 connector ingress、审批/中断、文件浏览与设备终端已由 M3 交付（见下），分享也已交付，管理台交付的是**用户目录 + 实例开关**这一块；同条列里的 `/agents*`、`/usage*`、`/announcements*`、`/pairing*` 四组没有随这一批交付，仍回 `501`（其中 `/pairing*` 后来单独交付，见 M3「已交付」的配对码一条）。
 
 ## M3 · connector ingress + agent（**计划项已全部交付**）
 
@@ -69,8 +69,13 @@ connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终�
 - **运行中干预（Ingress Protocol v1.3）**：新增三帧 `session.capabilities`（上行）/ `session.steer`、`session.selections`（下行）；hub 侧 `crates/farwork-hub/src/ingress.rs:376-404,520-532` + 进程内缓存 `crates/farwork-hub/src/runtime_caps.rs` + 分发 `crates/farwork-hub/src/routes/connector_ws.rs:415-439`（清缓存在 `:379-388,196-207`），agent 侧 `crates/farwork-agent/src/protocol.rs:242-257,331-338,441-466` + 分发 `hub.rs:357-391`，两个后端的真实上报 `echo.rs:25-68`（四项全 true + 占位 catalog）与 `codex/mod.rs:20-38`（只有 interrupt）。REST 五条：`GET .../runtime/capabilities`、`GET .../runtime/catalogs/{catalog}`（未知 422）、`GET .../runtime/commands`、`POST .../runtime/steer`（202）、`PATCH .../runtime/selections`（转发成功才 200），入口 `crates/farwork-hub/src/routes/runtime.rs` + `sessions.rs:937-951`。Web 侧：会话页的补充指令框（`state=running` 且有 `steer` 能力时才出现）、模型/权限选择（有 catalog 时才显示）、斜杠命令建议（`apps/web/src/lib/commands.ts`）。契约见 `docs/architecture.md` §3.10 与 §5.13。
 - **会话命名空间**：`POST /sessions/{id}/files/list|readText`、`POST /sessions/{id}/terminal`、`GET /sessions/{id}/terminal/{terminalId}/stream` —— **与 connector 级共用同一条 `fsrelay`/`termrelay`**（没有第二套中继），只多一层「由 session 解析出 connector + workspace」；终端行绑定 `session_id`（`migrations/0005_session_terminal_scope.sql:10-11` 在既有 `terminals` 表上加可空列，没建第二张表）；别人的会话一律 `404`。Web 侧文件面板与终端面板已切到会话命名空间（`apps/web/src/lib/api/workspace.ts:154,170,204,232`）。语义见 `docs/architecture.md` §3.5/§3.6。
 - **DSH 作为第二个 runtime（`--runtime dsh`）**：agent 现在既能拉起 `codex app-server`（子进程），也能**连一个本机已在运行的 DSH bridge**（loopback TCP 上的换行分隔 JSON-RPC 2.0）。入口 `crates/farwork-agent/src/dsh/`（九个模块：`discovery.rs` 端点发现、`rpc.rs` 分帧与 id、`handshake.rs` 握手与能力位、`client.rs` 方法封装、`sync.rs` 批次/快照/checkpoint、`projection.rs` 帧投影、`interaction.rs` 待答队列、`selections.rs` 目录短名解析、`mod.rs` 主循环），CLI 四个开关 `--runtime dsh` / `--dsh-endpoint` / `--dsh-permission` / `--dsh-model`（`cli.rs:18-56,112-117`）。端点只认 `~/.agents-anywhere/dsh-bridge/endpoint.json`（回退 `$DSH_HOME/agents-anywhere/bridge/endpoint.json`）且必须 `version==1 / host==127.0.0.1 / port / token` 全部合法，缺端点 = **启动失败**（`discovery.rs:137-183`；`main.rs:73-80`）。**已用真机只读探测验证**：`initialize` 通过、`identity.runtime=="dsh"`、`protocolVersion 1.0`、`features.approval/userQuestions=true`、`projectionVersion=3`、`syncMode=events`、`catalog.listModels` 2 条、`listPermissions` 4 条（`read-only` / `workspace-write` / `danger-full-access` / `Auto review`）；桥报 `session.steer supported=false`、`session.interrupt=true`。探测本身是 `crates/farwork-agent/tests/dsh_live.rs`（`#[ignore]`，`cargo test -p farwork-agent --test dsh_live -- --ignored --nocapture`）。契约见 `docs/architecture.md` §10。
+- **配对码（设备不必再手抄 token）**：hub 三条 REST —— `POST /pairing/start`（**需登录**，`201` 回 8 位码 `XXXX-XXXX`，字母表是 Crockford 去掉 I/L/O/U/0/1）、`POST /pairing/claim`（**免鉴权**，码就是凭证，`200` 回 `connector` + `connectorToken`）、`GET /pairing/{id}`（需登录，浏览器轮询状态）——入口 `crates/farwork-hub/src/routes/pairing.rs` + 纯逻辑 `crates/farwork-hub/src/pairing.rs` + 迁移 `0007_pairings.sql`。规则：只存 `sha256("farwork-pairing-v1:{FARWORK_HUB_SECRET}:{规范化码}")`、一次性（同码二次 `409 code_already_claimed`，靠 `update … where claimed_at is null` 抢）、TTL 默认 600s（60..=3600）、按来源地址每分钟 10 次（`429`）、错码 `404`、过期 `410`、`GET {id}` 对未知或别人的 id 回 `status:"unknown"` 而不是 `404`。agent 侧 `farwork-agent pair --hub <url> --code <code>`：`--hub` 接受 `http(s)://` 与 `ws(s)://`（也接受已带 `/api/v2/connector/ws` 的形式），成功后 `agent.json` 多出 `hub`/`connectorId`/`connectorToken` 三键（文件 0600、目录 0700），**之后裸 `farwork-agent` 直接复用**；claim 的 404/409/410/429/不可达/裸 404（旧 hub 没有 pairing API）各给一句可操作文案。`501` 表由 37 → 35。契约见 `docs/architecture.md` §3.12。
+- **`GET /meta`（hub 自报基地址，免鉴权）**：回 `{hubUrl, version, serverTime, scheme, port}`；优先级是 `FARWORK_HUB_PUBLIC_URL` → `X-Forwarded-Proto` 首值（**只定 scheme**）+ `Host` 的主机名（**去端口**）+ **hub 自己的监听端口**。为什么要有它：dev（5173 代理到 7300）与反代下页面 origin 不是 hub 地址，用 `location.origin` 拼出来的 `--hub` 会被原样写进 `agent.json`，之后 agent 再也连不上，而唯一症状是「设备离线」（真实事故）。`FARWORK_HUB_PUBLIC_URL` 非法会让 hub **启动失败**——这个串会被逐字复制进每条配对命令。入口 `crates/farwork-hub/src/routes/meta.rs` + `crates/farwork-hub/src/config.rs`。契约见 `docs/architecture.md` §3.13。
+- **自研 DSH 桥插件 `packages/dsh-plugin`（`@farwork/dsh-bridge`）**：DSH 那一侧的桥改成自己实现的一个 DSH host plugin（TypeScript/Cordis），**去掉对上游插件与其 Python connector 的依赖**——实测桥的工作 100% 在 TS 插件内，上游那个 Python connector 只是另一个客户端。`endpoint.json` 与 manager lock 一起换到 `~/.farwork/dsh-bridge/`（锁按目录取，所以与上游的 `~/.agents-anywhere/dsh-bridge/` 并存而不互相踢下线）。v1 实现 `initialize`/`ping`/`session.{list,getState,getSnapshot,createAndStart,startTurn,interrupt,getCapabilities}`/`runtime.getCapabilities`/`runtime.sync.{subscribe,ack}`，其余一律 `-32601`；**v1 不实现审批/问答**（要反射 `typertGateway`、无先例、没有 fail-soft 版本），降级方式是审批与提问都在 DSH 自己的 Web UI 里回答。agent 的端点发现顺序是 `--dsh-endpoint` → `~/.farwork/dsh-bridge/endpoint.json`（自研，排第一）→ 上游两条（`dsh/discovery.rs:173-191`），启动日志带 `dsh_endpoint_source` 说明用的是哪一个。见 `docs/architecture.md` §11。
+- **DSH checkpoint 改为落盘（纠正旧表述）**：`docs/architecture.md` §10.4 与 `AGENTS.md` §4.9 原先写「checkpoint 按 native session 保存（内存）」，实际是 `$FARWORK_HOME/dsh/sync/checkpoints/<externalSessionId>.json`（目录 0700、文件 0600、临时文件 + `rename` 原子替换、坏文件当没有、peer 给的 id 做路径穿越校验）；答复通道是 `runtime.sync.ack` 的 `checkpoint` 字段（实测桥从不反向发请求，`inbound_requests=0`）；`runtime.sync.subscribe` 的参数现已含 `subscriptionId` + `checkpointVersion:1` + `uploadProgressVersion:1`。现象层面：**冷启动首连仍可能因桥内 10000 事件队列溢出而失败**，有 checkpoint 时最多重订阅 3 次续传，没有 checkpoint 则一次性失败并建议归档旧会话。代码 `crates/farwork-agent/src/dsh/{sync.rs,client.rs,mod.rs}`。
+
 - **notice action 契约扩展（迁移 `0006_notice_interaction_type.sql`）**：`notice.options` 的规范形态变成 `[{id,label,style?}]`，旧的字符串数组**仍收**并归一化成对象（默认中文 label 见 `ingress.rs:824-836`）；新增可空列 `session_notices.interaction_type`（不建表、不加索引）；`notice.respond` 与 `notice.resolved` 都可带 `actionId`，未知 actionId → `422 unknown_action`、空 body → `422 empty_answer`、`actionId` 与 `decision` 同时给出但不一致 → `422 ambiguous_answer`，`inputData` 是 `input` 的别名（`notices.rs:342-470`）。`501` 表**本轮没有增删**，仍是 37 条。契约见 `docs/architecture.md` §3.7。
-- **诚实兜底更窄了**：`501` 表从 52 条减到 49 条（移出 interrupt / notices / notices respond 三条），分享交付后再减 2 条（`/sessions/{id}/shares`、`/sessions/{id}/shares/{*rest}`）→ 管理台再移出 2 条（`/admin`、`/admin/{*rest}`）→ 45；本轮会话命名空间与运行时控制再移出 8 条 → **37 条**。REST 与 ingress 两侧仍然「宁可变窄，不伪造成功」。
+- **诚实兜底更窄了**：`501` 表从 52 条减到 49 条（移出 interrupt / notices / notices respond 三条），分享交付后再减 2 条（`/sessions/{id}/shares`、`/sessions/{id}/shares/{*rest}`）→ 管理台再移出 2 条（`/admin`、`/admin/{*rest}`）→ 45；本轮会话命名空间与运行时控制再移出 8 条 → **37 条**；配对码再移出 `/pairing` 与 `/pairing/{*rest}` 两条 → **35 条**。REST 与 ingress 两侧仍然「宁可变窄，不伪造成功」。
 - **Web 审批卡**（`apps/web/src/components/ApprovalCard.svelte`）：三个决定按钮 `approve` / `approve_for_session` / `reject`（`:75-93`）；点击后状态先落在「已下发，等待运行时确认」（`:24-35,101`），卡片变灰**只**取决于服务端 `notice.status === 'resolved'`（`:22,25`）；投递失败可点「重试」（`:96-97`）。
 - **Web 新建会话表单**（`apps/web/src/components/NewSessionPage.svelte`，路由 `#/new-session[/:projectId]`，`apps/web/src/lib/router.ts:26-53`）：一次填 connector + 项目 + runtime + 首条消息；`connectorResult.ok` 为真则跳进会话页（`NewSessionPage.svelte:93`），为假则如实显示「设备未连接：指令未下发」（`:105,213`）+ 返回码（`:222`）+ 已创建会话 id（`:218`）。
 - **Web 中断与状态原因**（`apps/web/src/components/SessionView.svelte`）：中断按钮不本地改状态，只显示「中断指令已下发（stream …），等待运行时回推状态更新」（`:116-119,135-137`）；会话 `statusReason` 单独一行「状态原因：…」（`:129-130`，例如 `connector disconnected`）。
@@ -116,6 +121,8 @@ connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终�
    13. **陌生人 3 条全 `404`**：对别人的会话调 `files/list`、`terminal`、`runtime/steer` 一律 `404 session not found`（不是 `403`：不泄露存在性；`fs.rs:139-140`、`terminals.rs:114`、`sessions.rs:168-179`）。
    14. **断连后 steer 409**：杀掉 agent 后 `POST .../runtime/steer` 回 `409`（`session_not_running` / `connector_offline`），并且缓存被清——此时 `GET .../runtime/capabilities` 回到全 `false`（`connector_ws.rs:196-207`）。
 
+10. **配对码与 `/meta` 的自动化测试已就位（本轮未重跑）**：`crates/farwork-hub/tests/pairing.rs`（真 PostgreSQL，8 个测试：`start` 需登录且校验 TTL、免鉴权 claim 在 owner 账号里建设备、同码二次 `409`、过期 `410`、未知/畸形码 `404`、按来源限流 `429`、状态流转、明文码与 token 都不落库——`pairing.rs:282-687`）；`crates/farwork-hub/tests/meta.rs`（**不碰数据库**，4 个测试：无凭证可读 + 回 public url、监听端口优先于 `Host` 里的端口、只取 `X-Forwarded-Proto` 的 scheme、public url 的端口与路径保留——`meta.rs:50-119`）；agent 侧 `crates/farwork-agent/tests/pair_smoke.rs` 用真二进制对着桩 hub 跑 `pair`，断言 `agent.json` 的三键与权限、claim body，以及**裸重启复用凭证**（`pair_smoke.rs:22-27`）。**本轮只改文档，没有重跑这些命令。**
+
 ### 未验证（别当成已支持）
 
 - **codex 成功路径**：assistant 文本增量、工具执行、真实审批往返（codex 自己发起 `item/commandExecution/requestApproval`、用户批准、工具真的执行）。
@@ -135,7 +142,7 @@ connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终�
 
 顺序的理由：后面每一项都依赖 ingress 提供的真实连接，先做 UI 只会做出假状态。
 
-原「1. Web 审批卡」「2. 新建会话表单」已交付（见上文「已交付」与「已验证」第 3 条）；其中原定验收项——用 `--runtime echo` 点批准直到卡片转已解决——**仍未留证据**，属于下一批要补的验证，不是要重做功能。文件浏览、设备终端、分享与管理台都已交付并划掉（见下），**roadmap 上计划的功能块已全部交付**——剩下的只有 codex 成功路径（阻塞于本机无凭据）与 37 条 `501` 的广度补齐，见本节末尾。**未验证项不因划掉一项而消失**：codex 成功路径、`file_change` / `permissions` 两种 notice kind、审批卡在浏览器里的端到端证据，仍留在上面的「未验证」清单里。
+原「1. Web 审批卡」「2. 新建会话表单」已交付（见上文「已交付」与「已验证」第 3 条）；其中原定验收项——用 `--runtime echo` 点批准直到卡片转已解决——**仍未留证据**，属于下一批要补的验证，不是要重做功能。文件浏览、设备终端、分享与管理台都已交付并划掉（见下），**roadmap 上计划的功能块已全部交付**——剩下的只有 codex 成功路径（阻塞于本机无凭据）与 35 条 `501` 的广度补齐，见本节末尾。**未验证项不因划掉一项而消失**：codex 成功路径、`file_change` / `permissions` 两种 notice kind、审批卡在浏览器里的端到端证据，仍留在上面的「未验证」清单里。
 
 ### ~~1. 文件浏览~~ —— **已交付**（只读，见上文「已交付」与「已验证」第 4 条）
 
@@ -161,15 +168,15 @@ connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终�
 
 交付的是**实例管理**这一块：`GET`/`POST /admin/users`、`PATCH /admin/users/{id}`、`GET`/`PATCH /admin/settings`（`crates/farwork-hub/src/routes/admin.rs`）+ Web 管理页（`apps/web/src/components/AdminPage.svelte`）。与计划的差距，别当成已支持：
 
-- 原计划同一条还列了 `/agents*`、`/usage*`、`/announcements*`、`/pairing*` 四组——它们**没有**随这一批交付，仍回 `501`。管理台今天只有「用户目录 + 实例开关」。
+- 原计划同一条还列了 `/agents*`、`/usage*`、`/announcements*`、`/pairing*` 四组——管理台这一批**没有**交付它们；其中 `/pairing*` 后来由配对码那一批拿走（见上文「已交付」），`/agents*`、`/usage*`、`/announcements*` 三组仍回 `501`。管理台今天只有「用户目录 + 实例开关」。
 - **没有审计日志**：谁改了谁、谁被停用，都不落盘（只有被改行自己的 `updated_at` 变一下）。
 - **没有删除用户**（`routes/admin.rs` 只有 get/post/patch 三个方法）；角色是 `admin`/`member` 两档闭集，没有更细的权限模型；`users.avatar` 连读都不读（不在七键投影里），`emailVerified` 只读且今天恒为 `false`（没有邮件通道，`/auth/email-code` 仍 `501`）。
 
-### 下一批（不是新功能：codex 成功路径 + 剩余 37 条 `501` + M4）
+### 下一批（不是新功能：codex 成功路径 + 剩余 35 条 `501` + M4）
 
 **1. codex 成功路径**：assistant 文本增量、工具执行、真实审批往返——阻塞于本机没有 Codex 凭据（见「未验证」）。这一条比 501 更值钱：它决定「agent 能不能真干活」。
 
-**2. 剩余 37 条 `501` 的分组清单**（逐条见 `docs/architecture.md` §4；每收一组都要同步改 §3/§4 与 README 的计数，现在 `/api/v2` 是 **59** 个已实现的 method+path / **37** 条 `501`）：
+**2. 剩余 35 条 `501` 的分组清单**（逐条见 `docs/architecture.md` §4；每收一组都要同步改 §3/§4 与 README 的计数，现在 `/api/v2` 是 **63** 个已实现的 method+path / **35** 条 `501`）：
 
 | 分组 | 条数 | 路径 | 备注 |
 | --- | --- | --- | --- |
@@ -178,7 +185,7 @@ connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终�
 | 批量会话维护 | 3 | `/sessions/archive`、`/sessions/unarchive`、`/sessions/read` | 与 `PATCH /sessions/{id}/meta` 的 `archived` 同语义，只是批量 |
 | 设备运行时管理 | 8 | `/connectors/{id}/runtimes`、`/connectors/{id}/runtimes/{*rest}`、`/connectors/{id}/protocol/capabilities`、`/connectors/{id}/pairing`、`/runtimes`、`/runtimes/{*rest}`、`/devices`、`/devices/{*rest}` | 「编排 + 多设备配对」这一层；`/devices*` 是 M1 名词，**不要**照 M1 的写法回填（§附录 A） |
 | OAuth / 邮件码 / 移动端扫码登录 | 14 | `/auth/oauth/{start,callback,finalize}`、`/auth/mobile-login/{qr,exchange,refresh,request,status,confirm}`、`/auth/email-code`、`/auth/change-password`、`/auth/me/{email,profile,avatar}` | 都需要外部通道（IdP、邮件、扫码），本 build 一条都没有；`/auth/email-code` 是把 `emailVerificationRequired` 变成「真开关」的前置 |
-| 公告 / agents / usage / 配对 | 8 | `/announcements`、`/announcements/{*rest}`、`/agents`、`/agents/{*rest}`、`/pairing`、`/pairing/{*rest}`、`/usage`、`/usage/{*rest}` | 实例管理（`/admin*`）已实现，这四组是**另外四块**：公告、agent 目录、用量统计、配对码 |
+| 公告 / agents / usage | 6 | `/announcements`、`/announcements/{*rest}`、`/agents`、`/agents/{*rest}`、`/usage`、`/usage/{*rest}` | 实例管理（`/admin*`）与配对码（`/pairing*`）都已实现，这剩的是**另外三块**：公告、agent 目录、用量统计。`/connectors/{id}/pairing` 不在这三块里，它在「设备运行时管理」那组 |
 
 **3. M4**：Capacitor Android App（其后 iOS），见下一节。它与上面两条不冲突，但优先级最低：**没有 codex 成功路径，App 装出来也只是把失败路径搬进手机**。
 

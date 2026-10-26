@@ -57,18 +57,19 @@
 | `FARWORK_HUB_PORT` / `PORT` | `7300` | 监听端口，`FARWORK_HUB_PORT` 优先，其次 `PORT`；`--port <n>` 覆盖两者 | `config.rs:7,28-33`；`main.rs:32-34` |
 | `FARWORK_HUB_SECRET` | `agent-server-dev-secret` | **未设置时打印 warn**（`FARWORK_HUB_SECRET is not set; falling back to the development secret`）并回退到开发密钥 | `config.rs:9,34-37` |
 | `FARWORK_HUB_SETUP_TOKEN` | 未设置 | 首个 admin 注册令牌。未设置时按需生成随机值并 `warn!` 打到日志（30 分钟 TTL，过期轮换），从不出现在 HTTP 响应里 | `config.rs:10,38-40`；`state.rs:55-100` |
-| `FARWORK_HUB_DB_POOL` | `10` | sqlx 连接池上限；非法值静默回退 | `config.rs:41-44` |
+| `FARWORK_HUB_DB_POOL` | `10` | sqlx 连接池上限；非法值静默回退 | `config.rs:46-49` |
+| `FARWORK_HUB_PUBLIC_URL` | 未设置 | hub 对外自报的基地址（`GET /meta` 的 `hubUrl`），规范化为 `scheme://authority`、去尾斜杠；**优先级最高**——设了它，`/meta` 不再看 `Host`/`X-Forwarded-Proto`。**非法值让 hub 启动失败**（不是回退默认），因为这个串会被逐字复制进每条配对命令 | `config.rs:22-26,50-54,76-93`；`routes/meta.rs:63-73` |
 | `TEST_DATABASE_URL` | 未设置 | **仅测试**：`tests/e2e.rs` 的目标库。缺失时打印 SKIP 并直接返回（见 §8） | `tests/e2e.rs:125-138` |
 | `PUBLIC_FARWORK_API` | 空 | 仅 web 构建期：API base。留空 = 同源（dev 走 Vite 代理） | `apps/web/.env.example`；`src/lib/api/client.ts:3` |
 | `FARWORK_HUB_DEV_RUNTIMES` | 空 | **dev-only，默认关闭**：逗号分隔的额外 runtime 名，追加到 hub 的允许集合（默认集合是协议规定的 `codex/claude/opencode/acp/dsh`，**不含 `echo`**）。非空时启动打一条 WARN：`dev-only runtimes enabled: <列表> (never set FARWORK_HUB_DEV_RUNTIMES in production)`；不设置时行为完全不变 | `routes/sessions.rs:62,84-120`；`main.rs:36` |
 | `FARWORK_CONNECTOR_TOKEN` | 未设置 | **仅 agent**：`--token` 的等价环境变量（`--token` 优先）。两者都没有时 agent 退出码 1，报 `no connector token` | `farwork-agent/src/cli.rs:8,127-134`；`main.rs:43-45` |
 | `FARWORK_CODEX_BIN` | `codex` | **仅 agent**：codex 可执行文件路径（`--codex-bin` 覆盖）。agent 以 `app-server --stdio` 拉起它 | `cli.rs:9,135-143`；`hub.rs:375` |
-| `FARWORK_HOME` | `~/.farwork` | **仅 agent**：身份文件目录；文件是 `$FARWORK_HOME/agent.json`，未设置时 `~/.farwork/agent.json` | `identity.rs:37-47` |
+| `FARWORK_HOME` | `~/.farwork` | **仅 agent**：状态根。身份+凭证在 `$FARWORK_HOME/agent.json`（未设置时 `~/.farwork/agent.json`），DSH checkpoint 在 `$FARWORK_HOME/dsh/sync/checkpoints/`（§10.4） | `identity.rs:22-36,71-89`；`dsh/sync.rs:304-311` |
 | `DSH_HOME` | 未设置时回退 `$HOME/.dsh` | **仅 agent 的 `--runtime dsh`**：bridge 端点的**回退**查找根，读 `$DSH_HOME/agents-anywhere/bridge/endpoint.json`。主路径是 `$HOME/.agents-anywhere/dsh-bridge/endpoint.json`，两者都被 `--dsh-endpoint <path>` 覆盖（§10.1） | `dsh/discovery.rs:15-22,90-108` |
 
 ## 3. `/api/v2` 端点（已实现）
 
-`/api/v2` 下共 **59 个已实现的 method+path 组合**（**含** §5 单独记录的 `GET /connector/ws`；只数 §3 这几节是 58），由 **49 次** `.route(...)` 注册（admin 3 + auth 5 + connectors 5 + fs 4 + notices 3 + projects 3 + runtime 4 + sessions 11 + shares 3 + connector_ws 1 + terminals 4 + ws 3 = 49；`routes/mod.rs:22-40` 合并 13 个带 router 的模块、14 次 `.merge`——`extract` 只是提取器工具模块（没有 router），`shares` 贡献两个 router：认证面与公开面；其中 `unsupported` 子 router 用宏注册 **37 条** `501` 路径，见 §4）。另有 `GET /healthz` 挂在根（`lib.rs:36`）。49 次注册展开成 59 个 method+path，差额来自 8 条多方法路由：`/connectors/{id}` 与 `/projects/{id}` 各挂 3 个方法（各多 2），`/admin/users`、`/admin/settings`、`/connectors`、`/projects`、`/sessions`、`/sessions/{id}/meta` 各挂 2 个（各多 1），合计 +10。
+`/api/v2` 下共 **63 个已实现的 method+path 组合**（**含** §5 单独记录的 `GET /connector/ws`；只数 §3 这几节是 62），由 **53 次** `.route(...)` 注册（admin 3 + auth 5 + connectors 5 + fs 4 + **meta 1** + notices 3 + **pairing 3** + projects 3 + runtime 4 + sessions 11 + shares 3 + connector_ws 1 + terminals 4 + ws 3 = 53；`routes/mod.rs:24-49` 合并 15 个带 router 的模块、17 次 `.merge`——`extract` 只是提取器工具模块（没有 router），`shares` 与 `pairing` 各贡献两个 router：认证面与公开面；其中 `unsupported` 子 router 用宏注册 **35 条** `501` 路径，见 §4）。另有两条挂在根（不属 `/api/v2`）：`GET /healthz`（`lib.rs:38`）与 `GET /install.sh`（`lib.rs:42` → `src/install.rs`，见 §3.14）。53 次注册展开成 63 个 method+path，差额来自 8 条多方法路由：`/connectors/{id}` 与 `/projects/{id}` 各挂 3 个方法（各多 2），`/admin/users`、`/admin/settings`、`/connectors`、`/projects`、`/sessions`、`/sessions/{id}/meta` 各挂 2 个（各多 1），合计 +10。
 
 ### 3.1 认证 —— `routes/auth.rs`
 
@@ -251,23 +252,83 @@ wire 上现在是 `[{"id":"allow-once","label":"允许一次","style":"primary"}
 | `GET` | `/dashboard/ws` | 总览流：connectors / projects / 会话状态 | `ws.rs:34,292-320`（socket 循环 `398-420`） |
 | `GET` | `/sessions/{session_id}/ws` | 会话事件流：先发 `session.subscribed`，随后增量；15s keepalive | `ws.rs:35,159-291` |
 
-### 3.12 `GET /healthz`（不在 `/api/v2` 下）
+### 3.12 配对码：`/pairing*`（hub）+ `farwork-agent pair`（agent） —— `routes/pairing.rs`、`pairing.rs`
+
+设备不必由人手抄一个 `cxt_` token：浏览器铸一个 8 位一次性码，设备拿它去换 token。
+
+| 方法 | 路径 | 说明 | 源码 |
+| --- | --- | --- | --- |
+| `POST` | `/pairing/start` | **需登录**。body `{ttlSeconds?}`（缺省 600，闭区间 60..=3600，越界 `422`）。`201` 回 `{pairing:{id,code,expiresAt}, serverTime}`——**`code` 只在这一个响应里出现**，库里只有摘要 | `pairing.rs:145-205` |
+| `POST` | `/pairing/claim` | **免鉴权**（码就是凭证）。body `{code,name,platform?}`，`200` 回 `{connector:{id,name,deviceOs,status}, connectorToken, serverTime}`——`connectorToken` 与 `POST /connectors` 返回的是同一个对象，所以设备拿到之后的行为完全不变 | `pairing.rs:209-294` |
+| `GET` | `/pairing/{pairing_id}` | 需登录，浏览器轮询用。`status` ∈ `pending`/`claimed`/`expired`，仅在已 claim 时多一个 `connectorId` | `pairing.rs:296-345` |
+
+码的规则（纯逻辑在 `crates/farwork-hub/src/pairing.rs`）：
+
+- **8 位、`XXXX-XXXX`，字母表 30 个符号** `23456789ABCDEFGHJKMNPQRSTVWXYZ`——Crockford 去掉易混字符，**没有 I/L/O/U/0/1**（`pairing.rs:21-28`）。归一化去连字符与空白并转大写，所以 `4f2k-9qxm` 与 ` 4F2K9QXM ` 是同一个码（`pairing.rs:60-67`）；归一化后不是 8 个合法符号就按「码无效」回答，而不是「查不到」（`pairing.rs:69-74`）。
+- **只存带密钥的摘要**：`sha256("farwork-pairing-v1:{FARWORK_HUB_SECRET}:{规范化码}")`（`pairing.rs:76-79`）。8 位码只有约 39 bit，数据库里一份裸摘要能离线反推，反推出来就能抢走一个还没被 claim 的配对；把 hub secret 当 key material 之后，单看数据库拿到的东西没用（`pairing.rs:7-14`；`migrations/0007_pairings.sql:1-6`）。
+- **一次性**：claim 用 `update … where claimed_at is null` 抢（`pairing.rs:267-281`），`rows_affected == 0` 就回 `409 code_already_claimed` 并连同新建的 connector 一起回滚（`pairing.rs:255-282`）。**「已用」优先于「已过期」**：码一旦花掉再报过期，会把人引导去为一个已经存在的设备重新铸码（`pairing.rs:246-253`）。
+- **TTL 默认 600s，可配 60..=3600**（`pairing.rs:30-32,150-157`）。
+- **按来源地址每分钟 10 次**，超了 `429 too_many_attempts`（`pairing.rs:34-36,214-219`）。键是 TCP peer 地址，**刻意不看 `X-Forwarded-For`**：本 build 没有「可信代理」概念，跟着头走等于让直连调用者换 key 绕过限额；代价是反代后面所有 claim 共用一个桶，这是「太严」而不是「没限额」（`pairing.rs:19-25`）。限流器在进程内（`ClaimLimiter`，最多跟踪 4096 个来源，重启即清，`pairing.rs:81-120`）。
+- **状态码即语义**：错码 `404 invalid_code`、过期 `410 code_expired`、已用 `409 code_already_claimed`、限流 `429 too_many_attempts`、`name` 空白 `422`（`pairing.rs:108-143,225-228`）。
+- **claim 与 start 是两个 router**：`public_router()` 只注册 `/pairing/claim` 且**没有 `AuthedUser`**（`pairing.rs:53-56`；`routes/mod.rs:36-38`），与 `/public/shares` 同一套做法——响应里只有它刚创建的那台设备，看不到账号。
+- **`GET {id}` 不泄露存在性**：未知 id 与「别人的 id」都回 `status:"unknown"`（`expiresAt:null`）而不是 `404`，于是轮询只有一条代码路径，也无法用它探测别人的配对（`pairing.rs:310-322`）。
+- **表与索引**：`pairings`（`0007_pairings.sql:19-30`），`uq_pairings_code_hash` 唯一（摘要撞车时换码重试，而不是遮蔽一个活着的码，`pairing.rs:161-188`），`idx_pairings_user` 服务「我的配对码」列表（`0007_pairings.sql:35-38`）。浏览器侧是 `apps/web/src/components/ConnectDevicePage.svelte`（`#/connect`）+ `src/lib/api/pairing.ts`。
+
+agent 侧（`crates/farwork-agent/src/pair.rs` + `credentials.rs` + `identity.rs` + `cli.rs`）：
+
+```bash
+farwork-agent pair --hub <url> --code <code> [--name/--runtime/--workdir/--shell/--dsh-*]
+```
+
+- **子命令是裸词**：`pair` 只能出现在 argv 首位（`cli.rs:160-163`）；`--code` 只在这个子命令下有意义（否则 `CodeOutsidePair`），`pair` **必须显式给 `--hub`**——默认值是 `ws://127.0.0.1:7300` 的开发回退，拿它去兑码只会以「码无效」的样子失败（`cli.rs:113-118,228-246`）。码会被 `trim` + 转大写（Crockford 本就大小写无关，`cli.rs:228-237`）。
+- **`--hub` 接受四种形式**：`http(s)://` 与 `ws(s)://` 都行，且允许已经带着 `/api/v2/connector/ws`（文档就是那么发出来的），拼接前先剥掉（`pair.rs:79-104`）。无 scheme 或其它 scheme → `UnsupportedHub`，错误文本直接给一个 `--hub https://…` 的例子（`pair.rs:29-30`）。
+- **成功即写三键**：`agent.json` 多出 `hub` / `connectorId` / `connectorToken`（`identity.rs:22-36,50-57`），文件 0600、目录 0700（`identity.rs:114-137`）。**写完之后裸 `farwork-agent` 直接复用**：凭证解析顺序是「`--hub`/`--token`（含 `FARWORK_CONNECTOR_TOKEN`）→ agent.json」，显式旗标永远赢，且文件里的 token 只配它旁边的 hub（`credentials.rs:43-86`）。只有 token 没有 hub、或只有 hub 没有 token，都会指名缺哪一半并提示去 `pair`（`credentials.rs:21-41,58-79`）。
+- **claim 失败 → 可操作文案**（`pair.rs:106-134`，每条单测钉住 `pair.rs:354-380`）：`404 invalid_code` → 回 Web 重新铸码；`409` → 已被别的设备用掉，重新铸码；`410` → 已过期，重新铸码；`429` → 一分钟内最多 10 次，等一分钟；**裸 `404` 且 body 里没有 `invalid_code`** → 那台 hub 没有 pairing API（旧版本），升级它或改用 `--token`；连不上/超时 → 报出试过的 URL 与原因（`pair.rs:199-209`）；`200` 但没有 `connectorToken` → 那不是一个 pairing API（`pair.rs:177-184`）。**状态码不够、还要看 body 里的 `detail.code`**：两种 404 要给的忠告正好相反（`pair.rs:106-110`）。超时 15s（`pair.rs:16`）。
+- 真二进制烟测：`crates/farwork-agent/tests/pair_smoke.rs`（对着桩 hub 跑 `pair`，断言 `agent.json` 的内容与权限、claim body、以及 connector 实际用来拨号的 token；`pair_smoke.rs:22-27`）。
+
+### 3.13 `GET /meta`（免鉴权） —— `routes/meta.rs`
+
+```json
+{"hubUrl":"https://hub.example.com","version":"0.1.0","serverTime":"…","scheme":"https","port":443}
+```
+
+`hubUrl` 的优先级只有两级（`meta.rs:63-82`）：
+
+1. `FARWORK_HUB_PUBLIC_URL`（启动时规范化，见 §2）——设了就**完全不看请求头**；`scheme`/`port` 从它身上解析，没写端口就按 scheme 默认（`https`→443、`http`→80，`meta.rs:84-101`）；
+2. 否则：scheme 取 `X-Forwarded-Proto` 的**第一个值**（只认 `http`/`https`，其它忽略，`meta.rs:125-133`），主机名取 `Host` 头**去掉端口**（IPv6 字面量 `[::1]:5173` → `[::1]`，`meta.rs:103-123`），端口取 **hub 自己的监听端口** `config.port`（`meta.rs:74-81`），并且只在不是 scheme 默认端口时才写进 URL（`meta.rs:135-142`）。
+
+两条推导都直接来自一次事故：
+
+- **端口绝不取 `Host`**：反代下这个头带的是代理的地址，那个数字正是不能复制的——复制过去就是把「设备永远连不上」写成配置（`meta.rs:11-16`）。
+- **`X-Forwarded-Proto` 只定 scheme**：它除非有可信代理重写，否则是调用方可控的；除了「这个 URL 长什么样」，它不许影响任何东西（尤其不能用来判断调用者是谁，`meta.rs:19-25`）。
+
+**为什么需要这个端点（真实事故）**：生产把静态产物交给 hub 托管，页面 origin 就是 hub，一切正常；但 `vite dev`（5173 代理到 7300）和反代下不是。用 `location.origin` 拼出来的命令会让 `farwork-agent pair --hub http://localhost:5173` 被原样写进 `agent.json`，之后 agent 再也连不上，而唯一症状是「设备离线」（`meta.rs:1-9`）。所以 hub 自报基地址、web 照抄，而不是猜。
+
+**`FARWORK_HUB_PUBLIC_URL` 非法 → hub 启动失败**（`config.rs:71-93`）：这个串会被逐字复制进每条配对命令，写错必须在启动时炸，而不是交给用户一个连不上的地址。规范化规则：trim、去尾斜杠、scheme 小写，只接受 `http`/`https` 且有非空 authority、不含空白；空值等于「没设置」（`config.rs:78-93`；单测 `config.rs:132-147`）。
+
+未经 `AuthedUser`，和 `/healthz` 同级：它只说 hub 自己的地址与版本，不说任何账号信息（`meta.rs:24-25`）。测试 `crates/farwork-hub/tests/meta.rs`（**不碰数据库**：懒连接池）：无凭证可读、回 public url、忽略 `Host` 里的端口、只取 `X-Forwarded-Proto` 的 scheme、public url 的端口与路径保留（`meta.rs:50-119`）。
+
+### 3.14 根上的两条路由（不在 `/api/v2` 下）：`GET /healthz` 与 `GET /install.sh`
+
+`GET /healthz` 只回版本号：
 
 ```json
 {"status":"ok","version":"0.1.0"}
 ```
 
-源码：`crates/farwork-hub/src/lib.rs:36,48-50`。
+源码：`crates/farwork-hub/src/lib.rs:38,50-52`。
 
-## 4. `501 not_implemented`：**37 条路径**
+`GET /install.sh` 把仓库根的 `install.sh` **原样**发出去（`include_str!` 编进二进制，handler 只加 `content-type: text/x-shellscript` 与 `content-disposition`，不改一个字节；`src/install.rs:1-40`）。**它必须在根上**：配对页把 `GET /meta` 的 `hubUrl` 拼成 `curl -fsSL <hubUrl>/install.sh | sh`（`apps/web/src/components/ConnectDevicePage.svelte:73`），而 hub 在这里回 `404` 就等于把页面上唯一那条安装指令变成用户 shell 里的一次失败。免鉴权，与 `/healthz` 同级：它是公开的安装物料，不含任何账号信息。测试 `crates/farwork-hub/tests/install_sh.rs`（与 `meta.rs` 一样**不碰数据库**，懒连接池）。
 
-`crates/farwork-hub/src/routes/unsupported.rs:18-78` 用一个宏注册了 **37 条**路径（宏体 `unimplemented_paths!` 的 `"/..."` 字面量在 `unsupported.rs:19-76`，逐条数出正好 37），全部 `any(not_implemented)`，返回 `501` 且 body 里带 `"METHOD /path is not implemented in this build"`（`unsupported.rs:80-88`）；未注册的其余路径落到 `unknown_path` → `404`（`unsupported.rs:77,90-98`）。
+## 4. `501 not_implemented`：**35 条路径**
 
-**账要从 52 条倒着算**：M3 移出 3 条（`/sessions/{id}/runtime/interrupt`、`/sessions/{id}/runtime/notices`、`/sessions/{id}/runtime/notices/{notice_id}/respond`，§3.4/§3.7）→ 49；分享移出 2 条 → 47；管理台移出 2 条（`/admin`、`/admin/{*rest}`）→ 45；**会话命名空间与运行时控制再移出 8 条**（`/sessions/{id}/runtime/steer`、`/runtime/commands`、`/runtime/selections`、`/runtime/catalogs/{catalog}`、`/sessions/{id}/terminal`、`/sessions/{id}/terminal/{*rest}`、`/sessions/{id}/files`、`/sessions/{id}/files/{*rest}`）→ **37**。移出这 8 条不等于那组都补齐了：`/sessions/{id}/sync` 与 `/sessions/{id}/takeover` 仍在表里。
+`crates/farwork-hub/src/routes/unsupported.rs:18-79` 用一个宏注册了 **35 条**路径（宏体 `unimplemented_paths!` 的 `"/..."` 字面量在 `unsupported.rs:19-76`，逐条数出正好 35），全部 `any(not_implemented)`，返回 `501` 且 body 里带 `"METHOD /path is not implemented in this build"`（`unsupported.rs:81-89`）；未注册的其余路径落到 `unknown_path` → `404`（`unsupported.rs:78,91-99`）。
+
+**账要从 52 条倒着算**：M3 移出 3 条（`/sessions/{id}/runtime/interrupt`、`/sessions/{id}/runtime/notices`、`/sessions/{id}/runtime/notices/{notice_id}/respond`，§3.4/§3.7）→ 49；分享移出 2 条 → 47；管理台移出 2 条（`/admin`、`/admin/{*rest}`）→ 45；**会话命名空间与运行时控制再移出 8 条**（`/sessions/{id}/runtime/steer`、`/runtime/commands`、`/runtime/selections`、`/runtime/catalogs/{catalog}`、`/sessions/{id}/terminal`、`/sessions/{id}/terminal/{*rest}`、`/sessions/{id}/files`、`/sessions/{id}/files/{*rest}`）→ **37**。**配对码再移出 2 条**（`/pairing`、`/pairing/{*rest}`，已由 `routes/pairing.rs` 实现，§3.12）→ **35**。移出这 8 条不等于那组都补齐了：`/sessions/{id}/sync` 与 `/sessions/{id}/takeover` 仍在表里。`/connectors/{id}/pairing` **仍在表里**——那是每台设备的运行时开关，与配对码不是同一件事。
 
 **分享又移出 2 条，49 → 47**：`/sessions/{id}/shares`（`POST`）与 `/sessions/{id}/shares/{*rest}`（其中 `DELETE .../{share_id}`）已由 `routes/shares.rs` 真实实现（§3.8），所以表里只剩账号级的 `/shares` 与 `/shares/{*rest}`。公开读 `GET /public/shares/{id}` **从来不在本表**——它的前缀是 `/public/...` 而不是 `/shares*`，是这一批新加的一条路径，不是从 501 里移出来的。
 
-**管理台再移出 2 条，47 → 45**：`/admin` 与 `/admin/{*rest}` 已由 `routes/admin.rs` 真实实现（§3.9；3 次 `.route(...)`、5 个 method+path），所以这一整组从表里消失，宏里当时剩 45 条字面量。它移走的是**实例管理**这一块，不是 `/announcements*`、`/agents*`、`/pairing*`、`/usage*` 四个通配——那些仍在表里，仍回 `501`。
+**管理台再移出 2 条，47 → 45**：`/admin` 与 `/admin/{*rest}` 已由 `routes/admin.rs` 真实实现（§3.9；3 次 `.route(...)`、5 个 method+path），所以这一整组从表里消失，宏里当时剩 45 条字面量。它移走的是**实例管理**这一块，不是 `/announcements*`、`/agents*`、`/pairing*`、`/usage*` 四个通配——管理台交付时那些仍在表里、仍回 `501`（其中 `/pairing*` 后来由 §3.12 那一批移出，见上）。
 
 **文件与终端的会话命名空间是后补的，现在也移出去了**：第一批交付的是 connector 命名空间（`/connectors/{id}/fs/*`、`/connectors/{id}/terminals*`，§3.5/§3.6），当时 `/sessions/{id}/files*` 和 `/sessions/{id}/terminal*` 仍在表里、仍回 `501`；这一轮把这两组连同 `runtime/{steer,commands,selections,catalogs/{catalog}}` 一起真正实现了（会话级**共用同一条 `fsrelay`/`termrelay`**，不是第二套中继，见 §3.5/§3.6），于是表里少掉整整 8 条。
 
@@ -278,9 +339,9 @@ wire 上现在是 `[{"id":"allow-once","label":"允许一次","style":"primary"}
 | 批量会话维护 | `/sessions/archive`、`/sessions/unarchive`、`/sessions/read` | 3 |
 | 设备运行时管理 | `/connectors/{id}/runtimes`、`/connectors/{id}/runtimes/{*rest}`、`/connectors/{id}/protocol/capabilities`、`/connectors/{id}/pairing`、`/runtimes`、`/runtimes/{*rest}`、`/devices`、`/devices/{*rest}` | 8 |
 | OAuth / 邮件码 / 移动端扫码登录 | `/auth/oauth/{start,callback,finalize}`、`/auth/mobile-login/{qr,exchange,refresh,request,status,confirm}`、`/auth/email-code`、`/auth/change-password`、`/auth/me/{email,profile,avatar}` | 14 |
-| 公告 / agents / usage / 配对（**实例管理已实现**，`/admin*` 已从本表移出，见 §3.9） | `/announcements`、`/announcements/{*rest}`、`/agents`、`/agents/{*rest}`、`/pairing`、`/pairing/{*rest}`、`/usage`、`/usage/{*rest}` | 8 |
+| 公告 / agents / usage（**实例管理已实现**，`/admin*` 已从本表移出，见 §3.9；**配对码已实现**，`/pairing*` 已移出，见 §3.12） | `/announcements`、`/announcements/{*rest}`、`/agents`、`/agents/{*rest}`、`/usage`、`/usage/{*rest}` | 6 |
 
-**2 + 2 + 3 + 8 + 14 + 8 = 37**，与宏里的字面量条数一致（`unsupported.rs:19-76`）。分组只是读起来方便：`any(...)` 是按**路径**匹配的，没有方法粒度，所以同一条 `*rest` 通配把它下面所有子路径一起收进 `501`。
+**2 + 2 + 3 + 8 + 14 + 6 = 35**，与宏里的字面量条数一致（`unsupported.rs:19-76`）。分组只是读起来方便：`any(...)` 是按**路径**匹配的，没有方法粒度，所以同一条 `*rest` 通配把它下面所有子路径一起收进 `501`。
 
 另有一处**带内** `501`：`POST /sessions/{id}/runtime/messages` 携带非空 `attachments` 时返回 `501 attachments are not implemented in this build`（`sessions.rs:971-979`）——拒绝好过静默丢弃附件。
 
@@ -661,18 +722,19 @@ hub 侧的对应行为：`routes/sessions.rs:766-812` —— `after` 不可解�
 
 ## 7. 持久化
 
-- 迁移文件 **6 个**：`crates/farwork-hub/migrations/0001_init.sql` + `0002_connector_ingress.sql`（M3 ingress）+ `0003_terminals.sql`（设备终端）+ `0004_shares.sql`（分享）+ `0005_session_terminal_scope.sql`（Ingress Protocol v1.3：给 `terminals` 加可空的 `session_id`，不建第二张表）+ `0006_notice_interaction_type.sql`（给 `session_notices` 加**可空**的 `interaction_type`：DSH 的 approval 是通用 runtime interaction，不是 `kind` 那三个值能表达的，所以加列而不是改义 `kind`；**不建表、不加索引**）。启动时由 `db::migrate` 通过 `sqlx::migrate!("./migrations")` 应用，sqlx 自带 ledger，重复启动是 no-op（`db.rs:17-22`；`main.rs` 的启动序列）。
-- **12 张表**（`create table` 计数）：0001 的 `users`、`app_settings`、`connectors`、`projects`、`sessions`、`session_runtime_states`、`timeline_items`、`ws_tickets`，加 0002 的 `session_streams`、`session_notices`，加 0003 的 `terminals`，加 0004 的 `shares`（`snapshot_json` 存一次写死的快照、`deleted_at` 是软删，见 §3.8）。`0006_notice_interaction_type.sql` 只加列，**表数不变**。后三张的存在理由见 §5.7：一张让 `streamId` 跨 hub 重启存活，一张让审批跨刷新存活，`terminals` 让「终端已结束 / 从未存在」可区分并让 agent 的拒绝原因活过它被报告的那一刻（列含 `closed_at`、`error_code`、`error_message`，`0003_terminals.sql:13-29`）。
-- **16 个索引**（`create index` / `create unique index` 计数：0001 十个 + 0002 两个 + 0003 两个 + 0004 一个 + 0005 一个；`0006` 一个也没加，**索引数不变**），其中数条是语义承载点：
+- 迁移文件 **7 个**：`crates/farwork-hub/migrations/0001_init.sql` + `0002_connector_ingress.sql`（M3 ingress）+ `0003_terminals.sql`（设备终端）+ `0004_shares.sql`（分享）+ `0005_session_terminal_scope.sql`（Ingress Protocol v1.3：给 `terminals` 加可空的 `session_id`，不建第二张表）+ `0006_notice_interaction_type.sql`（给 `session_notices` 加**可空**的 `interaction_type`：DSH 的 approval 是通用 runtime interaction，不是 `kind` 那三个值能表达的，所以加列而不是改义 `kind`；**不建表、不加索引**）+ `0007_pairings.sql`（配对码：`pairings` 表 + 两个索引；只存带密钥的摘要，`claimed_at` 是一次性开关，见 §3.12）。启动时由 `db::migrate` 通过 `sqlx::migrate!("./migrations")` 应用，sqlx 自带 ledger，重复启动是 no-op（`db.rs:17-22`；`main.rs` 的启动序列）。
+- **13 张表**（`create table` 计数）：0001 的 `users`、`app_settings`、`connectors`、`projects`、`sessions`、`session_runtime_states`、`timeline_items`、`ws_tickets`，加 0002 的 `session_streams`、`session_notices`，加 0003 的 `terminals`，加 0004 的 `shares`（`snapshot_json` 存一次写死的快照、`deleted_at` 是软删，见 §3.8），加 0007 的 `pairings`（只存 `code_hash`、`expires_at_epoch` 是整数比较、`claimed_at` 与 `connector_id` 记「被谁花掉」，`connector_id` 可空所以删设备不会抹掉「这个码被用过」，`0007_pairings.sql:19-30`）。`0006_notice_interaction_type.sql` 只加列，**表数不变**。后三张的存在理由见 §5.7：一张让 `streamId` 跨 hub 重启存活，一张让审批跨刷新存活，`terminals` 让「终端已结束 / 从未存在」可区分并让 agent 的拒绝原因活过它被报告的那一刻（列含 `closed_at`、`error_code`、`error_message`，`0003_terminals.sql:13-29`）。
+- **18 个索引**（`create index` / `create unique index` 计数：0001 十个 + 0002 两个 + 0003 两个 + 0004 一个 + 0005 一个 + 0007 两个；`0006` 一个也没加，**索引数不变**），其中数条是语义承载点：
   - `uq_timeline_items_client_message`：`unique (session_id, client_message_id)`（`0001_init.sql:132`）——`clientMessageId` 幂等的**唯一**保证。
   - `idx_timeline_items_session_updated_seq` / `_session_order_seq`：游标补拉与展示排序的查询路径（`0001_init.sql:129-130`）。
   - `idx_session_notices_id`：`notice.resolved` 只带 notice id，解析时先按 id 找行、再校验它属于发帧的 connector（`0002_connector_ingress.sql:37-39`）。
+  - `uq_pairings_code_hash`：**唯一**索引（`0007_pairings.sql:35`）——claim 只按摘要查（匿名调用者说不出这个码属于谁），唯一性让摘要撞车时换码重试而不是让一个活着的码被悄悄遮蔽（`routes/pairing.rs:161-188`）；`idx_pairings_user` 服务「我的配对码」列表（`0007_pairings.sql:38`）。
   - `idx_terminals_connector`：connector 断连时扫「这个设备还有哪些终端没关」（`0003_terminals.sql:31-32`；`terminals.rs:594-614`）；`idx_terminals_user` 服务取票时的归属校验（`0003_terminals.sql:34-35`；`ws.rs:154-162`）；`idx_terminals_session` 服务会话命名空间的读（`0005_session_terminal_scope.sql:13-14`），也是握手时判定「同设备但别处开的终端」的查询路径（`terminals.rs:353-363`）。
 - `ws_tickets` 走 `delete ... returning` 消费，行即删，靠 `idx_ws_tickets_expires` 清理（`0001_init.sql:144`；`ws.rs:83-108`）。
 
 ## 8. 测试的前置条件（`crates/farwork-hub/tests/`）
 
-`crates/farwork-hub/tests/` 下六个集成测试都跑真实 PostgreSQL：`e2e.rs`（M2 纵向切片）、`connector_ingress.rs`（ingress 上下行）、`fs_bridge.rs`（文件浏览中继）、`terminal_bridge.rs`（设备终端中继）、`shares.rs`（分享快照与公开读）、`admin.rs`（管理台：权限门、七键投影、admin_lockout、settings 开关真的生效）。下面以 `e2e.rs` 为例：
+`crates/farwork-hub/tests/` 下**十个**集成测试，其中 `meta.rs` 与 `install_sh.rs` 不碰数据库（懒连接池），其余都跑真实 PostgreSQL：`e2e.rs`（M2 纵向切片）、`connector_ingress.rs`（ingress 上下行）、`fs_bridge.rs`（文件浏览中继）、`terminal_bridge.rs`（设备终端中继）、`shares.rs`（分享快照与公开读）、`admin.rs`（管理台：权限门、七键投影、admin_lockout、settings 开关真的生效）、`session_runtime.rs`（运行中干预与会话命名空间，单个测试函数——同一个库里多个测试会互相 truncate）、`pairing.rs`（配对码：免鉴权 claim、一次性、410/404/429、明文码与 token 都不落库；测试内按进程互斥串行）、`meta.rs`（`/meta` 的地址推导，**刻意不碰数据库**：懒连接池，只从配置与请求头回答）、`install_sh.rs`（`GET /install.sh` 与仓库 `install.sh` 逐字节相同、内容类型正确；同样**不碰数据库**）。下面以 `e2e.rs` 为例：
 
 - `TEST_DATABASE_URL` **未设置** → 打印 `SKIP farwork-hub integration test: TEST_DATABASE_URL is not set.` 并附上怎么设置，然后 `return`（`e2e.rs:127-134`）。测试仍然是「通过」的——这就是 CI 必须提供数据库的原因。
 - `TEST_DATABASE_URL` 为空串 → 打印 `SKIP farwork-hub integration test: TEST_DATABASE_URL is empty.` 并返回（`e2e.rs:135-138`）。
@@ -747,11 +809,11 @@ hub 侧的对应行为：`routes/sessions.rs:766-812` —— `after` 不可解�
 | 谁起谁 | agent `spawn` 子进程 `codex app-server --stdio`（`hub.rs:341`、`hub.rs:634` 起会话 worker） | bridge **本来就在跑**；agent 只是 TCP 客户端。每个会话各连一次：`rpc::dial`（`rpc.rs:206`）在 `mod.rs:132` |
 | 进程从哪来 | `$FARWORK_CODEX_BIN`（默认 `codex`） | 用户自己启动 DSH，并在其中**启用 agents-anywhere 桥插件** |
 | 端点 | 无此概念 | 读 `endpoint.json`（见下） |
-| 缺一个会怎样 | 该会话 `session.exit{code:2}` | 启动阶段就失败：退出码 `1`，connector **根本不上线**（`main.rs:73-80`） |
+| 缺一个会怎样 | 该会话 `session.exit{code:2}` | 启动阶段就失败：退出码 `1`，connector **根本不上线**（`main.rs:97-99`） |
 
-端点发现（`discovery.rs`）按优先级：① `--dsh-endpoint <path>`（`cli.rs:49-51,150`）；② `$HOME/.agents-anywhere/dsh-bridge/endpoint.json`（`PRIMARY_SUFFIX`，`discovery.rs:15`）；③ `$DSH_HOME/agents-anywhere/bridge/endpoint.json`，`$DSH_HOME` 未设置时回退 `$HOME/.dsh`（`discovery.rs:17-18,100-108`；候选顺序 `discovery.rs:76-108`，入口 `discovery.rs:90`）。
+端点发现（`discovery.rs`）按优先级：① `--dsh-endpoint <path>`（`cli.rs:49-51,150`）；② `$HOME/.farwork/dsh-bridge/endpoint.json`（`FARWORK_SUFFIX`，`discovery.rs:26`）——**自研插件**，见 §11；③ `$HOME/.agents-anywhere/dsh-bridge/endpoint.json`（`UPSTREAM_SUFFIX`，`discovery.rs:28`）——上游插件；④ `$DSH_HOME/agents-anywhere/bridge/endpoint.json`（`DSH_HOME_SUFFIX`，`discovery.rs:30`），`$DSH_HOME` 未设置时回退 `$HOME/.dsh`（候选顺序 `discovery.rs:173-191`，入口 `resolve` 在 `discovery.rs:194`）。解析结果连**来源**一起返回（`Located{endpoint, path, source}`，`discovery.rs:91-96`；`source` 是 `explicit`/`farwork`/`upstream`/`upstream-dsh-home`，`discovery.rs:69-88`），启动日志记 `dsh_endpoint_source`（`main.rs:89-105,163`）——两个插件可以同时装，所以「连上了某个桥」不算信息。**显式 `--dsh-endpoint` 指了文件却不存在是错误，不回退去搜默认位置**：操作者点了名，让另一个桥顶上会把拼写错误藏起来（`discovery.rs:108-121`）；默认位置全空时报错会列出**四个候选**与怎么修（`discovery.rs:125-146`）。
 
-读到的 JSON 必须逐字过四项校验（`discovery.rs:137-183`），任何一项不过都是**拒绝拨号**而不是猜一个：
+读到的 JSON 必须逐字过四项校验（`parse`，`discovery.rs:252-297`；`pid` 只是记录字段，不参与校验），任何一项不过都是**拒绝拨号**而不是猜一个：
 - `version == 1`（`ENDPOINT_VERSION`，`discovery.rs:21,144-152`）——版本变了说明文件布局变了，按旧布局读等于「静默拨错端口」；
 - `host == "127.0.0.1"`（`discovery.rs:22,157-163`）——只连 loopback，不把 token 发到别的地址；
 - `port` 在 `1..=65535`、`token` 非空白。
@@ -781,13 +843,15 @@ hub 侧的对应行为：`routes/sessions.rs:766-812` —— `after` 不可解�
 
 ### 10.4 同步语义：subscribe → batch → **ack**，序号严格 +1
 
-1. `runtime.sync.subscribe`（方法名 `client.rs:355`，调用点 `mod.rs:748-773`）；
-2. bridge 以 `runtime.sync.batch` 通知推事件（分发 `mod.rs:266`）；
-3. agent 把批次翻成 ingress 帧后**必须**回 `runtime.sync.ack`（方法名 `client.rs:375`，调用点 `mod.rs:780-800`）。ack 同时是 checkpoint 的出口：有 checkpoint 就带上、没有就发 `null`，**不省略键**（`mod.rs:465-467`）。
+1. `runtime.sync.subscribe`：参数是 `{subscriptionId, checkpointVersion:1, uploadProgressVersion:1}`（`client.rs:218-233`；调用 `client.rs:397-414`）。`subscriptionId` 每次订阅都重新生成，桥按它绑定批次/ack/checkpoint（`client.rs:235-241`）——重订阅必须看起来像一次**新**订阅。**`checkpointVersion` 不写 1 等于关掉 durable checkpoint**：桥从此一个 `checkpoint.*` 操作都不发，每次连接都是全量 inventory 重放（`client.rs:218-222` 的注释即此）；
+2. bridge 以 `runtime.sync.batch` 通知推事件（分发 `mod.rs:290-303`）；
+3. agent 把批次翻成 ingress 帧后**必须**回 `runtime.sync.ack`（`client.rs:416-427`，调用点 `mod.rs:872-890`）。**ack 同时是 checkpoint 的答复通道**：批次里的 `checkpoint.load` 把答案写进待发的 `ack_checkpoint`，没有也**带上 `null`** 这个键（省略会被读成「这个扩展没实现」，`mod.rs:542-558`）；`checkpoint.save` 在 ack 发出**之前**落盘（`mod.rs:559-568`）——先回执后写盘，重连就退化成全量重放。实测口径：`crates/farwork-agent/tests/dsh_live.rs:642` 的 `PROBE SUMMARY … inbound_requests=` 为 **0**，即桥**从不反向发请求**，checkpoint 只能搭 ack 回去（本轮未复跑该探针）。
 
 - **`batchSeq` 必须严格 +1**（`sync.rs:6-8,26,63-66`）：跳号或乱序意味着事件已经丢了，**唯一安全的恢复是重新订阅**，不是「从下一个号接着跑」（`mod.rs:308,322` → `resubscribe`，`mod.rs:774-779`）。重新订阅会重置序号（`sync.rs:89-99`）。
 - **快照 `begin → items → commit` 先暂存、后提交**（`sync.rs:152-277`）：`commit` 核对**条数**与 **id 唯一性**，不匹配整份丢弃并报错（`sync.rs:34-42,233-266`）；新的 `begin` 直接替换半份旧快照（`sync.rs:191-210`），`abort` 抛掉它（`sync.rs:268-277`）。理由在 `sync.rs:9-11`：**半份快照比没有快照更糟**。
-- **checkpoint 按 native session 保存**（`sync.rs:281-300`）：key 是 `externalSessionId`，它只是加速手段——丢了只是多一次全量快照，不会丢事件（`sync.rs:281-283`）。
+- **checkpoint 落盘，按 native session 一个文件**：`$FARWORK_HOME/dsh/sync/checkpoints/<externalSessionId>.json`（`sync.rs:304-311`；默认目录函数 `default_dir`），目录 0700、文件 0600，写入是「同目录临时文件 + `rename`」的原子替换（`sync.rs:452-489`）——读到半个 checkpoint，桥就会从一个它从未确认过的边界续传。**坏文件/外来文件一律当「没有 checkpoint」**：读不动或解析失败只 warn 跳过那一份，不连累其余（`sync.rs:412-450`）。它仍然只是加速手段：丢了就是一次全量重放，不会丢事件（`sync.rs:281-291`）。**peer 给的 `externalSessionId` 直接变成文件名**，所以必须是单个普通路径组件——非空、≤200 字节、不以 `.` 开头、不含 `/` `\` `NUL`（`sync.rs:402-410`），不合法就拒绝写并 warn（`sync.rs:343-352`）；临时文件不以 `.json` 结尾，因此半成品永远不会被当成完整的一份（`sync.rs:426-431`）。
+- **`checkpoint.*` 由桥驱动，agent 只做三件事**：`load` → 答案随下一次 ack 发出（`null` 表示没有）；`save` → 先落盘再 ack；`delete` → 内存与文件一起删（`sync.rs:369-383`；`mod.rs:542-576`）。一个批次要两份 checkpoint 时只答最后一份并 warn（`mod.rs:551-556`），因为一次 ack 只带得下一个。
+- **冷启动首连仍可能失败（桥侧 10000 事件队列）**：桥报 `runtime.error{data.scope:"sync"}` 表示它自己的事件队列（10000 条）在重放整个 inventory 时爆了（`mod.rs:320-328`）。两条路：**有 checkpoint 时最多重订阅 3 次**（`MAX_SYNC_RECOVERIES`，`mod.rs:48-53,356-366`），每次重订阅前已流到的会话 checkpoint 都在盘上，下一次从更后面续传；**没有 checkpoint 时一次性失败**（退出码 1），错误文本直接给可操作动作——归档旧会话（或让桥上少开点会话）再重连，并报出已持久化的 checkpoint 数与目录（`mod.rs:367-382`）。重试只对「能续传」有意义：续不上就又是从头的全量重放，队列会再爆一次。
 
 ### 10.5 能力诚实：真机只读探测的实测值
 
@@ -820,6 +884,78 @@ DSH 的通知不是「`kind` + 三个决定」，而是带 `interactionType` 和
 - **入**：批次里的 `notice.upsert` 操作 → `projection::notice`（`mod.rs:501-544`；`projection.rs:159-229`）。`options` 由桥的 actions 归一化成 `{id,label,style?}`（`projection.rs:114-157`）；`interactionType` 既进 `body` 也进 notice 顶层字段（`projection.rs:216,224`；ingress 侧 `ingress.rs:838-849`）。`responseRequired` 却**没有任何 action** 的通知直接丢弃并 warn（`projection.rs:202-207`）——发出去就是一张点不了任何按钮的卡。不是本 `sessionId` 的通知直接不转发（`projection.rs:160-162`）。
 - **回答**：hub 的 `notice.respond` 带 `actionId` 下来（`ingress.rs:472-499`），agent 先按这条 notice **记录下来的 action 列表重新校验**（`interaction.rs:95-126`），不合法就回 error 帧并把通知放回队列（`mod.rs:683-706`）；桥回 `{ok:false}`（业务失败，不是 RPC 错误）同样算失败：恢复队列、回 error（`mod.rs:711-726`），**不写「已解决」**。只有成功才发 `notice.resolved`，并在能映射到闭集时附带 `decision`（`projection.rs:284-300`；`mod.rs:726-736`）。
 - 于是 **hub 的 `422 unknown_action` 与 agent 的二次校验是两道闸**：前者防一个晚到的浏览器标签页塞进桥没给过的按钮，后者防 hub 与 agent 版本错位。
+
+## 11. 自研 DSH 桥插件：`packages/dsh-plugin`（`@farwork/dsh-bridge`）
+
+DSH 那一侧原本要装上游插件（`@agents-anywhere/dsh-bridge-next`）+ 上游的 Python connector。本仓把桥自己实现成一个 **DSH host plugin**（TypeScript / Cordis，**不是** cargo workspace 成员，也不在 pnpm workspace 里——根目录没有 `pnpm-workspace.yaml`，构建只用 Node 自带能力），于是这条链路里不再有 Python。
+
+### 11.1 为什么自研
+
+- **去掉对上游插件与其 Python connector 的依赖**：实测桥的工作 **100% 都在 TS 插件内**（loopback JSON-RPC 服务端 + 事件流 + 投影），上游那个 Python connector 只是**另一个客户端**——它不给桥加任何能力。既然本仓的客户端是 `farwork-agent`，跟着上游装 Python connector 就是纯负担（也与 §4.1 的零 Python 相冲突）。
+- **契约以本仓为准**：wire 形状（`initialize` / `session.*` / `runtime.sync.subscribe|ack`）在 `crates/farwork-agent/src/dsh/` 已经是唯一实现且有测试，桥按它实现，而不是按上游某个版本的实现反推。
+
+### 11.2 与上游插件共存：endpoint 必须换目录
+
+| | 上游插件 | 本插件 |
+| --- | --- | --- |
+| rendezvous 文件 | `~/.agents-anywhere/dsh-bridge/endpoint.json` | **`~/.farwork/dsh-bridge/endpoint.json`** |
+| manager lock | `…/.agents-anywhere/dsh-bridge/.manager-lock.json` | **`…/.farwork/dsh-bridge/.manager-lock.json`** |
+| TCP | `listen(0)` 随机端口 | 同 |
+
+**锁是按目录取的，而锁与 endpoint 文件同目录**（`packages/dsh-plugin/src/endpoint.ts:1-12,45-56`；`acquireManagerLock` 在 `:165`）。所以「两个桥共享一个目录」＝互相覆盖 endpoint、互相把对方踢下线；换一个目录就得到两把独立锁，两者可以同时跑。默认值就是 `~/.farwork/dsh-bridge`（`endpoint.ts:37-48`），`endpointDir` 可配但必须是绝对路径（`src/index.ts:33-50`）。endpoint 用 `link()` 发布而不是 rename/直写——读者永远不会看到半份文件，且 `link` 撞车时是失败而不是覆盖别人（`endpoint.ts:1-12,77-89`）。
+
+> **agent 的发现顺序已经包含它**（`dsh/discovery.rs:173-191`）：`--dsh-endpoint` → `~/.farwork/dsh-bridge/endpoint.json`（自研，排第一）→ 上游的两条。装好本插件后裸 `--runtime dsh` 就能找到它，不必带 `--dsh-endpoint`；启动日志里的 `dsh_endpoint_source`（`explicit`/`farwork`/`upstream`/`upstream-dsh-home`，`discovery.rs:69-88`；`main.rs:89-105`）说明**到底是哪一个桥在服务**。⚠️ 插件自己的 README 里「crate 的默认发现路径仍指向上游目录」那句已过期（代码先行改了），以本节为准。
+
+### 11.3 已实现的方法集（v1）
+
+`initialize` / `ping` / `session.list` / `session.getState` / `session.getSnapshot` / `session.createAndStart` / `session.startTurn` / `session.interrupt` / `session.getCapabilities` / `runtime.getCapabilities` / `runtime.sync.subscribe` / `runtime.sync.ack`（`src/router.ts:103-133`）。
+
+其余一律 `-32601 METHOD_NOT_FOUND`（`router.ts:129-131`）：`session.getNotices`、`session.respondInteraction`、`session.updateSelections`、`session.listCommands`、`session.executeCommand`、`catalog.*`、`workspace.list`、`runtime.sync.progress|unsubscribe|refresh`。**半实现的方法比明确拒绝更糟**：客户端会相信它的回答。
+
+两个身份也是按 §10 的契约派生的：`platformId` = hub 的 session id（wire 上的 `sessionId`），`externalSessionId` = `aa_` + `sha256(namespace)[0:16]` + `_` + platformId，靠**派生**而不是枚举会话解析，所以一次会话级调用不依赖 `sessionQuery` 是否加载（`src/identity.ts`；插件 README「Identity contract」）。
+
+### 11.4 v1 不实现审批 / 问答（以及怎么降级）
+
+DSH 的审批与用户提问**没有公共入口**。上游的做法是反射进 `typertGateway.wireStream.open(...)`、按函数的 `length`（5 vs 3 个参数）分支、用 `connection.browserPeer ?? connection.operator` 当 peer、再手搓一个 `Request` 往 `$events/result` 投答案。这依赖内部签名，且**没有先例**、**没有 fail-soft 版本**：签名一变，插件要么在宿主里抛，要么（更糟）静默吞掉用户的答案。
+
+所以 v1 明说没有它：
+
+- `initialize` 上报 `features.approval = false` / `features.userQuestions = false`；
+- `session.getNotices` / `session.respondInteraction` 回 `-32601`。
+
+**降级路径**：浏览器不出现审批卡，`farwork-agent` 也不转发（`dsh/projection.rs` 的 notice 分支按这两个位门禁，§10.3）；卡在审批上的会话必须**在 DSH 自己的 Web UI 里回答**——这条通道正因为本插件从不碰审批路径而照常可用，答完之后回合继续、timeline 继续流动。
+
+### 11.5 已知边界（别当成已支持）
+
+- **投影是故意的子集**：只投 assistant 文本、工具调用、工具结果与中断；reasoning / 图片 / compaction 标记 / 审批记录全部丢弃（`src/projection.ts:1-12`）。声称完整 projection v3 会让将来的 checkpoint 方案撤不回承诺。
+- **没有 checkpoint / upload-progress 协商**：`runtime.sync.subscribe` 既不回 `checkpointVersion` 也不回 `uploadProgressVersion`，v1 每次订阅都给全量快照。于是 agent 侧的 `checkpoints` 一直是空的——**§10.4 那条「没有 checkpoint 时一次性失败」正是用本插件时会走到的分支**（有续传的是上游桥）。
+- **`session.list` 的标题恒为 `null`**：v1 没有 title 服务，编一个标题就是让浏览器渲染一个谎。
+- **subscribe 之后新建的会话要等下一次 subscribe 才出现**：v1 不把半成品 baseline 缝进活流。
+- **`features.syncMode` 在宿主没有事件总线时是 `"polling"`**：轮询同样没实现，它只是「不会有流推给你」的诚实说法——agent 会直接拒绝而不是慢慢变旧（§10.3）。
+- **`apply()` 永不抛**：启动失败只 `logger.warn` 后返回；一个起不来的桥只该让用户失去桥，不该让宿主挂掉（`src/index.ts:1-8,52-83`）。
+- **不 import 任何 DSH 包**：`link:` 装的第三方包解析不到 `@deepseek-ai/cordis`（它只在 `app.asar` 里），宿主能力一律 duck-typed 探测，缺服务是「那个方法拒绝」而不是加载期崩溃（`src/runtime.ts:1-8`）。
+
+### 11.6 安装 / 卸载（都要重启 DSH）
+
+```bash
+node packages/dsh-plugin/scripts/build.mjs          # dist/ 不入库，先构建
+dsh plugin --profile desktop add "link:$PWD/packages/dsh-plugin"
+# 再把 "@farwork/dsh-bridge" 写进 ~/.dsh/profiles/desktop/package.json 的 dsh.profile.bundles
+# （dsh plugin add 只装包；bundles 列表由 Desktop 插件管理器或手改写入）
+# 完全退出 DSH 再启动（不要在有 live session 时做）
+cat ~/.farwork/dsh-bridge/endpoint.json             # 验证 rendezvous 文件
+```
+
+agent 侧（**注意 `--dsh-endpoint`**，理由见 11.2）：
+
+```bash
+cargo run -p farwork-agent -- --runtime dsh --token '<connectorToken>' \
+  --workdir /srv/work --dsh-endpoint ~/.farwork/dsh-bridge/endpoint.json
+```
+
+卸载：`dsh plugin --profile desktop remove @farwork/dsh-bridge` → 从 `dsh.profile.bundles` 删掉 `"@farwork/dsh-bridge"` → `rm -rf ~/.farwork/dsh-bridge` → 重启 DSH。插件正常关闭时也会自己收尾：只有当 `endpoint.json` 里的 token+pid 仍是自己才 unpublish（`endpoint.ts:90-127`），锁在 `close()` 里比对 token+pid+port 之后才 unlink（`endpoint.ts:231-242`）。
+
+构建与自测（**本轮没有跑**）：`node scripts/build.mjs`（用 Node 自带的 `stripTypeScriptTypes`，**零构建依赖**——链接安装时 DSH 只做一次裸 `import()`）、`node --test dist/__tests__/*.test.js`、`node scripts/selftest-bridge.mjs`（假 ctx + 真 TCP + `mkdtemp` 的 endpoint 目录；不碰 `~/.dsh`、`~/.farwork`、62082 端口或正在跑的 DSH）。
 
 ## 附录 A · M1 遗留：终端线协议
 

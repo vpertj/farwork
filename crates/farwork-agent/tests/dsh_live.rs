@@ -22,7 +22,7 @@ use farwork_agent::dsh::selections;
 async fn initialize_and_list_against_a_real_bridge() {
     let env = |key: &str| std::env::var(key).ok();
     let endpoint = match discovery::resolve(None, &env) {
-        Ok(endpoint) => endpoint,
+        Ok(located) => located.endpoint,
         Err(error) => {
             println!("PROBE SKIP: no DSH bridge endpoint ({error})");
             return;
@@ -104,7 +104,7 @@ async fn initialize_and_list_against_a_real_bridge() {
 async fn read_only_permission_resolves_to_a_real_selection_id() {
     let env = |key: &str| std::env::var(key).ok();
     let endpoint = match discovery::resolve(None, &env) {
-        Ok(endpoint) => endpoint,
+        Ok(located) => located.endpoint,
         Err(error) => {
             println!("PROBE SKIP: no DSH bridge endpoint ({error})");
             return;
@@ -183,7 +183,7 @@ async fn read_only_permission_resolves_to_a_real_selection_id() {
 async fn agent_presets_resolve_to_real_selection_ids() {
     let env = |key: &str| std::env::var(key).ok();
     let endpoint = match discovery::resolve(None, &env) {
-        Ok(endpoint) => endpoint,
+        Ok(located) => located.endpoint,
         Err(error) => {
             println!("PROBE SKIP: no DSH bridge endpoint ({error})");
             return;
@@ -305,7 +305,7 @@ async fn subscribe_only() {
 
     let env = |key: &str| std::env::var(key).ok();
     let endpoint = match discovery::resolve(None, &env) {
-        Ok(endpoint) => endpoint,
+        Ok(located) => located.endpoint,
         Err(error) => {
             println!("PROBE SKIP: no DSH bridge endpoint ({error})");
             return;
