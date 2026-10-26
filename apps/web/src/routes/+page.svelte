@@ -7,6 +7,7 @@
 	import WorkspaceShell from '../components/WorkspaceShell.svelte';
 	import TaskHome from '../components/TaskHome.svelte';
 	import SessionView from '../components/SessionView.svelte';
+	import NewSessionPage from '../components/NewSessionPage.svelte';
 	import PlaceholderPage from '../components/PlaceholderPage.svelte';
 
 	let hash = $state('#/');
@@ -71,10 +72,7 @@
 				description="设备页需要设备运行时列表、终端与文件浏览，属于后续切片。"
 			/>
 		{:else if route.page === 'new-session'}
-			<PlaceholderPage
-				title={`新建会话 · 项目 ${route.projectId}`}
-				description="创建会话需要 agent、模型目录与运行时选择，属于后续切片。"
-			/>
+			<NewSessionPage projectId={route.projectId} {token} />
 		{/if}
 	</WorkspaceShell>
 {/if}

@@ -2,25 +2,46 @@ import {
 	createSessionWsTicket,
 	fetchEvents,
 	fetchSnapshot,
+	interruptSession,
+	respondNotice,
 	sendSessionMessage,
 	sessionSocketUrl
 } from './api/workspace';
 import {
-	asArray,
 	asString,
 	cursorToSeq,
+	isOpenNotice,
 	parseEvent,
+	parseNotice,
+	parseNotices,
 	parseRuntimeState,
 	parseSession,
 	parseTimelineItem,
 	parseTimelineItems,
+	type NoticeDecision,
+	type RuntimeNotice,
 	type RuntimeState,
 	type Session,
 	type SessionEvent,
 	type TimelineItem
 } from './api/types';
 import { describeError } from './format';
+import { noticeItemId } from './notice';
 import { isVisibleItem, sortItems } from './timeline';
+
+export type NoticeAction = {
+	pending: boolean;
+	submitted: NoticeDecision | null;
+	error: string | null;
+	lastDecision: NoticeDecision | null;
+};
+
+const EMPTY_ACTION: NoticeAction = {
+	pending: false,
+	submitted: null,
+	error: null,
+	lastDecision: null
+};
 
 export type ConnectionState = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed';
 
@@ -45,7 +66,13 @@ export class SessionController {
 	loading = $state(true);
 	error = $state<string | null>(null);
 	approvalCount = $state(0);
-	noticeCount = $state(0);
+	notices = $state<RuntimeNotice[]>([]);
+	/** Notices the runtime closed while this page was open; those stay on screen, greyed. */
+	resolvedWhileOpen = $state<string[]>([]);
+	noticeActions = $state<Record<string, NoticeAction>>({});
+	interrupting = $state(false);
+	interruptStream = $state<string | null>(null);
+	interruptError = $state<string | null>(null);
 	lastEventAt = $state<number | null>(null);
 	snapshotCount = $state(0);
 
@@ -61,6 +88,36 @@ export class SessionController {
 		return this.items.filter(isVisibleItem);
 	}
 
+	/** Notices the runtime has not closed yet — the only ones that can be answered. */
+	get openNotices(): RuntimeNotice[] {
+		return this.notices.filter(isOpenNotice);
+	}
+
+	/** Open notices plus the ones this page watched get resolved. */
+	get approvalNotices(): RuntimeNotice[] {
+		const watched = new Set(this.resolvedWhileOpen);
+		return this.notices.filter((notice) => isOpenNotice(notice) || watched.has(notice.id));
+	}
+
+	/**
+	 * Items the runtime parked on `waiting_approval` with no notice to answer.
+	 * Shown as a read-only card rather than buttons that would have nothing to POST.
+	 */
+	get pendingApprovalItems(): TimelineItem[] {
+		const covered = new Set(
+			this.openNotices
+				.map(noticeItemId)
+				.filter((value): value is string => value !== null)
+		);
+		return this.items.filter(
+			(item) => item.status === 'waiting_approval' && !covered.has(item.id)
+		);
+	}
+
+	noticeAction(noticeId: string): NoticeAction {
+		return this.noticeActions[noticeId] ?? EMPTY_ACTION;
+	}
+
 	async open(sessionId: string, token: string): Promise<void> {
 		this.dispose();
 		this.#disposed = false;
@@ -72,6 +129,12 @@ export class SessionController {
 		this.error = null;
 		this.items = [];
 		this.optimistic = [];
+		this.notices = [];
+		this.resolvedWhileOpen = [];
+		this.noticeActions = {};
+		this.interrupting = false;
+		this.interruptStream = null;
+		this.interruptError = null;
 		this.session = null;
 		this.runtimeState = null;
 		this.connection = 'idle';
@@ -112,7 +175,7 @@ export class SessionController {
 		this.runtimeState = snapshot.state;
 		this.items = sortItems(snapshot.items);
 		this.approvalCount = snapshot.approvalCount;
-		this.noticeCount = snapshot.noticeCount;
+		this.notices = snapshot.notices;
 		this.snapshotCount += 1;
 		const cursor = cursorToSeq(snapshot.eventCursor) ?? snapshot.nextSeq;
 		this.cursorSeq = Math.max(this.cursorSeq, cursor);
@@ -143,6 +206,70 @@ export class SessionController {
 			);
 			return false;
 		}
+	}
+
+	/**
+	 * Send the decision to the hub. The card must not flip to "approved" here: the
+	 * hub keeps the notice open until the connector confirms with
+	 * `notice.resolved`, which arrives as a `runtime.notice.updated` delta.
+	 */
+	async respond(noticeId: string, decision: NoticeDecision): Promise<void> {
+		if (this.noticeAction(noticeId).pending) return;
+		this.setNoticeAction(noticeId, {
+			pending: true,
+			submitted: null,
+			error: null,
+			lastDecision: decision
+		});
+		try {
+			await respondNotice(this.#token, this.sessionId, noticeId, decision);
+			this.setNoticeAction(noticeId, {
+				pending: false,
+				submitted: decision,
+				error: null,
+				lastDecision: decision
+			});
+		} catch (error) {
+			this.setNoticeAction(noticeId, {
+				pending: false,
+				submitted: null,
+				error: describeError(error),
+				lastDecision: decision
+			});
+		}
+	}
+
+	/** The session status only changes when the runtime reports it over WS. */
+	async interrupt(): Promise<void> {
+		if (this.interrupting) return;
+		this.interrupting = true;
+		this.interruptError = null;
+		this.interruptStream = null;
+		try {
+			this.interruptStream = await interruptSession(this.#token, this.sessionId);
+		} catch (error) {
+			this.interruptError = describeError(error);
+		} finally {
+			this.interrupting = false;
+		}
+	}
+
+	setNoticeAction(noticeId: string, action: NoticeAction): void {
+		this.noticeActions = { ...this.noticeActions, [noticeId]: action };
+	}
+
+	private upsertNotice(notice: RuntimeNotice): void {
+		const next = [...this.notices];
+		const index = next.findIndex((existing) => existing.id === notice.id);
+		const wasOpen = index >= 0 && isOpenNotice(next[index]);
+		if (index >= 0) next[index] = notice;
+		else next.push(notice);
+		if (wasOpen && !isOpenNotice(notice) && !this.resolvedWhileOpen.includes(notice.id)) {
+			this.resolvedWhileOpen = [...this.resolvedWhileOpen, notice.id];
+		}
+		this.notices = next.sort(
+			(a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)
+		);
 	}
 
 	discardOptimistic(clientMessageId: string): void {
@@ -240,11 +367,12 @@ export class SessionController {
 				break;
 			}
 			case 'runtime.notice.snapshot': {
-				this.noticeCount = asArray(event.payload.notices).length;
+				this.notices = parseNotices(event.payload.notices);
 				break;
 			}
 			case 'runtime.notice.updated': {
-				this.noticeCount += 1;
+				const notice = parseNotice(event.payload.notice);
+				if (notice) this.upsertNotice(notice);
 				break;
 			}
 			case 'session.subscribed': {

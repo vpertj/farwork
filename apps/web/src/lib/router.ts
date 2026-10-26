@@ -5,7 +5,7 @@ export type Route =
 	| { page: 'session'; sessionId: string }
 	| { page: 'settings'; tab: string }
 	| { page: 'device'; connectorId: string }
-	| { page: 'new-session'; projectId: string };
+	| { page: 'new-session'; projectId: string | null };
 
 export function parseHash(hash: string): Route {
 	const path = (hash.replace(/^#\/?/, '').split('?')[0] ?? '').trim();
@@ -24,7 +24,10 @@ export function parseHash(hash: string): Route {
 		case 'device':
 			return parts[1] ? { page: 'device', connectorId: decodeURIComponent(parts[1]) } : { page: 'home' };
 		case 'new-session':
-			return parts[1] ? { page: 'new-session', projectId: decodeURIComponent(parts[1]) } : { page: 'home' };
+			return {
+				page: 'new-session',
+				projectId: parts[1] ? decodeURIComponent(parts[1]) : null
+			};
 		default:
 			return { page: 'home' };
 	}
@@ -45,7 +48,9 @@ export function hrefFor(route: Route): string {
 		case 'device':
 			return `#/device/${encodeURIComponent(route.connectorId)}`;
 		case 'new-session':
-			return `#/new-session/${encodeURIComponent(route.projectId)}`;
+			return route.projectId
+				? `#/new-session/${encodeURIComponent(route.projectId)}`
+				: '#/new-session';
 	}
 }
 

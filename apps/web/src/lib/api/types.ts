@@ -193,6 +193,70 @@ export function parseRuntimeState(value: unknown): RuntimeState | null {
 	};
 }
 
+export type NoticeDecision = 'approve' | 'approve_for_session' | 'reject';
+
+export const NOTICE_DECISIONS: readonly NoticeDecision[] = ['approve', 'approve_for_session', 'reject'];
+
+export type RuntimeNotice = {
+	id: string;
+	kind: string;
+	status: string;
+	title: string;
+	body: Record<string, unknown> | null;
+	options: string[];
+	decision: string | null;
+	createdAt: string;
+	updatedAt: string;
+};
+
+export function parseNotice(value: unknown): RuntimeNotice | null {
+	const raw = asRecord(value);
+	if (!raw) return null;
+	const id = asString(raw.id);
+	if (!id) return null;
+	return {
+		id,
+		kind: asString(raw.kind, 'unknown'),
+		status: asString(raw.status, 'open'),
+		title: asString(raw.title),
+		body: asRecord(raw.body),
+		options: asArray(raw.options).filter((option): option is string => typeof option === 'string'),
+		decision: asNullableString(raw.decision),
+		createdAt: asString(raw.createdAt),
+		updatedAt: asString(raw.updatedAt)
+	};
+}
+
+export function parseNotices(value: unknown): RuntimeNotice[] {
+	return parseList(value, 'notices', parseNotice);
+}
+
+export function isOpenNotice(notice: RuntimeNotice): boolean {
+	return notice.status !== 'resolved';
+}
+
+export function isNoticeDecision(value: string): value is NoticeDecision {
+	return NOTICE_DECISIONS.includes(value as NoticeDecision);
+}
+
+export type ConnectorResult = {
+	ok: boolean;
+	code: string | null;
+	streamId: string | null;
+	sessionId: string | null;
+};
+
+export function parseConnectorResult(value: unknown): ConnectorResult | null {
+	const raw = asRecord(value);
+	if (!raw) return null;
+	return {
+		ok: asBoolean(raw.ok),
+		code: asNullableString(raw.code),
+		streamId: asNullableString(raw.streamId),
+		sessionId: asNullableString(raw.sessionId)
+	};
+}
+
 export type TimelineItemType = 'message' | 'tool' | 'artifact' | 'marker' | 'system';
 export type TimelineItemStatus =
 	| 'pending'
@@ -293,7 +357,7 @@ export type SessionSnapshot = {
 	eventCursor: string;
 	serverTime: string;
 	approvalCount: number;
-	noticeCount: number;
+	notices: RuntimeNotice[];
 };
 
 export function parseSnapshot(value: unknown): SessionSnapshot | null {
@@ -311,7 +375,7 @@ export function parseSnapshot(value: unknown): SessionSnapshot | null {
 		eventCursor: asString(raw.eventCursor),
 		serverTime: asString(raw.serverTime),
 		approvalCount: asArray(raw.approvals).length,
-		noticeCount: asArray(raw.notices).length
+		notices: parseNotices(raw.notices)
 	};
 }
 
@@ -355,6 +419,19 @@ export function parseRecovery(value: unknown): EventRecovery {
 		nextCursor: asString(raw.nextCursor),
 		snapshotRequired: asBoolean(raw.snapshotRequired)
 	};
+}
+
+export type CreateAndStartResult = {
+	session: Session;
+	connectorResult: ConnectorResult | null;
+};
+
+export function parseCreateAndStart(value: unknown): CreateAndStartResult | null {
+	const raw = asRecord(value);
+	if (!raw) return null;
+	const session = parseSession(raw.session);
+	if (!session) return null;
+	return { session, connectorResult: parseConnectorResult(raw.connectorResult) };
 }
 
 export function cursorToSeq(cursor: string | null | undefined): number | null {

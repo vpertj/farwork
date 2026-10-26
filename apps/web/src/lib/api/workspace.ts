@@ -4,14 +4,20 @@ import {
 	asString,
 	cursorToSeq,
 	parseConnectors,
+	parseCreateAndStart,
+	parseNotice,
+	parseNotices,
 	parseProjects,
 	parseRecovery,
 	parseSessions,
 	parseSnapshot,
 	seqToCursor,
 	type Connector,
+	type CreateAndStartResult,
 	type EventRecovery,
+	type NoticeDecision,
 	type Project,
+	type RuntimeNotice,
 	type Session,
 	type SessionSnapshot
 } from './types';
@@ -80,6 +86,56 @@ export async function sendSessionMessage(
 		token,
 		body: { content, clientMessageId: messageClientId }
 	});
+}
+
+export async function listNotices(token: string, sessionId: string): Promise<RuntimeNotice[]> {
+	const payload = await apiRequest(`/sessions/${encodeURIComponent(sessionId)}/runtime/notices`, {
+		token
+	});
+	return parseNotices(payload);
+}
+
+export async function respondNotice(
+	token: string,
+	sessionId: string,
+	noticeId: string,
+	decision: NoticeDecision
+): Promise<RuntimeNotice | null> {
+	const payload = await apiRequest(
+		`/sessions/${encodeURIComponent(sessionId)}/notices/${encodeURIComponent(noticeId)}/respond`,
+		{ method: 'POST', token, body: { decision } }
+	);
+	return parseNotice(asRecord(payload)?.notice);
+}
+
+export async function interruptSession(token: string, sessionId: string): Promise<string | null> {
+	const payload = await apiRequest(`/sessions/${encodeURIComponent(sessionId)}/runtime/interrupt`, {
+		method: 'POST',
+		token
+	});
+	return asString(asRecord(payload)?.streamId) || null;
+}
+
+export type CreateAndStartInput = {
+	connectorId: string;
+	projectId: string;
+	runtime: string;
+	content: string;
+	clientMessageId: string;
+};
+
+export async function createAndStartSession(
+	token: string,
+	input: CreateAndStartInput
+): Promise<CreateAndStartResult> {
+	const payload = await apiRequest('/sessions/create-and-start', {
+		method: 'POST',
+		token,
+		body: input
+	});
+	const result = parseCreateAndStart(payload);
+	if (!result) throw new Error('创建会话的响应格式无法识别。');
+	return result;
 }
 
 export { cursorToSeq, seqToCursor };

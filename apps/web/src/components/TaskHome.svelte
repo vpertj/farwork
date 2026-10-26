@@ -19,8 +19,9 @@
 	<header>
 		<div>
 			<h1>任务台</h1>
-			<p>按设备查看项目与会话；点开会话即可对话、查看时间线。</p>
+			<p>按设备查看项目与会话；点开会话即可对话、查看时间线，或在新建会话页下发首条指令。</p>
 		</div>
+		<a class="btn" data-variant="primary" href="#/new-session">新建会话</a>
 	</header>
 
 	<div class="stats">
@@ -46,7 +47,7 @@
 		{#if recent.length === 0}
 			<div class="empty">
 				<p>还没有任何会话。</p>
-				<p>上游侧创建会话后，这里会自动出现。</p>
+				<p><a class="link" href="#/new-session">新建会话</a>，或等上游侧创建后自动出现在这里。</p>
 			</div>
 		{:else}
 			<ul>
@@ -81,6 +82,19 @@
 		flex-direction: column;
 		gap: 22px;
 		padding: 28px 32px;
+	}
+
+	header {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 16px;
+	}
+
+	.link {
+		color: var(--info);
+		text-decoration: underline;
+		text-underline-offset: 2px;
 	}
 
 	header h1 {

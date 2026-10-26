@@ -1,7 +1,13 @@
 <script lang="ts">
 	import { SessionController } from '$lib/session.svelte';
 	import { formatClock } from '$lib/format';
-	import { runtimeLabel, sessionStatusLabel, sessionStatusTone } from '$lib/timeline';
+	import {
+		itemHeadline,
+		runtimeLabel,
+		sessionStatusLabel,
+		sessionStatusTone
+	} from '$lib/timeline';
+	import ApprovalCard from './ApprovalCard.svelte';
 	import TimelineEntry from './TimelineEntry.svelte';
 
 	let { sessionId, token }: { sessionId: string; token: string } = $props();
@@ -13,6 +19,10 @@
 
 	const session = $derived(controller.session);
 	const status = $derived(controller.runtimeState?.status ?? session?.status ?? 'idle');
+	const canInterrupt = $derived(status === 'running' || status === 'waiting_approval');
+	const showApprovals = $derived(
+		controller.approvalNotices.length > 0 || controller.pendingApprovalItems.length > 0
+	);
 
 	const connectionLabel = $derived(
 		controller.connection === 'open'
@@ -89,19 +99,66 @@
 			</div>
 		</div>
 		<div class="badges">
-			{#if controller.approvalCount > 0}
-				<span class="badge" data-tone="warn">待审批 {controller.approvalCount}</span>
+			{#if status === 'waiting_approval'}
+				<span class="badge status-alert" data-tone="warn" role="status">等待审批 · 需要你决定</span>
+			{:else if controller.openNotices.length > 0}
+				<span class="badge" data-tone="warn">待审批 {controller.openNotices.length}</span>
 			{/if}
 			<span class="badge" data-tone={sessionStatusTone(status)}>
 				<span class="dot"></span>
 				{sessionStatusLabel(status)}
 			</span>
 			<span class="badge" data-tone={connectionTone}>{connectionLabel}</span>
+			{#if canInterrupt}
+				<button
+					class="btn"
+					type="button"
+					disabled={controller.interrupting}
+					onclick={() => void controller.interrupt()}
+				>
+					{controller.interrupting ? '中断中…' : '中断当前回合'}
+				</button>
+			{/if}
 		</div>
 	</header>
 
 	{#if controller.error}
 		<p class="alert banner">{controller.error}</p>
+	{/if}
+
+	{#if controller.runtimeState?.statusReason}
+		<p class="banner notice-line">状态原因：{controller.runtimeState.statusReason}</p>
+	{/if}
+
+	{#if controller.interruptError}
+		<p class="alert banner" role="alert">中断未下发：{controller.interruptError}</p>
+	{:else if controller.interruptStream && canInterrupt}
+		<p class="banner notice-line">
+			中断指令已下发（stream <code class="mono">{controller.interruptStream}</code>），等待运行时回推状态更新。
+		</p>
+	{/if}
+
+	{#if showApprovals}
+		<section class="approvals" aria-label="审批请求">
+			{#each controller.approvalNotices as notice (notice.id)}
+				<ApprovalCard
+					{notice}
+					action={controller.noticeAction(notice.id)}
+					onRespond={(decision) => void controller.respond(notice.id, decision)}
+				/>
+			{/each}
+			{#each controller.pendingApprovalItems as item (item.id)}
+				<article class="approval pending-item" data-item-id={item.id}>
+					<div class="pending-head">
+						<span class="badge" data-tone="warn">等待审批</span>
+						<span class="pending-title">{itemHeadline(item)}</span>
+					</div>
+					<p class="pending-hint">
+						时间线条目 <code class="mono">{item.id}</code> 处于等待审批，但 hub 尚未下发对应的审批详情（notice），因此这里没有可提交的决定。
+					</p>
+				</article>
+			{/each}
+		</section>
 	{/if}
 
 	<div class="timeline" bind:this={scroller} onscroll={handleScroll}>
@@ -235,6 +292,61 @@
 
 	.banner {
 		margin: 12px 20px 0;
+	}
+
+	.notice-line {
+		padding: 8px 12px;
+		border-radius: var(--radius-md);
+		border: 1px solid color-mix(in oklch, var(--info) 40%, transparent);
+		background: color-mix(in oklch, var(--info) 10%, transparent);
+		color: oklch(0.9 0.03 240);
+		font-size: 12px;
+	}
+
+	.status-alert {
+		font-weight: 700;
+		box-shadow: 0 0 0 3px color-mix(in oklch, var(--warn) 22%, transparent);
+	}
+
+	.approvals {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		padding: 12px 20px 4px;
+		max-height: 42vh;
+		overflow-y: auto;
+		border-bottom: 1px solid var(--border);
+	}
+
+	.pending-item {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		padding: 10px 12px;
+		border-radius: var(--radius-md);
+		border: 1px dashed color-mix(in oklch, var(--warn) 40%, transparent);
+		background: color-mix(in oklch, var(--warn) 6%, transparent);
+	}
+
+	.pending-head {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		min-width: 0;
+	}
+
+	.pending-title {
+		font-size: 12.5px;
+		font-weight: 500;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.pending-hint {
+		font-size: 11px;
+		color: var(--muted-foreground);
+		line-height: 1.6;
 	}
 
 	.timeline {
