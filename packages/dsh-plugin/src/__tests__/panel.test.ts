@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 
 import { Bridge } from '../bridge.js'
@@ -14,6 +17,16 @@ const PACKAGE_VERSION = (JSON.parse(
 ) as { version: string }).version
 
 const ENDPOINT = '/tmp/farwork-panel-test/endpoint.json'
+
+/**
+ * A fresh endpoint directory per installation.
+ *
+ * panel.json outlives the process on purpose, so two installations sharing one
+ * directory would leak the first test's hub into the next one's startup read.
+ */
+function freshEndpoint(): string {
+  return join(mkdtempSync(join(tmpdir(), 'farwork-panel-')), 'endpoint.json')
+}
 const STATUS: BridgeStatus = { ready: true, port: 7501, endpointPath: ENDPOINT, pid: 4242, lastError: null }
 
 function fakeBridge(overrides: Partial<BridgeStatus> = {}): PanelBridge {
@@ -204,11 +217,17 @@ function injectHost(returned?: unknown): {
   return { ctx, injects }
 }
 
-function install(bridge: PanelBridge) {
+function install(bridge: PanelBridge, endpointFile: string = freshEndpoint()) {
   const { ctx, registrations } = fakeConnection()
-  const registration = installPanel({ ctx, bridge, logger: NO_LOGGER() })
+  const scoped: PanelBridge = {
+    get status(): BridgeStatus {
+      return bridge.status
+    },
+    endpointFile,
+  }
+  const registration = installPanel({ ctx, bridge: scoped, logger: NO_LOGGER() })
   assert.equal(registrations.length, 1)
-  return { handler: registrations[0]!.handler, registration, registrations }
+  return { handler: registrations[0]!.handler, registration, registrations, endpointFile }
 }
 
 function valueOf(reply: PanelReply): Record<string, unknown> {
@@ -223,7 +242,7 @@ test('the panel registers exactly one channel and it is not /api', () => {
   assert.equal(registrations[0]!.channel, '/farwork')
 })
 
-test('status reports the six panel fields and leaks no endpoint token', async () => {
+test('status reports the seven panel fields and leaks no endpoint token', async () => {
   const leaking = { ...STATUS, token: 'endpoint-token-must-not-leak' } as unknown as BridgeStatus
   const { handler } = install({ endpointFile: ENDPOINT, get status() { return leaking } })
 
@@ -235,6 +254,7 @@ test('status reports the six panel fields and leaks no endpoint token', async ()
     pid: 4242,
     lastError: null,
     version: PACKAGE_VERSION,
+    hub: null,
   })
   assert.equal(JSON.stringify(value).includes('endpoint-token-must-not-leak'), false)
 })
@@ -250,29 +270,41 @@ test('a bridge that failed to start still explains itself through status', async
 })
 
 test('command quotes the endpoint path and keeps a placeholder until a token is known', async () => {
-  const { handler } = install(fakeBridge())
+  const { handler, endpointFile } = install(fakeBridge())
   const value = valueOf(await handler('command', {}))
-  assert.equal(value.command, "farwork-agent --token '<connectorToken>' --runtime dsh --dsh-endpoint '" + ENDPOINT + "'")
+  assert.equal(
+    value.command,
+    "farwork-agent --token '<connectorToken>' --runtime dsh --dsh-endpoint '" + endpointFile + "'",
+  )
 })
 
 test('a pasted token is used for one command and is not persisted by reading it', async () => {
-  const { handler } = install(fakeBridge())
+  const { handler, endpointFile } = install(fakeBridge())
   const pasted = valueOf(await handler('command', { connectorToken: 'ct_pasted' }))
-  assert.equal(pasted.command, "farwork-agent --token 'ct_pasted' --runtime dsh --dsh-endpoint '" + ENDPOINT + "'")
+  assert.equal(
+    pasted.command,
+    "farwork-agent --token 'ct_pasted' --runtime dsh --dsh-endpoint '" + endpointFile + "'",
+  )
 
   const again = valueOf(await handler('command', {}))
-  assert.equal(again.command, "farwork-agent --token '<connectorToken>' --runtime dsh --dsh-endpoint '" + ENDPOINT + "'")
+  assert.equal(
+    again.command,
+    "farwork-agent --token '<connectorToken>' --runtime dsh --dsh-endpoint '" + endpointFile + "'",
+  )
 })
 
 test('savePair remembers the token so a later command uses it, without echoing it', async () => {
-  const { handler } = install(fakeBridge())
+  const { handler, endpointFile } = install(fakeBridge())
   const saved = await handler('savePair', { connectorToken: 'ct_saved', hub: 'https://hub.example.test' })
   const value = valueOf(saved)
   assert.deepEqual(value, { accepted: true, hasToken: true, hub: 'https://hub.example.test' })
   assert.equal(JSON.stringify(value).includes('ct_saved'), false)
 
   const command = valueOf(await handler('command', {}))
-  assert.equal(command.command, "farwork-agent --token 'ct_saved' --runtime dsh --dsh-endpoint '" + ENDPOINT + "'")
+  assert.equal(
+    command.command,
+    "farwork-agent --token 'ct_saved' --runtime dsh --dsh-endpoint '" + endpointFile + "'",
+  )
 })
 
 test('savePair refuses a hub that is not a url and a token that is not a string', async () => {
@@ -284,6 +316,127 @@ test('savePair refuses a hub that is not a url and a token that is not a string'
   const badToken = await handler('savePair', { connectorToken: 42 })
   assert.equal(badToken.ok, false)
   assert.equal(badToken.ok === false ? badToken.error.code : '', 'farwork/invalid_token')
+})
+
+test('status echoes the saved hub but never the saved token', async () => {
+  const { handler } = install(fakeBridge())
+  assert.equal(valueOf(await handler('status', {})).hub, null)
+
+  valueOf(await handler('savePair', { connectorToken: 'ct_keep_secret', hub: 'https://hub.example.test/' }))
+
+  // A browser that reopens the panel reads both back from status: the hub is a
+  // public URL, the token is a credential and stays host-side.
+  const value = valueOf(await handler('status', {}))
+  assert.equal(value.hub, 'https://hub.example.test/')
+  assert.equal(JSON.stringify(value).includes('ct_keep_secret'), false)
+  assert.equal(value.hasToken, undefined)
+})
+
+test('a refused hub keeps the previously saved hub', async () => {
+  const { handler } = install(fakeBridge())
+  valueOf(await handler('savePair', { hub: 'https://hub.example.test' }))
+
+  const refused = await handler('savePair', { hub: 'ftp://hub.example.test' })
+  assert.equal(refused.ok, false)
+  assert.equal(refused.ok === false ? refused.error.code : '', 'farwork/invalid_hub')
+  assert.match(refused.ok === false ? refused.error.message : '', /http\(s\):\/\/|ws\(s\):\/\//)
+  assert.equal(valueOf(await handler('status', {})).hub, 'https://hub.example.test')
+})
+
+test('a pairing code is refused as a pairing code, not stored as a token', async () => {
+  const { handler } = install(fakeBridge())
+
+  for (const code of ['AB3D-EFGH', 'ab3d-efgh']) {
+    const refused = await handler('savePair', { connectorToken: code })
+    assert.equal(refused.ok, false)
+    assert.equal(refused.ok === false ? refused.error.code : '', 'farwork/pairing_code')
+    const message = refused.ok === false ? refused.error.message : ''
+    // The reason has to name the actual fix: mint a device in the Web console.
+    assert.match(message, /配对码/)
+    assert.match(message, /Web 控制台/)
+    assert.match(message, /connectorToken/)
+  }
+
+  // Nothing was stored: the command still shows the placeholder, which is the only
+  // honest state after a refused save.
+  const command = valueOf(await handler('command', {}))
+  assert.match(command.command, /'<connectorToken>'/)
+})
+
+test('a token that is not a pairing code shape is still accepted', async () => {
+  const { handler } = install(fakeBridge())
+  const saved = await handler('savePair', { connectorToken: 'cxt_0123456789abcdef' })
+  assert.equal(valueOf(saved).hasToken, true)
+})
+
+test('savePair writes the hub to panel.json beside the endpoint and a restart reads it back', async () => {
+  const endpointFile = freshEndpoint()
+  const first = install(fakeBridge(), endpointFile)
+  valueOf(await first.handler('savePair', { hub: 'https://hub.example.test' }))
+
+  const file = join(dirname(endpointFile), 'panel.json')
+  assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), { version: 1, hub: 'https://hub.example.test' })
+  assert.equal((await stat(file)).mode & 0o777, 0o600, 'panel.json must be private')
+  assert.equal((await stat(dirname(file))).mode & 0o777, 0o700, 'its directory must be private')
+  // Nothing about the hub touches endpoint.json: that file is the agent's
+  // discovery contract and keeps exactly the keys it documents.
+  await assert.rejects(readFile(endpointFile, 'utf8'))
+
+  // A second installation of the panel is what a DSH restart looks like from here.
+  const restarted = install(fakeBridge(), endpointFile)
+  assert.equal(valueOf(await restarted.handler('status', {})).hub, 'https://hub.example.test')
+})
+
+test('the panel file holds the hub and never the connector token', async () => {
+  const endpointFile = freshEndpoint()
+  const { handler } = install(fakeBridge(), endpointFile)
+  valueOf(
+    await handler('savePair', { connectorToken: 'ct_must_not_land_on_disk', hub: 'https://hub.example.test' }),
+  )
+
+  const raw = await readFile(join(dirname(endpointFile), 'panel.json'), 'utf8')
+  assert.equal(raw.includes('ct_must_not_land_on_disk'), false, 'a credential must never be written: ' + raw)
+  assert.deepEqual(JSON.parse(raw), { version: 1, hub: 'https://hub.example.test' })
+  // The token still works for this process, it just is not persisted.
+  assert.match(valueOf(await handler('command', {})).command, /ct_must_not_land_on_disk/)
+})
+
+test('a corrupt panel file reads as unconfigured and never stops the panel', async () => {
+  const cases = [
+    'not json at all',
+    '{"version":1,"hub":42}',
+    '{"version":2,"hub":"https://hub.example.test"}',
+    '{"version":1,"hub":"   "}',
+    '{"version":1,"hub":"ftp://hub.example.test"}',
+    '[]',
+  ]
+  for (const contents of cases) {
+    const endpointFile = freshEndpoint()
+    await writeFile(join(dirname(endpointFile), 'panel.json'), contents, 'utf8')
+    // Installing must not throw on any of them.
+    const { handler } = install(fakeBridge(), endpointFile)
+    assert.equal(valueOf(await handler('status', {})).hub, null, 'unexpected hub for: ' + contents)
+    // A bad file is not a broken save: a good hub is still accepted afterwards.
+    assert.equal(valueOf(await handler('savePair', { hub: 'https://hub.new.test' })).hub, 'https://hub.new.test')
+  }
+})
+
+test('a hub that cannot be written is reported as a failure, not as saved', async () => {
+  const endpointFile = freshEndpoint()
+  const file = join(dirname(endpointFile), 'panel.json')
+  // A directory where the record belongs makes the atomic rename fail, which is
+  // what a read-only or full disk presents to the writer.
+  await mkdir(file)
+  const { handler } = install(fakeBridge(), endpointFile)
+
+  const reply = await handler('savePair', { hub: 'https://hub.example.test' })
+  assert.equal(reply.ok, false)
+  assert.equal(reply.ok === false ? reply.error.code : '', 'farwork/hub_not_saved')
+  const message = reply.ok === false ? reply.error.message : ''
+  assert.match(message, /hub/)
+  assert.match(message, /panel\.json/)
+  // Not applied in memory either: nothing may look saved that is not on disk.
+  assert.equal(valueOf(await handler('status', {})).hub, null)
 })
 
 test('an unknown endpoint is refused with a readable code instead of throwing', async () => {

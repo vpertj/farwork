@@ -13,9 +13,11 @@
 // second interceptor on it would be a collision, not a convention.
 
 import { readFileSync } from 'node:fs'
+import { dirname } from 'node:path'
 
 import type { BridgeStatus } from './bridge.js'
 import type { Logger } from './logger.js'
+import { panelPath, readPanelHub, writePanelHub } from './panel-store.js'
 import { errorMessage, isRecord } from './values.js'
 
 export const PANEL_CHANNEL = '/farwork'
@@ -51,9 +53,46 @@ export interface PanelRegistration {
   dispose(): void
 }
 
+/**
+ * What the panel remembers inside this process.
+ *
+ * The hub is also written to panel.json so it survives a restart; the connector
+ * token is not, and must never be added to that record.
+ */
 interface PairState {
   connectorToken: string | null
   hub: string | null
+  /** Where the hub is remembered; null keeps it in memory only. */
+  readonly hubFile: string | null
+  /**
+   * Settles once the startup read has finished, so a request that arrives first
+   * cannot report "no hub" for a hub that is already on disk. Never rejects.
+   */
+  loaded: Promise<void>
+}
+
+/**
+ * Seed the panel state and start reading the remembered hub.
+ *
+ * The read is asynchronous but must not gate installation: the panel has to be
+ * serving while the bridge is still failing, so the promise is settled here and
+ * awaited per request instead.
+ */
+export function createPairState(hubFile: string | null, logger: Logger): PairState {
+  const state: PairState = { connectorToken: null, hub: null, hubFile, loaded: Promise.resolve() }
+  if (hubFile === null) return state
+  state.loaded = readPanelHub(hubFile).then((hub) => {
+    // A hub saved through the panel while this read was in flight is newer than
+    // the file, so the file only fills the gap.
+    if (hub === null || state.hub !== null) return
+    if (hub.length > MAX_HUB_LENGTH || !isHubUrl(hub)) {
+      logger.warn('the remembered hub in ' + hubFile + ' is not a usable hub url; treating it as unset')
+      return
+    }
+    state.hub = hub
+    logger.debug('restored the remembered Farwork hub', { file: hubFile })
+  })
+  return state
 }
 
 const MAX_TOKEN_LENGTH = 1024
@@ -93,7 +132,9 @@ const NO_CONNECTION_WARN =
  */
 export function installPanel(options: PanelOptions): PanelRegistration {
   const logger = options.logger
-  const state: PairState = { connectorToken: null, hub: null }
+  // panel.json lives next to endpoint.json, never inside it: that file is the
+  // agent's discovery contract and must keep exactly the keys it documents.
+  const state = createPairState(panelPath(dirname(options.bridge.endpointFile)), logger)
   const handler = createHandler(options.bridge, state, logger)
 
   // A linked plugin declares no inject, so on DSH even reading ctx.connection
@@ -222,13 +263,16 @@ function registrationOf(releases: Array<() => void>, logger: Logger): PanelRegis
 export function createHandler(bridge: PanelBridge, state: PairState, logger: Logger): PanelHandler {
   return async (endpoint, params) => {
     try {
+      // A request may arrive before the startup read of panel.json finished;
+      // waiting here is what makes status answer with the persisted hub.
+      await state.loaded
       switch (endpoint) {
         case 'status':
-          return { ok: true, value: statusValue(bridge) }
+          return { ok: true, value: statusValue(bridge, state) }
         case 'command':
           return { ok: true, value: commandValue(bridge, state, params) }
         case 'savePair':
-          return savePairValue(state, params)
+          return await savePairValue(state, params, logger)
         default:
           return failure('farwork/unknown_endpoint', 'unknown endpoint: ' + clip(endpoint, 64))
       }
@@ -245,7 +289,7 @@ export function createHandler(bridge: PanelBridge, state: PairState, logger: Log
 }
 
 /** A field-by-field whitelist: spreading the bridge status would invite a token leak later. */
-function statusValue(bridge: PanelBridge): Record<string, unknown> {
+function statusValue(bridge: PanelBridge, state: PairState): Record<string, unknown> {
   const status = bridge.status
   return {
     ready: status.ready === true,
@@ -254,6 +298,9 @@ function statusValue(bridge: PanelBridge): Record<string, unknown> {
     pid: status.pid,
     lastError: status.lastError ?? null,
     version: packageVersion(),
+    // The hub is a public URL the browser is meant to open, so it is echoed back
+    // after a restart. The connector token is not, and must never join this list.
+    hub: state.hub,
   }
 }
 
@@ -265,7 +312,7 @@ function commandValue(bridge: PanelBridge, state: PairState, params: unknown): R
   return { command: buildCommand(token, bridge.endpointFile) }
 }
 
-function savePairValue(state: PairState, params: unknown): PanelReply {
+async function savePairValue(state: PairState, params: unknown, logger: Logger): Promise<PanelReply> {
   const payload = payloadOf(params)
   const rawToken = payload.connectorToken
   const rawHub = payload.hub
@@ -286,12 +333,50 @@ function savePairValue(state: PairState, params: unknown): PanelReply {
   if (hub.length > 0 && !isHubUrl(hub)) {
     // Caught here so the panel can say why: the pasted value ends up in the command
     // line, and a bare host would fail on the device instead.
-    return failure('farwork/invalid_hub', 'hub must start with http(s):// or ws(s)://')
+    return failure('farwork/invalid_hub', 'hub 必须以 http(s):// 或 ws(s):// 开头（例：https://hub.example.com）')
+  }
+  if (isPairingCode(token)) {
+    // A pairing code and a connector token are different credentials: the code is
+    // single-use and only mints a device in the Web console. Accepting it here would
+    // leave the user believing the bridge is paired while nothing was.
+    return failure(
+      'farwork/pairing_code',
+      '这是配对码，不是 connectorToken：请在 Web 控制台用它生成设备后再取 connectorToken',
+    )
   }
   if (token.length > 0) state.connectorToken = token
-  if (hub.length > 0) state.hub = hub
+  if (hub.length > 0) {
+    const unsaved = await rememberHub(state, hub, logger)
+    // Reported as a failure, not as an accepted save with a footnote: the whole
+    // point of persisting the hub is that it is still there after a restart.
+    if (unsaved !== null) return failure('farwork/hub_not_saved', unsaved)
+  }
   // Reports presence, never the secret: this reply is rendered in a browser.
   return { ok: true, value: { accepted: true, hasToken: state.connectorToken !== null, hub: state.hub } }
+}
+
+/**
+ * Write the hub to disk and only then make it the live one.
+ *
+ * Returns null once the hub is durable, or the user-facing reason it is not.
+ * A disk error costs the hub, never the bridge: it is logged as a warning and
+ * answered in the reply so the panel cannot show "saved" for an unsaved URL.
+ */
+async function rememberHub(state: PairState, hub: string, logger: Logger): Promise<string | null> {
+  const file = state.hubFile
+  if (file === null) {
+    state.hub = hub
+    return null
+  }
+  try {
+    await writePanelHub(file, hub)
+    state.hub = hub
+    return null
+  } catch (error) {
+    const reason = errorMessage(error)
+    logger.warn('the Farwork hub could not be written to ' + file + '; it stays unset', reason)
+    return 'hub 未能写入 ' + file + '，所以没有保存：' + clip(reason, MAX_ERROR_LENGTH)
+  }
 }
 
 function buildCommand(token: string, endpointFile: string): string {
@@ -312,6 +397,15 @@ function shellQuote(value: string): string {
 
 function isHubUrl(value: string): boolean {
   return /^(https?|wss?):\/\//i.test(value)
+}
+
+/**
+ * A hub pairing code is exactly four symbols, a dash, four symbols (the hub's own
+ * alphabet is uppercase). A device token is `cxt_<32 base64url chars>`, so the two
+ * shapes cannot collide.
+ */
+function isPairingCode(value: string): boolean {
+  return /^[a-z0-9]{4}-[a-z0-9]{4}$/i.test(value)
 }
 
 function payloadOf(params: unknown): Record<string, unknown> {

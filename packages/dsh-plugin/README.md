@@ -13,6 +13,7 @@ DSH Host process
 └── @farwork/dsh-bridge (Cordis plugin, this package)
     ├── manager lock   ~/.farwork/dsh-bridge/.manager-lock.json
     ├── endpoint.json  ~/.farwork/dsh-bridge/endpoint.json   (0600, dir 0700)
+    ├── panel.json     ~/.farwork/dsh-bridge/panel.json      (0600; the panel's remembered hub, never a token)
     └── TCP 127.0.0.1:<random>   JSON-RPC 2.0, one document per line
                      ▲
                      └── farwork-agent --runtime dsh (loopback client)
@@ -123,9 +124,9 @@ gateway owns that channel), with exactly three endpoints:
 
 | endpoint | answers |
 |---|---|
-| `status` | `{ ready, port, endpointPath, pid, lastError, version }` — a field whitelist; **the endpoint token is never sent** |
+| `status` | `{ ready, port, endpointPath, pid, lastError, version, hub }` — a field whitelist; **the endpoint token is never sent**. `hub` is the saved Web console URL (`null` when unset), so a reopened panel can echo it |
 | `command` | `{ command }` — the `farwork-agent … --dsh-endpoint <path>` line, built host-side so the template lives in one place |
-| `savePair` | `{ accepted, hasToken, hub }` — keeps a pasted `connectorToken` in host memory only (never logged, never echoed back) |
+| `savePair` | `{ accepted, hasToken, hub }` — keeps a pasted `connectorToken` in host memory only (never logged, never echoed back); refuses a non-URL `hub` and an 8-symbol pairing code (`XXXX-XXXX`) with a reason instead of storing it |
 
 A channel is mounted by filing an HTTP route under an **owner context**, and the
 route lives on that owner's `webServer`. The plugin therefore calls the
@@ -157,10 +158,18 @@ Every disposer the host hands back is kept and released on stop. `ctx.inject` in
 Cordis 4 returns the injected fiber, not a disposer: the deferred callback is torn
 down with that fiber, so nothing leaks and nothing needs releasing.
 
-Panel contents, v1: the readiness badge plus the verbatim `lastError`, the endpoint
-path and port with copy buttons, the copyable agent command, a `connectorToken`
-input with "regenerate command", and one line stating the boundary — **approvals and
-questions are not part of this plugin in v1; answer them in DSH's own UI.**
+Panel contents, v1: the readiness badge plus the verbatim `lastError`, the Web
+console (hub) field with a save button and a **打开 Web 控制台并登录** button that opens
+`<hub>/#/connect` in a new tab (`noopener`) — disabled with 先填 hub 地址 until a hub is
+set — the three login steps, the endpoint path and port with copy buttons, the
+copyable agent command, a `connectorToken` input with "regenerate command", and one
+line stating the boundary — **approvals and questions are not part of this plugin in
+v1; answer them in DSH's own UI.**
+
+The hub and the connector token live in host memory only: reopening the panel
+re-reads both through `status`, but a DSH restart loses them. The button exists
+because the Web console is where a login happens — the plugin has no OAuth client of
+its own and never handles the user's password.
 
 ## Uninstall
 

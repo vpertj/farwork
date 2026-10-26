@@ -20,10 +20,10 @@ interface VNode {
   children: unknown[]
 }
 
-function captureLoad(): LoadSpec[] {
+function captureLoad(windowExtras: Record<string, unknown> = {}): LoadSpec[] {
   const specs: LoadSpec[] = []
   const sandbox = {
-    window: { __ModuleLoader__: { load: (spec: LoadSpec) => specs.push(spec) } },
+    window: Object.assign({ __ModuleLoader__: { load: (spec: LoadSpec) => specs.push(spec) } }, windowExtras),
     console,
     // The panel polls only from its effect; a bare vm context has no timers.
     setInterval: () => 0,
@@ -42,14 +42,20 @@ function stubReact() {
     useState<T>(initial: T): [T, (next: T) => void] {
       return [initial, () => undefined]
     },
+    useRef<T>(initial: T): { current: T } {
+      return { current: initial }
+    },
     useEffect(): void {
       // The panel only mounts its effect when opened; the entry does not.
     },
   }
 }
 
-function loadClient(react: unknown = stubReact()): { module: Record<string, unknown>; required: string[] } {
-  const specs = captureLoad()
+function loadClient(
+  react: unknown = stubReact(),
+  windowExtras: Record<string, unknown> = {},
+): { module: Record<string, unknown>; required: string[] } {
+  const specs = captureLoad(windowExtras)
   assert.equal(specs.length, 1)
   const spec = specs[0]!
   assert.equal(spec.id, '@farwork/dsh-bridge')
@@ -172,6 +178,9 @@ function panelRenderer() {
   const states = new Map<unknown, unknown[]>()
   const setters: Array<(value: unknown) => void> = []
   const effects: Array<() => void> = []
+  // Hooks share one index counter, so refs are keyed like state: same order, same
+  // slot, across renders.
+  const refs: Array<{ current: unknown }> = []
   let owner: unknown = null
   let index = 0
 
@@ -195,6 +204,16 @@ function panelRenderer() {
       setters.push(set as (value: unknown) => void)
       return [slots[at] as T, set]
     },
+    useRef<T>(initial: T): { current: T } {
+      const at = index
+      index += 1
+      // Refs are numbered by the same hook index state uses, so earlier slots have
+      // to exist (as empty holes) before this one is addressed.
+      while (refs.length <= at) refs.push({ current: undefined })
+      const slot = refs[at] as { current: T }
+      if (slot.current === undefined) slot.current = initial
+      return slot
+    },
     useEffect(effect: () => void): void {
       effects.push(effect)
     },
@@ -216,10 +235,20 @@ function isVNode(value: unknown): value is VNode {
   return typeof value === 'object' && value !== null && 'type' in value && 'props' in value
 }
 
-/** Open the sidebar entry, mount the panel, and return the text it rendered. */
-async function openPanelText(ctx: Record<string, unknown>): Promise<string[]> {
+interface PanelHarness {
+  Panel: (props: unknown) => VNode
+  props: Record<string, unknown>
+  /** Re-render the mounted panel, which is how a settled state or a click shows up. */
+  render(): VNode
+}
+
+/** Open the sidebar entry, mount the panel, and hand back a way to read it again. */
+async function openPanel(
+  ctx: Record<string, unknown>,
+  windowExtras: Record<string, unknown> = {},
+): Promise<PanelHarness> {
   const renderer = panelRenderer()
-  const { module } = loadClient(renderer.react)
+  const { module } = loadClient(renderer.react, windowExtras)
   const { slots, injections, registrations } = fakeSlots()
   ;(module.apply as (ctx: unknown) => void)({ ...ctx, slots })
   injections[0]!.produce()
@@ -238,7 +267,57 @@ async function openPanelText(ctx: Record<string, unknown>): Promise<string[]> {
   for (const effect of renderer.effects.splice(0)) effect()
   await new Promise((resolve) => setTimeout(resolve, 20))
 
-  return texts(renderer.render(Panel, panel.props))
+  return {
+    Panel,
+    props: panel.props,
+    render(): VNode {
+      return renderer.render(Panel, panel.props)
+    },
+  }
+}
+
+async function openPanelText(ctx: Record<string, unknown>): Promise<string[]> {
+  return texts((await openPanel(ctx)).render())
+}
+
+function collectNodes(node: unknown, predicate: (candidate: VNode) => boolean): VNode[] {
+  if (node === null || node === undefined || typeof node !== 'object') return []
+  const vnode = node as VNode
+  if (!('type' in vnode) || !('props' in vnode)) return []
+  const found = predicate(vnode) ? [vnode] : []
+  for (const child of vnode.children ?? []) found.push(...collectNodes(child, predicate))
+  return found
+}
+
+function inputByLabel(root: unknown, label: string): VNode | undefined {
+  return collectNodes(root, (node) => node.type === 'input' && node.props['aria-label'] === label)[0]
+}
+
+function buttonByText(root: unknown, label: string): VNode | undefined {
+  return collectNodes(root, (node) => node.type === 'button' && texts(node).join('') === label)[0]
+}
+
+/** A connection service whose rpc.call answers per endpoint from a fixture. */
+function rpcHost(values: Record<string, Record<string, unknown>>): Record<string, unknown> {
+  return {
+    connection: {
+      rpc: {
+        call(_channel: string, endpoint: string): Promise<unknown> {
+          return Promise.resolve({ ok: true, value: values[endpoint] ?? {} })
+        },
+      },
+    },
+  }
+}
+
+const STATUS_WITH_HUB = {
+  ready: true,
+  port: 7501,
+  endpointPath: '/tmp/farwork-panel-test/endpoint.json',
+  pid: 4242,
+  lastError: null,
+  version: '0.1.0',
+  hub: 'https://hub.example.test',
 }
 
 test('a browser without a connection service renders its reason, never an empty panel', async () => {
@@ -291,6 +370,136 @@ test('apply is inert when the slots service is missing', () => {
     apply({ slots: null })
     apply({ get: () => undefined })
   })
+})
+
+test('the panel explains the login flow and keeps the console button disabled until a hub is set', async () => {
+  // No connection at all: the panel still has to show the hub field, the three
+  // steps, and a button the user cannot press yet.
+  const tree = (await openPanel({})).render()
+  const rendered = texts(tree)
+
+  assert.ok(rendered.includes('Web 控制台地址（hub）'), 'expected the hub label, got: ' + JSON.stringify(rendered))
+  assert.ok(rendered.includes('打开 Web 控制台并登录'))
+  assert.ok(rendered.includes('① 在 Web 控制台登录并生成配对码'))
+  assert.ok(rendered.includes('② 回到这里粘贴 connectorToken（配对码只用于生成设备）'))
+  assert.ok(rendered.includes('③ 复制下面的命令到终端执行'))
+  assert.ok(rendered.includes('尚未配置 hub'))
+  assert.ok(rendered.includes('先填 hub 地址'))
+
+  const button = buttonByText(tree, '打开 Web 控制台并登录')
+  assert.ok(button, 'the console button must render')
+  assert.equal(button.props.disabled, true)
+  assert.equal(inputByLabel(tree, 'Web 控制台地址（hub）')?.props.value, '')
+})
+
+test('a saved hub is echoed into the field and enables the console button', async () => {
+  const tree = (await openPanel(rpcHost({ status: STATUS_WITH_HUB }))).render()
+
+  // status carries the saved hub, so reopening the panel shows it without retyping.
+  assert.equal(inputByLabel(tree, 'Web 控制台地址（hub）')?.props.value, 'https://hub.example.test')
+  assert.ok(texts(tree).includes('当前 hub：https://hub.example.test'))
+  assert.equal(buttonByText(tree, '打开 Web 控制台并登录')?.props.disabled, false)
+  assert.equal(texts(tree).includes('先填 hub 地址'), false)
+})
+
+test('the console button opens <hub>/#/connect in a new tab with noopener', async () => {
+  const opened: Array<{ url: string; target: string; features: string }> = []
+  const harness = await openPanel(rpcHost({ status: { ...STATUS_WITH_HUB, hub: 'https://hub.example.test/' } }), {
+    open(url: string, target: string, features: string): null {
+      opened.push({ url, target, features })
+      return null
+    },
+  })
+
+  const button = buttonByText(harness.render(), '打开 Web 控制台并登录')
+  assert.ok(button)
+  ;(button.props.onClick as () => void)()
+
+  assert.equal(opened.length, 1)
+  // The trailing slash on the saved hub must not become a double slash.
+  assert.equal(opened[0]!.url, 'https://hub.example.test/#/connect')
+  assert.equal(opened[0]!.target, '_blank')
+  assert.match(opened[0]!.features, /noopener/)
+  assert.ok(texts(harness.render()).some((text) => text.includes('已打开 Web 控制台')))
+})
+
+test('a ws hub cannot be opened in a browser and the panel asks for http(s)', async () => {
+  const tree = (
+    await openPanel(rpcHost({ status: { ...STATUS_WITH_HUB, hub: 'ws://hub.example.test:7300' } }))
+  ).render()
+
+  assert.equal(buttonByText(tree, '打开 Web 控制台并登录')?.props.disabled, true)
+  assert.ok(texts(tree).includes('先填 http(s) 的 hub 地址'), 'got: ' + JSON.stringify(texts(tree)))
+})
+
+test('saving a hub goes through savePair and echoes the accepted value', async () => {
+  const calls: Array<{ endpoint: string; payload: unknown }> = []
+  const host = {
+    connection: {
+      rpc: {
+        call(_channel: string, endpoint: string, payload: unknown): Promise<unknown> {
+          calls.push({ endpoint, payload })
+          if (endpoint === 'savePair') {
+            return Promise.resolve({ ok: true, value: { accepted: true, hasToken: false, hub: 'https://hub.example.test' } })
+          }
+          return Promise.resolve({ ok: true, value: endpoint === 'command' ? { command: 'farwork-agent ...' } : {} })
+        },
+      },
+    },
+  }
+  const harness = await openPanel(host)
+
+  const input = inputByLabel(harness.render(), 'Web 控制台地址（hub）')
+  assert.ok(input)
+  ;(input.props.onChange as (event: unknown) => void)({ target: { value: 'https://hub.example.test' } })
+  const save = buttonByText(harness.render(), '保存 hub')
+  assert.ok(save)
+  ;(save.props.onClick as () => void)()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+
+  const saveCalls = calls.filter((call) => call.endpoint === 'savePair')
+  assert.equal(saveCalls.length, 1)
+  assert.equal((saveCalls[0]!.payload as { hub?: unknown }).hub, 'https://hub.example.test')
+
+  const tree = harness.render()
+  assert.equal(inputByLabel(tree, 'Web 控制台地址（hub）')?.props.value, 'https://hub.example.test')
+  assert.ok(texts(tree).some((text) => text.includes('已保存 hub')), 'got: ' + JSON.stringify(texts(tree)))
+})
+
+test('a pasted pairing code shows the host reason instead of a new command', async () => {
+  // The panel must not turn the host's refusal into a silent no-op: the reason is
+  // the only thing telling the user the code was never a token.
+  const host = {
+    connection: {
+      rpc: {
+        call(_channel: string, endpoint: string): Promise<unknown> {
+          if (endpoint === 'savePair') {
+            return Promise.resolve({
+              ok: false,
+              error: {
+                code: 'farwork/pairing_code',
+                message: '这是配对码，不是 connectorToken：请在 Web 控制台用它生成设备后再取 connectorToken',
+              },
+            })
+          }
+          return Promise.resolve({ ok: true, value: endpoint === 'command' ? { command: 'farwork-agent ...' } : {} })
+        },
+      },
+    },
+  }
+  const harness = await openPanel(host)
+
+  const input = inputByLabel(harness.render(), 'connectorToken')
+  assert.ok(input)
+  ;(input.props.onChange as (event: unknown) => void)({ target: { value: 'AB3D-EFGH' } })
+  const button = buttonByText(harness.render(), '重新生成命令')
+  assert.ok(button)
+  ;(button.props.onClick as () => void)()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+
+  const rendered = texts(harness.render())
+  assert.ok(rendered.some((text) => text.includes('这是配对码')), 'got: ' + JSON.stringify(rendered))
+  assert.ok(rendered.some((text) => text.includes('Web 控制台')))
 })
 
 test('apply swallows a slots service that throws', () => {

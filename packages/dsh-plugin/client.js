@@ -85,6 +85,23 @@
         cursor: 'pointer',
         whiteSpace: 'nowrap',
       }
+      var primaryStyle = {
+        width: '100%',
+        marginTop: '6px',
+        padding: '6px 10px',
+        borderRadius: '6px',
+        border: '1px solid ' + COLOR.border,
+        background: COLOR.fill,
+        color: 'inherit',
+        font: 'inherit',
+        fontSize: '12px',
+        fontWeight: '600',
+        cursor: 'pointer',
+      }
+      var disabledStyle = {
+        opacity: '0.55',
+        cursor: 'not-allowed',
+      }
       var inputStyle = {
         flex: '1 1 auto',
         minWidth: '0',
@@ -205,6 +222,17 @@
         })
       }
 
+      /**
+       * The Web console entry point: <hub>/#/connect, which is the page that logs in
+       * and mints a pairing code. Returns '' when the saved value is not an http(s)
+       * URL — a ws(s):// hub is for the agent, not for a browser tab.
+       */
+      function consoleUrl(hub) {
+        var value = String(hub === undefined || hub === null ? '' : hub).trim()
+        if (!/^https?:\/\//i.test(value)) return ''
+        return value.replace(/\/+$/, '') + '/#/connect'
+      }
+
       var portalImpl
       function getCreatePortal() {
         if (portalImpl !== undefined) return portalImpl
@@ -265,6 +293,12 @@
         var noticePair = React.useState('')
         var notice = noticePair[0]
         var setNotice = noticePair[1]
+        var hubPair = React.useState('')
+        var hub = hubPair[0]
+        var setHub = hubPair[1]
+        // The field is seeded from the host once, so the 5s poll can never overwrite
+        // a value the user is in the middle of typing.
+        var hubSeeded = React.useRef(false)
 
         React.useEffect(function () {
           var alive = true
@@ -274,6 +308,10 @@
                 if (!alive) return
                 setStatus(value)
                 setError('')
+                if (!hubSeeded.current && value && typeof value.hub === 'string' && value.hub.length > 0) {
+                  hubSeeded.current = true
+                  setHub(value.hub)
+                }
               },
               function (failure) {
                 if (!alive) return
@@ -332,12 +370,57 @@
             )
         }
 
+        function saveHub() {
+          var next = hub.trim()
+          if (next.length === 0) {
+            setNotice('先填 hub 地址')
+            return
+          }
+          setNotice('正在保存 hub…')
+          // savePair is the only place a hub is persisted: the host validates the
+          // URL, so a typo is a rendered reason here instead of a broken agent start.
+          rpcCall(ctx, 'savePair', { hub: next }).then(
+            function (value) {
+              var saved = value && typeof value.hub === 'string' ? value.hub : next
+              hubSeeded.current = true
+              setHub(saved)
+              setNotice('已保存 hub：' + saved)
+            },
+            function (failure) {
+              setNotice('hub 保存失败：' + describeFailure(failure))
+            },
+          )
+        }
+
+        function openConsole() {
+          var target = consoleUrl(hub)
+          if (target.length === 0) {
+            setNotice('先填 hub 地址（http(s)://）')
+            return
+          }
+          try {
+            if (typeof window === 'undefined' || typeof window.open !== 'function') {
+              setNotice('这个环境不能打开新标签页，请手动访问 ' + target)
+              return
+            }
+            // noopener/noreferrer: the console is a different origin and must not get
+            // a handle back into the DSH page it was opened from.
+            window.open(target, '_blank', 'noopener,noreferrer')
+            setNotice('已打开 Web 控制台：' + target)
+          } catch (error) {
+            setNotice('打开失败：' + describeError(error))
+          }
+        }
+
         var ready = status !== null && status.ready === true
         var badgeColor = status === null ? COLOR.border : ready ? COLOR.ok : COLOR.warn
         var badgeText = status === null ? '读取中…' : ready ? '就绪' : '未就绪'
         var endpointPath = status && typeof status.endpointPath === 'string' ? status.endpointPath : ''
         var port = status && typeof status.port === 'number' ? status.port : 0
         var lastError = status && typeof status.lastError === 'string' ? status.lastError : ''
+        // The host's saved hub is what makes the button state survive a restart.
+        var savedHub = status && typeof status.hub === 'string' ? status.hub : ''
+        var canOpen = consoleUrl(hub).length > 0
 
         return h(
           React.Fragment,
@@ -369,6 +452,80 @@
               ? h('div', null, h('div', { style: muted }, '失败原因'), h('pre', { style: blockStyle }, lastError))
               : null,
             error.length > 0 ? h('div', { style: { fontSize: '12px', color: COLOR.warn } }, error) : null,
+            h(
+              'div',
+              null,
+              h('div', { style: muted }, 'Web 控制台地址（hub）'),
+              h(
+                'div',
+                { style: { display: 'flex', gap: '8px', marginTop: '4px' } },
+                h('input', {
+                  type: 'url',
+                  style: inputStyle,
+                  value: hub,
+                  placeholder: 'https://hub.example.com',
+                  autoComplete: 'off',
+                  spellCheck: false,
+                  'aria-label': 'Web 控制台地址（hub）',
+                  onChange: function (event) {
+                    setHub(event && event.target ? String(event.target.value) : '')
+                  },
+                }),
+                h('button', { type: 'button', style: buttonStyle, onClick: saveHub }, '保存 hub'),
+              ),
+              h('div', { style: muted }, savedHub.length > 0 ? '当前 hub：' + savedHub : '尚未配置 hub'),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  style: Object.assign({}, primaryStyle, canOpen ? null : disabledStyle),
+                  disabled: !canOpen,
+                  onClick: openConsole,
+                },
+                '打开 Web 控制台并登录',
+              ),
+              canOpen
+                ? null
+                : h(
+                    'div',
+                    { style: muted },
+                    savedHub.length === 0 && hub.trim().length === 0 ? '先填 hub 地址' : '先填 http(s) 的 hub 地址',
+                  ),
+            ),
+            h(
+              'div',
+              null,
+              h('div', { style: muted }, '登录流程'),
+              h(
+                'div',
+                { style: { display: 'flex', flexDirection: 'column', gap: '2px', marginTop: '4px', fontSize: '12px' } },
+                h('span', null, '① 在 Web 控制台登录并生成配对码'),
+                h('span', null, '② 回到这里粘贴 connectorToken（配对码只用于生成设备）'),
+                h('span', null, '③ 复制下面的命令到终端执行'),
+              ),
+            ),
+            h(
+              'div',
+              null,
+              h('div', { style: muted }, '粘贴 hub 的 connectorToken（只用于拼命令，不回传浏览器）'),
+              h(
+                'div',
+                { style: { display: 'flex', gap: '8px', marginTop: '4px' } },
+                h('input', {
+                  type: 'password',
+                  style: inputStyle,
+                  value: token,
+                  placeholder: 'connectorToken',
+                  autoComplete: 'off',
+                  spellCheck: false,
+                  'aria-label': 'connectorToken',
+                  onChange: function (event) {
+                    setToken(event && event.target ? String(event.target.value) : '')
+                  },
+                }),
+                h('button', { type: 'button', style: buttonStyle, onClick: regenerate }, '重新生成命令'),
+              ),
+            ),
             h(
               'div',
               null,
@@ -409,28 +566,6 @@
                   },
                   '复制命令',
                 ),
-              ),
-            ),
-            h(
-              'div',
-              null,
-              h('div', { style: muted }, '粘贴 hub 的 connectorToken（只用于拼命令，不回传浏览器）'),
-              h(
-                'div',
-                { style: { display: 'flex', gap: '8px', marginTop: '4px' } },
-                h('input', {
-                  type: 'password',
-                  style: inputStyle,
-                  value: token,
-                  placeholder: 'connectorToken',
-                  autoComplete: 'off',
-                  spellCheck: false,
-                  'aria-label': 'connectorToken',
-                  onChange: function (event) {
-                    setToken(event && event.target ? String(event.target.value) : '')
-                  },
-                }),
-                h('button', { type: 'button', style: buttonStyle, onClick: regenerate }, '重新生成命令'),
               ),
             ),
             notice.length > 0 ? h('div', { style: muted }, notice) : null,
