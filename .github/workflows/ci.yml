@@ -12,6 +12,34 @@ jobs:
   rust:
     name: Rust (fmt / clippy / test)
     runs-on: ubuntu-latest
+    # farwork-hub's integration test drives a real PostgreSQL
+    # (crates/farwork-hub/tests/e2e.rs). With no database it prints a SKIP line and
+    # returns, so the job stays green while the whole /api/v2 journey is untested.
+    # This service turns that skip into a real run.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          # The image creates this database at start-up; the test creates its own
+          # tables (sqlx::migrate!) and truncates them on every run.
+          POSTGRES_DB: farwork_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Read by crates/farwork-hub/tests/e2e.rs. Unset = it skips loudly, which hides
+      # regressions; that is exactly what this job must never allow.
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/farwork_test
+      # Read by farwork_hub::Config::from_env (crates/farwork-hub/src/config.rs). The
+      # test builds its Config by hand, so this is parity with a manual
+      # 'cargo run -p farwork-hub', not a test input.
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/farwork_test
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,6 +57,9 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Verify test database
+        run: psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -c 'select 1'
 
       - name: Test
         run: cargo test --workspace
