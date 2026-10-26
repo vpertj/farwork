@@ -162,6 +162,18 @@ async fn run_connector_socket(state: AppState, mut socket: WebSocket, connector:
         }
     }
 
+    // No reply can arrive for these any more: releasing them here turns a
+    // connector disconnect into an immediate error instead of a 10s timeout per
+    // waiting browser request.
+    let abandoned = state.fs_relay().abandon_connector(&connector.id);
+    if abandoned > 0 {
+        tracing::warn!(
+            connector_id = %connector.id,
+            requests = abandoned,
+            "connector disconnected with file requests in flight"
+        );
+    }
+
     // The connector's runtimes died with this socket, so their streams are closed
     // here whether or not a newer connection already took over the route.
     match ingress::abandon_connector_streams(&state, &connector.id).await {
@@ -450,6 +462,19 @@ async fn apply_frame(
             crate::routes::notices::publish_notice_snapshot(state, &connector.user_id, &session_id)
                 .await
                 .map_err(err)?;
+            Ok(())
+        }
+        // A file-browsing reply is paired by requestId, not routed by stream, so
+        // it is handed straight to the handler waiting for it.
+        ConnectorFrame::FsResponse(reply) => {
+            match state.fs_relay().deliver(&connector.id, reply) {
+                crate::fsrelay::Delivery::Delivered => {}
+                delivery => tracing::warn!(
+                    connector_id = %connector.id,
+                    delivery = ?delivery,
+                    "dropped an fs.response that nothing was waiting for"
+                ),
+            }
             Ok(())
         }
         ConnectorFrame::Error { message, stream_id } => {

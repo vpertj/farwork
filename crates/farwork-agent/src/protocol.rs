@@ -107,6 +107,138 @@ impl NoticeEnvelope {
     pub const OPEN: &'static str = "open";
 }
 
+/// `fs.request.op`. Only these two exist: a third spelling is a broken frame,
+/// not a future-proof extension, and the agent must refuse it rather than guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FsOp {
+    List,
+    ReadText,
+}
+
+/// Directory entry kind. The contract has exactly two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FsEntryKind {
+    File,
+    Dir,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FsEntry {
+    pub name: String,
+    pub path: String,
+    pub kind: FsEntryKind,
+    #[serde(rename = "sizeBytes")]
+    pub size_bytes: u64,
+    #[serde(rename = "modifiedAt")]
+    pub modified_at: String,
+}
+
+/// Failure codes the hub maps onto HTTP statuses. Closed set: an unmapped code
+/// would become a 502 with no explanation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FsErrorCode {
+    NotFound,
+    PermissionDenied,
+    IoError,
+    TooLarge,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FsErrorBody {
+    pub code: FsErrorCode,
+    pub message: String,
+}
+
+/// `fs.response` payload. The frame is a union on the wire (list reply, readText
+/// reply, or failure), so it is one struct with absent halves rather than an
+/// enum: all three carry `type: "fs.response"`, which a tagged enum cannot
+/// express twice.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FsResponse {
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<FsOp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entries: Option<Vec<FsEntry>>,
+    #[serde(default, rename = "sizeBytes", skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<FsErrorBody>,
+}
+
+impl FsResponse {
+    pub fn list(
+        request_id: impl Into<String>,
+        path: impl Into<String>,
+        entries: Vec<FsEntry>,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            ok: true,
+            op: Some(FsOp::List),
+            path: Some(path.into()),
+            entries: Some(entries),
+            size_bytes: None,
+            content: None,
+            truncated: None,
+            error: None,
+        }
+    }
+
+    pub fn read_text(
+        request_id: impl Into<String>,
+        path: impl Into<String>,
+        content: impl Into<String>,
+        size_bytes: u64,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            ok: true,
+            op: Some(FsOp::ReadText),
+            path: Some(path.into()),
+            entries: None,
+            size_bytes: Some(size_bytes),
+            content: Some(content.into()),
+            // Never true: an oversized file is refused with too_large rather than
+            // returned short and passed off as whole.
+            truncated: Some(false),
+            error: None,
+        }
+    }
+
+    pub fn failure(
+        request_id: impl Into<String>,
+        code: FsErrorCode,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            ok: false,
+            op: None,
+            path: None,
+            entries: None,
+            size_bytes: None,
+            content: None,
+            truncated: None,
+            error: Some(FsErrorBody {
+                code,
+                message: message.into(),
+            }),
+        }
+    }
+}
+
 /// Connector -> hub frames.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -152,6 +284,8 @@ pub enum ClientFrame {
         notice_id: String,
         decision: Decision,
     },
+    #[serde(rename = "fs.response")]
+    FsResponse(FsResponse),
     #[serde(rename = "error")]
     Error {
         message: String,
@@ -206,6 +340,13 @@ pub enum ServerFrame {
         #[serde(rename = "noticeId")]
         notice_id: String,
         decision: Decision,
+    },
+    #[serde(rename = "fs.request")]
+    FsRequest {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        op: FsOp,
+        path: String,
     },
     #[serde(rename = "error")]
     Error {
@@ -273,6 +414,7 @@ const KNOWN_SERVER_TYPES: &[&str] = &[
     "session.message",
     "session.interrupt",
     "notice.respond",
+    "fs.request",
     "error",
 ];
 
@@ -404,6 +546,76 @@ mod tests {
             }) => assert_eq!(client_message_id, None),
             other => panic!("unexpected parse: {other:?}"),
         }
+    }
+
+    #[test]
+    fn fs_request_parses_and_a_bad_op_is_malformed() {
+        let text = r#"{"type":"fs.request","requestId":"req_1","op":"readText","path":"/w/a.txt"}"#;
+        match parse_server_frame(text) {
+            ParsedServerFrame::Frame(ServerFrame::FsRequest {
+                request_id,
+                op,
+                path,
+            }) => {
+                assert_eq!(request_id, "req_1");
+                assert_eq!(op, FsOp::ReadText);
+                assert_eq!(path, "/w/a.txt");
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+
+        let list = r#"{"type":"fs.request","requestId":"req_2","op":"list","path":"/w"}"#;
+        match parse_server_frame(list) {
+            ParsedServerFrame::Frame(ServerFrame::FsRequest { op, .. }) => {
+                assert_eq!(op, FsOp::List)
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+
+        // An op outside the closed set must not be coerced into one of the two:
+        // it is a known type with a payload the contract does not describe.
+        let bogus = r#"{"type":"fs.request","requestId":"req_3","op":"delete","path":"/w"}"#;
+        match parse_server_frame(bogus) {
+            ParsedServerFrame::Malformed { ty, .. } => {
+                assert_eq!(ty.as_deref(), Some("fs.request"))
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fs_response_frames_use_the_contract_field_names() {
+        let list = ClientFrame::FsResponse(FsResponse::list(
+            "req_1",
+            "/w",
+            vec![FsEntry {
+                name: String::from("a.txt"),
+                path: String::from("/w/a.txt"),
+                kind: FsEntryKind::File,
+                size_bytes: 3,
+                modified_at: String::from("2026-01-01T00:00:00Z"),
+            }],
+        ));
+        assert_eq!(
+            list.encode().expect("encode"),
+            r#"{"type":"fs.response","requestId":"req_1","ok":true,"op":"list","path":"/w","entries":[{"name":"a.txt","path":"/w/a.txt","kind":"file","sizeBytes":3,"modifiedAt":"2026-01-01T00:00:00Z"}]}"#
+        );
+
+        let text = ClientFrame::FsResponse(FsResponse::read_text("req_2", "/w/a.txt", "abc", 3));
+        assert_eq!(
+            text.encode().expect("encode"),
+            r#"{"type":"fs.response","requestId":"req_2","ok":true,"op":"readText","path":"/w/a.txt","sizeBytes":3,"content":"abc","truncated":false}"#
+        );
+
+        let failure = ClientFrame::FsResponse(FsResponse::failure(
+            "req_3",
+            FsErrorCode::PermissionDenied,
+            "denied",
+        ));
+        assert_eq!(
+            failure.encode().expect("encode"),
+            r#"{"type":"fs.response","requestId":"req_3","ok":false,"error":{"code":"permission_denied","message":"denied"}}"#
+        );
     }
 
     #[test]

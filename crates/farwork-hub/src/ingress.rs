@@ -32,6 +32,17 @@ pub const DECISIONS: [&str; 3] = ["approve", "approve_for_session", "reject"];
 /// Session runtime states a connector may report.
 pub const RUNTIME_STATES: [&str; 4] = ["running", "idle", "waiting_approval", "error"];
 
+/// File-browsing operations the hub may ask a connector for.
+pub const FS_OPS: [&str; 2] = ["list", "readText"];
+
+/// Failure codes an `fs.response` may carry. `routes::fs` maps each one to an
+/// HTTP status; an unlisted code is reported as 502 rather than guessed at.
+pub const FS_ERROR_CODES: [&str; 4] = ["not_found", "permission_denied", "io_error", "too_large"];
+
+pub fn is_known_fs_op(op: &str) -> bool {
+    FS_OPS.contains(&op)
+}
+
 pub fn is_known_state(state: &str) -> bool {
     RUNTIME_STATES.contains(&state)
 }
@@ -349,6 +360,17 @@ pub fn session_interrupt_frame(stream_id: &str) -> Value {
     json!({ "type": "session.interrupt", "streamId": stream_id })
 }
 
+/// `fs.request`. The hub mints `requestId`; the connector must answer with that
+/// exact id, which is what lets many file requests share the one socket.
+pub fn fs_request_frame(request_id: &str, op: &str, path: &str) -> Value {
+    json!({
+        "type": "fs.request",
+        "requestId": request_id,
+        "op": op,
+        "path": path,
+    })
+}
+
 pub fn notice_respond_frame(notice_id: &str, decision: &str) -> Value {
     json!({
         "type": "notice.respond",
@@ -423,6 +445,8 @@ pub enum ConnectorFrame {
         notice_id: String,
         decision: String,
     },
+    #[serde(rename = "fs.response")]
+    FsResponse(IngressFsResponse),
     #[serde(rename = "error")]
     Error {
         message: String,
@@ -443,9 +467,67 @@ impl ConnectorFrame {
             Self::NoticeResolved { stream_id, .. } | Self::Error { stream_id, .. } => {
                 stream_id.as_deref()
             }
-            Self::Hello { .. } | Self::Heartbeat { .. } => None,
+            // `fs.response` is paired by requestId, not routed by stream.
+            Self::FsResponse(_) | Self::Hello { .. } | Self::Heartbeat { .. } => None,
         }
     }
+}
+
+/// One directory entry, exactly as the connector reports it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FsEntry {
+    pub name: String,
+    pub path: String,
+    /// `file` or `dir`. Required: it is the field the browser navigates on, so a
+    /// reply without it is malformed rather than a file by default.
+    pub kind: String,
+    // Lenient on purpose: a missing size is a display detail, not a reason to
+    // fail a request the device already answered.
+    #[serde(default, rename = "sizeBytes")]
+    pub size_bytes: u64,
+    #[serde(default, rename = "modifiedAt")]
+    pub modified_at: String,
+}
+
+impl FsEntry {
+    pub fn view(&self) -> Value {
+        json!({
+            "name": self.name,
+            "path": self.path,
+            "kind": self.kind,
+            "sizeBytes": self.size_bytes,
+            "modifiedAt": self.modified_at,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FsErrorBody {
+    pub code: String,
+    pub message: String,
+}
+
+/// A connector's answer to one `fs.request`. All three shapes (list, readText,
+/// failure) are one struct because they share `type: "fs.response"`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IngressFsResponse {
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub op: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub entries: Option<Vec<FsEntry>>,
+    #[serde(default, rename = "sizeBytes")]
+    pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub truncated: Option<bool>,
+    #[serde(default)]
+    pub error: Option<FsErrorBody>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -601,6 +683,81 @@ mod tests {
 
         let with_id = session_message_frame("str_1", "hi", Some("cm_x"));
         assert_eq!(with_id["clientMessageId"], "cm_x");
+    }
+
+    #[test]
+    fn fs_request_frame_carries_the_contract_fields() {
+        let frame = fs_request_frame("req_1", "readText", "/srv/farwork/a.txt");
+        assert_eq!(frame["type"], "fs.request");
+        assert_eq!(frame["requestId"], "req_1");
+        assert_eq!(frame["op"], "readText");
+        assert_eq!(frame["path"], "/srv/farwork/a.txt");
+        assert_eq!(
+            frame.as_object().expect("object").keys().count(),
+            4,
+            "expected exactly type/requestId/op/path: {frame}"
+        );
+        assert!(is_known_fs_op("list") && is_known_fs_op("readText"));
+        assert!(!is_known_fs_op("delete"));
+    }
+
+    #[test]
+    fn fs_responses_parse_in_all_three_shapes() {
+        let list: ConnectorFrame = serde_json::from_str(
+            r#"{"type":"fs.response","requestId":"req_1","ok":true,"op":"list","path":"/w","entries":[{"name":"a.txt","path":"/w/a.txt","kind":"file","sizeBytes":12,"modifiedAt":"2026-01-01T00:00:00Z"}]}"#,
+        )
+        .expect("parses");
+        match list {
+            ConnectorFrame::FsResponse(reply) => {
+                assert_eq!(reply.request_id, "req_1");
+                assert!(reply.ok);
+                assert_eq!(reply.op.as_deref(), Some("list"));
+                let entries = reply.entries.expect("entries");
+                assert_eq!(entries[0].name, "a.txt");
+                assert_eq!(entries[0].kind, "file");
+                assert_eq!(entries[0].size_bytes, 12);
+                assert_eq!(entries[0].modified_at, "2026-01-01T00:00:00Z");
+                assert_eq!(entries[0].view()["sizeBytes"], 12);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let read: ConnectorFrame = serde_json::from_str(
+            r#"{"type":"fs.response","requestId":"req_2","ok":true,"op":"readText","path":"/w/a.txt","content":"hi","sizeBytes":2,"truncated":false}"#,
+        )
+        .expect("parses");
+        match read {
+            ConnectorFrame::FsResponse(reply) => {
+                assert_eq!(reply.content.as_deref(), Some("hi"));
+                assert_eq!(reply.size_bytes, Some(2));
+                assert_eq!(reply.truncated, Some(false));
+                assert!(reply.entries.is_none());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let failure: ConnectorFrame = serde_json::from_str(
+            r#"{"type":"fs.response","requestId":"req_3","ok":false,"error":{"code":"permission_denied","message":"outside the workdir"}}"#,
+        )
+        .expect("parses");
+        match failure {
+            ConnectorFrame::FsResponse(reply) => {
+                assert!(!reply.ok);
+                let error = reply.error.expect("error");
+                assert_eq!(error.code, "permission_denied");
+                assert_eq!(error.message, "outside the workdir");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        assert_eq!(FS_ERROR_CODES.len(), 4);
+    }
+
+    #[test]
+    fn an_fs_response_has_no_stream_to_route_on() {
+        let frame: ConnectorFrame =
+            serde_json::from_str(r#"{"type":"fs.response","requestId":"req_1","ok":false}"#)
+                .expect("parses");
+        assert_eq!(frame.stream_id(), None);
     }
 
     #[test]

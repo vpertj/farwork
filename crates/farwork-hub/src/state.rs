@@ -131,6 +131,8 @@ struct Inner {
     /// Live connector sockets. Presence and routing live here, not in Postgres:
     /// a socket cannot be shared between processes.
     connectors: crate::ingress::ConnectorRegistry,
+    /// In-flight `fs.request` waits, keyed by the requestId the hub minted.
+    fs_relay: crate::fsrelay::FsRelay,
 }
 
 #[derive(Clone)]
@@ -149,6 +151,7 @@ impl AppState {
                 setup_token,
                 timelines: crate::timeline::TimelineHub::new(),
                 connectors: crate::ingress::ConnectorRegistry::new(),
+                fs_relay: crate::fsrelay::FsRelay::new(),
             }),
         }
     }
@@ -177,5 +180,10 @@ impl AppState {
     /// Routable connector connections (connector_id -> live socket).
     pub fn connectors(&self) -> &crate::ingress::ConnectorRegistry {
         &self.inner.connectors
+    }
+
+    /// In-flight file requests waiting for a connector's reply.
+    pub fn fs_relay(&self) -> &crate::fsrelay::FsRelay {
+        &self.inner.fs_relay
     }
 }

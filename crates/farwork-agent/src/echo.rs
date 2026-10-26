@@ -186,6 +186,7 @@ mod tests {
                 ClientFrame::Error { .. } => "error",
                 ClientFrame::Heartbeat { .. } => "heartbeat",
                 ClientFrame::Hello { .. } => "hello",
+                ClientFrame::FsResponse(_) => "fs.response",
             })
             .collect()
     }

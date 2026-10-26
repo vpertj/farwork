@@ -9,6 +9,7 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod fsrelay;
 pub mod ids;
 pub mod ingress;
 pub mod models;

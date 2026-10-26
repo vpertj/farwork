@@ -1,6 +1,9 @@
 //! RFC3339 timestamps in the shape the hub already emits, so agent-supplied
 //! itemTime / heartbeat ts sort and parse identically on the server side.
 
+use std::time::SystemTime;
+
+use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::OffsetDateTime;
 
@@ -15,6 +18,14 @@ pub fn format_utc(value: OffsetDateTime) -> String {
     value
         .format(ISO_MICROS)
         .unwrap_or_else(|_| String::from("1970-01-01T00:00:00.000000Z"))
+}
+
+/// File timestamps: plain RFC3339, which is what `fs.response` entries advertise.
+pub fn format_system_time(value: SystemTime) -> String {
+    match OffsetDateTime::from(value).format(&Rfc3339) {
+        Ok(text) => text,
+        Err(_) => String::from("1970-01-01T00:00:00Z"),
+    }
 }
 
 #[cfg(test)]

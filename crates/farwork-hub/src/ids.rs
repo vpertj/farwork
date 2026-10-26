@@ -45,6 +45,11 @@ pub fn stream_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// `fs.request` correlation id. The contract spells it "<uuid>", like streamId.
+pub fn request_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 /// Connector device credential (`cxt_` prefix, 32 random bytes).
 pub fn connector_token() -> String {
     format!("cxt_{}", token_urlsafe(32))

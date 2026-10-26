@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -21,8 +22,11 @@ use crate::cli::{connector_ws_url, RuntimeKind};
 use crate::codex::mapper::{MapperConfig, SessionSeed};
 use crate::codex::{CodexSession, SessionCmd, StdioTransport};
 use crate::echo::EchoSession;
+use crate::fsops::{self, Sandbox};
 use crate::identity::AgentIdentity;
-use crate::protocol::{parse_server_frame, AgentInfo, ClientFrame, ParsedServerFrame, ServerFrame};
+use crate::protocol::{
+    parse_server_frame, AgentInfo, ClientFrame, FsOp, ParsedServerFrame, ServerFrame,
+};
 use crate::timeutil;
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -48,11 +52,29 @@ struct Worker {
 pub struct Connector {
     opts: HubOptions,
     identity: AgentIdentity,
+    /// `None` when the workdir cannot be resolved: every fs request is then
+    /// denied instead of falling back to an unconstrained read.
+    sandbox: Option<Arc<Sandbox>>,
 }
 
 impl Connector {
     pub fn new(opts: HubOptions, identity: AgentIdentity) -> Self {
-        Self { opts, identity }
+        let sandbox = match Sandbox::new(&opts.workdir) {
+            Ok(sandbox) => Some(Arc::new(sandbox)),
+            Err(error) => {
+                tracing::warn!(
+                    workdir = %opts.workdir.display(),
+                    %error,
+                    "workdir cannot be resolved; fs requests will be denied"
+                );
+                None
+            }
+        };
+        Self {
+            opts,
+            identity,
+            sandbox,
+        }
     }
 
     /// Connect, serve, reconnect. Returns only on --once or a fatal setup error.
@@ -340,6 +362,11 @@ impl Connector {
                     tracing::warn!(%notice_id, "notice.respond with no live session");
                 }
             }
+            ServerFrame::FsRequest {
+                request_id,
+                op,
+                path,
+            } => self.spawn_fs_request(request_id, op, path, out.clone()),
             ServerFrame::Error { message, stream_id } => {
                 tracing::warn!(?stream_id, %message, "hub reported an error");
             }
@@ -347,6 +374,35 @@ impl Connector {
                 tracing::debug!("duplicate welcome frame ignored");
             }
         }
+    }
+
+    /// Serve one fs.request off the read loop. Directory and file IO is blocking,
+    /// so it runs on the blocking pool and answers through the same frame channel
+    /// every other reply uses.
+    fn spawn_fs_request(
+        &self,
+        request_id: String,
+        op: FsOp,
+        path: String,
+        out: UnboundedSender<ClientFrame>,
+    ) {
+        let sandbox = self.sandbox.clone();
+        tokio::spawn(async move {
+            let response = tokio::task::spawn_blocking(move || match sandbox {
+                Some(sandbox) => sandbox.respond(&request_id, op, &path),
+                None => fsops::no_sandbox(
+                    &request_id,
+                    "the agent has no readable workdir; file browsing is disabled",
+                ),
+            })
+            .await;
+            match response {
+                Ok(response) => {
+                    let _ = out.send(ClientFrame::FsResponse(response));
+                }
+                Err(error) => tracing::warn!(%error, "fs request task failed"),
+            }
+        });
     }
 
     fn forward(&self, sessions: &HashMap<String, Worker>, stream_id: &str, command: SessionCmd) {
@@ -664,6 +720,144 @@ mod tests {
         assert_eq!(exit["streamId"], serde_json::json!("str_1"));
         assert_eq!(exit["code"], serde_json::json!(1));
         run.abort();
+    }
+
+    fn options_with_workdir(hub_url: String, workdir: PathBuf) -> HubOptions {
+        HubOptions {
+            workdir,
+            ..options(hub_url, RuntimeKind::Echo)
+        }
+    }
+
+    /// The fs contract over a real socket: one list, one readText, one denial,
+    /// and a malformed request that must not take the connection down.
+    #[tokio::test]
+    async fn fs_requests_are_served_over_the_ingress_socket() {
+        let root = std::env::temp_dir().join(format!(
+            "farwork-agent-fs-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(root.join("sub")).expect("subdir");
+        std::fs::write(root.join("hello.txt"), b"hello fs").expect("write");
+        let workdir = root.canonicalize().expect("canonical workdir");
+        let file = workdir.join("hello.txt").to_string_lossy().into_owned();
+        let dir = workdir.to_string_lossy().into_owned();
+
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let hub = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let websocket = tokio_tungstenite::accept_async(stream).await.expect("ws");
+            let (mut sink, mut source) = websocket.split();
+            let hello = read_json(&mut source).await;
+            assert_eq!(hello["type"], serde_json::json!("hello"));
+            write_json(
+                &mut sink,
+                serde_json::json!({"type": "welcome", "serverVersion": "0.1.0", "heartbeatSecs": 15}),
+            )
+            .await;
+
+            write_json(
+                &mut sink,
+                serde_json::json!({"type": "fs.request", "requestId": "req_list",
+                    "op": "list", "path": dir}),
+            )
+            .await;
+            let listed = read_json(&mut source).await;
+
+            write_json(
+                &mut sink,
+                serde_json::json!({"type": "fs.request", "requestId": "req_read",
+                    "op": "readText", "path": file}),
+            )
+            .await;
+            let read = read_json(&mut source).await;
+
+            write_json(
+                &mut sink,
+                serde_json::json!({"type": "fs.request", "requestId": "req_denied",
+                    "op": "readText", "path": "/etc/passwd"}),
+            )
+            .await;
+            let denied = read_json(&mut source).await;
+
+            // A known type carrying an op outside the contract: dropped, not fatal.
+            write_json(
+                &mut sink,
+                serde_json::json!({"type": "fs.request", "requestId": "req_bad",
+                    "op": "delete", "path": dir}),
+            )
+            .await;
+            write_json(
+                &mut sink,
+                serde_json::json!({"type": "fs.request", "requestId": "req_after",
+                    "op": "list", "path": dir}),
+            )
+            .await;
+            let after = read_json(&mut source).await;
+            assert_eq!(
+                after["requestId"],
+                serde_json::json!("req_after"),
+                "the malformed request must not close the socket"
+            );
+            assert_eq!(after["ok"], serde_json::json!(true));
+
+            (listed, read, denied)
+        });
+
+        let connector = Connector::new(
+            options_with_workdir(format!("ws://127.0.0.1:{port}"), workdir),
+            identity(),
+        );
+        let run = tokio::spawn(async move { connector.run().await });
+        let (listed, read, denied) = timeout(Duration::from_secs(20), hub)
+            .await
+            .expect("fake hub timed out")
+            .expect("hub task");
+        for frame in [&listed, &read, &denied] {
+            println!(
+                "FS FRAME {}",
+                serde_json::to_string(frame).unwrap_or_default()
+            );
+        }
+
+        assert_eq!(listed["type"], serde_json::json!("fs.response"));
+        assert_eq!(listed["requestId"], serde_json::json!("req_list"));
+        assert_eq!(listed["ok"], serde_json::json!(true));
+        assert_eq!(listed["op"], serde_json::json!("list"));
+        let entries = listed["entries"].as_array().expect("entries");
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(names, vec!["sub", "hello.txt"]);
+        assert_eq!(entries[0]["kind"], serde_json::json!("dir"));
+        assert_eq!(entries[1]["kind"], serde_json::json!("file"));
+        assert_eq!(entries[1]["sizeBytes"], serde_json::json!(8));
+        assert!(entries[1]["modifiedAt"]
+            .as_str()
+            .expect("modifiedAt")
+            .contains('T'));
+
+        assert_eq!(read["requestId"], serde_json::json!("req_read"));
+        assert_eq!(read["ok"], serde_json::json!(true));
+        assert_eq!(read["op"], serde_json::json!("readText"));
+        assert_eq!(read["content"], serde_json::json!("hello fs"));
+        assert_eq!(read["sizeBytes"], serde_json::json!(8));
+        assert_eq!(read["truncated"], serde_json::json!(false));
+
+        assert_eq!(denied["requestId"], serde_json::json!("req_denied"));
+        assert_eq!(denied["ok"], serde_json::json!(false));
+        assert_eq!(
+            denied["error"]["code"],
+            serde_json::json!("permission_denied")
+        );
+        assert!(denied.get("entries").is_none() && denied.get("content").is_none());
+
+        run.abort();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

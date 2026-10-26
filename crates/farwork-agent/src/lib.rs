@@ -10,6 +10,7 @@ pub mod backoff;
 pub mod cli;
 pub mod codex;
 pub mod echo;
+pub mod fsops;
 pub mod hub;
 pub mod identity;
 pub mod ids;
