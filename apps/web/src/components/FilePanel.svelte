@@ -1,17 +1,17 @@
 <script lang="ts">
-	import { listWorkspaceDir, readWorkspaceText, fsFailure } from '$lib/api/workspace';
+	import { listSessionDir, readSessionText, fsFailure } from '$lib/api/workspace';
 	import type { FsEntry, FsTextFile } from '$lib/api/types';
 	import { describeFsFailure, fsBreadcrumb, trimFsPath, type FsFailureView } from '$lib/fs';
 	import { formatBytes, formatModified } from '$lib/format';
 
 	let {
 		token,
-		connectorId,
+		sessionId,
 		workspacePath,
 		connectorOnline
 	}: {
 		token: string;
-		connectorId: string;
+		sessionId: string;
 		workspacePath: string;
 		connectorOnline: boolean;
 	} = $props();
@@ -34,7 +34,7 @@
 	let activeKey = '';
 
 	$effect(() => {
-		const key = `${token}::${connectorId}::${root}::${connectorOnline}`;
+		const key = `${token}::${sessionId}::${root}::${connectorOnline}`;
 		if (activeKey === key) return;
 		activeKey = key;
 		listTicket += 1;
@@ -70,7 +70,7 @@
 			return;
 		}
 		try {
-			const result = await listWorkspaceDir(token, connectorId, target);
+			const result = await listSessionDir(token, sessionId, target);
 			if (ticket !== listTicket) return;
 			path = result.path;
 			entries = result.entries;
@@ -89,7 +89,7 @@
 		previewError = null;
 		preview = null;
 		try {
-			const file = await readWorkspaceText(token, connectorId, entry.path);
+			const file = await readSessionText(token, sessionId, entry.path);
 			if (ticket !== readTicket) return;
 			preview = file;
 			previewLoading = false;

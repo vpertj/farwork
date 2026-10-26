@@ -178,6 +178,7 @@ export type RuntimeState = {
 	runtime: string;
 	status: string;
 	statusReason: string | null;
+	selections: RuntimeSelections;
 	updatedSeq: number;
 };
 
@@ -191,6 +192,7 @@ export function parseRuntimeState(value: unknown): RuntimeState | null {
 		runtime: asString(raw.runtime, 'unknown'),
 		status: asString(raw.status, 'idle'),
 		statusReason: asNullableString(raw.statusReason),
+		selections: parseRuntimeSelections(raw.selections) ?? NO_RUNTIME_SELECTIONS,
 		updatedSeq: asNumber(raw.updatedSeq)
 	};
 }
@@ -720,3 +722,115 @@ export function parseAdminSettings(value: unknown): AdminSettings | null {
 	};
 }
 
+export type RuntimeCommand = {
+	name: string;
+	description: string;
+};
+
+/** 运行时自己的命令名可能带前导 `/`；界面统一按不带斜杠的名字显示，选中时再补回去。 */
+export function parseRuntimeCommand(value: unknown): RuntimeCommand | null {
+	const raw = asRecord(value);
+	if (!raw) return null;
+	const name = asString(raw.name).trim().replace(/^\/+/, '');
+	if (!name) return null;
+	return { name, description: asString(raw.description) };
+}
+
+export function parseRuntimeCommands(value: unknown): RuntimeCommand[] {
+	const commands: RuntimeCommand[] = [];
+	for (const row of asArray(asRecord(value)?.commands ?? value)) {
+		const command = parseRuntimeCommand(row);
+		if (command) commands.push(command);
+	}
+	return commands;
+}
+
+export type RuntimeCatalogItem = {
+	id: string;
+	name: string;
+	description: string;
+};
+
+export function parseRuntimeCatalogItem(value: unknown): RuntimeCatalogItem | null {
+	const raw = asRecord(value);
+	if (!raw) return null;
+	const id = asString(raw.id).trim();
+	if (!id) return null;
+	return { id, name: asString(raw.name).trim() || id, description: asString(raw.description) };
+}
+
+export function parseRuntimeCatalog(value: unknown): RuntimeCatalogItem[] {
+	const items: RuntimeCatalogItem[] = [];
+	for (const row of asArray(asRecord(value)?.items ?? value)) {
+		const item = parseRuntimeCatalogItem(row);
+		if (item) items.push(item);
+	}
+	return items;
+}
+
+export type RuntimeCatalogs = {
+	models: RuntimeCatalogItem[];
+	permissions: RuntimeCatalogItem[];
+};
+
+export type RuntimeCapabilityFlags = {
+	steer: boolean;
+	interrupt: boolean;
+	selections: boolean;
+	commands: boolean;
+};
+
+/** 能力没拿到时用它：每一项都关，界面就不会给出后端做不到的入口。 */
+export const NO_RUNTIME_CAPABILITIES: RuntimeCapabilityFlags = {
+	steer: false,
+	interrupt: false,
+	selections: false,
+	commands: false
+};
+
+export type RuntimeCapabilities = {
+	flags: RuntimeCapabilityFlags;
+	revision: number;
+	serverTime: string;
+};
+
+/**
+ * 能力是运行时自己报的：没报过就是全 false。两种键名都收 —— `capabilitySet` 是
+ * hub 落地的写法，`capabilities` 是接口草案的写法；两个都没有就返回 null，
+ * 让调用方显示真实错误，而不是猜「全支持」。
+ */
+export function parseRuntimeCapabilities(value: unknown): RuntimeCapabilities | null {
+	const raw = asRecord(value);
+	const flags = asRecord(raw?.capabilitySet) ?? asRecord(raw?.capabilities);
+	if (!raw || !flags) return null;
+	return {
+		flags: {
+			steer: asBoolean(flags.steer),
+			interrupt: asBoolean(flags.interrupt),
+			selections: asBoolean(flags.selections),
+			commands: asBoolean(flags.commands)
+		},
+		revision: asNumber(raw.revision),
+		serverTime: asString(raw.serverTime)
+	};
+}
+
+export type RuntimeSelections = {
+	model: string | null;
+	permissionMode: string | null;
+};
+
+export const NO_RUNTIME_SELECTIONS: RuntimeSelections = { model: null, permissionMode: null };
+
+export function parseRuntimeSelections(value: unknown): RuntimeSelections | null {
+	const raw = asRecord(asRecord(value)?.selections ?? value);
+	if (!raw) return null;
+	return {
+		model: asNullableString(raw.model),
+		permissionMode: asNullableString(raw.permissionMode)
+	};
+}
+
+export function parseSteerDelivery(value: unknown): boolean {
+	return asBoolean(asRecord(value)?.delivered);
+}

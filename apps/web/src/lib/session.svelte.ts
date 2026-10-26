@@ -8,6 +8,16 @@ import {
 	sessionSocketUrl
 } from './api/workspace';
 import {
+	fetchRuntimeCapabilities,
+	fetchRuntimeCatalog,
+	fetchRuntimeCommands,
+	isSessionNotRunning,
+	patchRuntimeSelections,
+	steerSession
+} from './api/runtime';
+import {
+	NO_RUNTIME_CAPABILITIES,
+	NO_RUNTIME_SELECTIONS,
 	asString,
 	cursorToSeq,
 	isOpenNotice,
@@ -19,7 +29,13 @@ import {
 	parseTimelineItem,
 	parseTimelineItems,
 	type NoticeDecision,
+	type RuntimeCapabilities,
+	type RuntimeCapabilityFlags,
+	type RuntimeCatalogItem,
+	type RuntimeCatalogs,
+	type RuntimeCommand,
 	type RuntimeNotice,
+	type RuntimeSelections,
 	type RuntimeState,
 	type Session,
 	type SessionEvent,
@@ -44,6 +60,8 @@ const EMPTY_ACTION: NoticeAction = {
 };
 
 export type ConnectionState = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed';
+
+export type SteerOutcome = { ok: true } | { ok: false; kind: 'not_running' | 'error'; message: string };
 
 export type OptimisticMessage = {
 	clientMessageId: string;
@@ -73,6 +91,21 @@ export class SessionController {
 	interrupting = $state(false);
 	interruptStream = $state<string | null>(null);
 	interruptError = $state<string | null>(null);
+	capabilities = $state<RuntimeCapabilities | null>(null);
+	capabilitiesLoading = $state(false);
+	capabilitiesError = $state<string | null>(null);
+	selections = $state<RuntimeSelections>(NO_RUNTIME_SELECTIONS);
+	catalogs = $state<RuntimeCatalogs>({ models: [], permissions: [] });
+	commands = $state<RuntimeCommand[]>([]);
+	/** 目录/命令列表各自的失败单独记：能力拿到了不代表列表拿到了。 */
+	listsError = $state<string | null>(null);
+	/** 受控下拉的显隐版本号：失败时也 +1，让选择框回到服务端已确认的值。 */
+	selectionsRevision = $state(0);
+	selectionsSaving = $state(false);
+	selectionsError = $state<string | null>(null);
+	steering = $state(false);
+	steerError = $state<string | null>(null);
+	steerNotice = $state<string | null>(null);
 	lastEventAt = $state<number | null>(null);
 	snapshotCount = $state(0);
 
@@ -86,6 +119,10 @@ export class SessionController {
 
 	get visibleItems(): TimelineItem[] {
 		return this.items.filter(isVisibleItem);
+	}
+
+	get flags(): RuntimeCapabilityFlags {
+		return this.capabilities?.flags ?? NO_RUNTIME_CAPABILITIES;
 	}
 
 	/** Notices the runtime has not closed yet — the only ones that can be answered. */
@@ -135,6 +172,19 @@ export class SessionController {
 		this.interrupting = false;
 		this.interruptStream = null;
 		this.interruptError = null;
+		this.capabilities = null;
+		this.capabilitiesLoading = false;
+		this.capabilitiesError = null;
+		this.selections = NO_RUNTIME_SELECTIONS;
+		this.catalogs = { models: [], permissions: [] };
+		this.commands = [];
+		this.listsError = null;
+		this.selectionsRevision = 0;
+		this.selectionsSaving = false;
+		this.selectionsError = null;
+		this.steering = false;
+		this.steerError = null;
+		this.steerNotice = null;
 		this.session = null;
 		this.runtimeState = null;
 		this.connection = 'idle';
@@ -147,6 +197,7 @@ export class SessionController {
 		}
 		this.loading = false;
 		this.connect();
+		void this.loadCapabilities();
 	}
 
 	dispose(): void {
@@ -173,6 +224,7 @@ export class SessionController {
 		const snapshot = await fetchSnapshot(this.#token, this.sessionId, SNAPSHOT_LIMIT);
 		this.session = snapshot.session;
 		this.runtimeState = snapshot.state;
+		if (snapshot.state) this.selections = snapshot.state.selections;
 		this.items = sortItems(snapshot.items);
 		this.approvalCount = snapshot.approvalCount;
 		this.notices = snapshot.notices;
@@ -186,6 +238,111 @@ export class SessionController {
 		if (this.#disposed) return;
 		this.connection = this.#attempt === 0 ? 'connecting' : 'reconnecting';
 		void this.openSocket();
+	}
+
+	async loadCapabilities(): Promise<void> {
+		if (this.#disposed) return;
+		const sessionId = this.sessionId;
+		this.capabilitiesLoading = true;
+		this.capabilitiesError = null;
+		let flags = NO_RUNTIME_CAPABILITIES;
+		try {
+			const capabilities = await fetchRuntimeCapabilities(this.#token, sessionId);
+			this.capabilities = capabilities;
+			flags = capabilities.flags;
+		} catch (error) {
+			this.capabilities = null;
+			this.capabilitiesError = describeError(error);
+		} finally {
+			this.capabilitiesLoading = false;
+		}
+		if (this.#disposed || sessionId !== this.sessionId) return;
+		await this.loadRuntimeLists(flags);
+	}
+
+	/** 只为报告里标 true 的能力取列表：关掉的功能不该产生一次多余请求。 */
+	private async loadRuntimeLists(flags: RuntimeCapabilityFlags): Promise<void> {
+		const failures: string[] = [];
+		let models: RuntimeCatalogItem[] = [];
+		let permissions: RuntimeCatalogItem[] = [];
+		let commands: RuntimeCommand[] = [];
+		if (flags.selections) {
+			try {
+				models = await fetchRuntimeCatalog(this.#token, this.sessionId, 'model');
+			} catch (error) {
+				failures.push(`模型目录：${describeError(error)}`);
+			}
+			try {
+				permissions = await fetchRuntimeCatalog(this.#token, this.sessionId, 'permission');
+			} catch (error) {
+				failures.push(`权限目录：${describeError(error)}`);
+			}
+		}
+		if (flags.commands) {
+			try {
+				commands = await fetchRuntimeCommands(this.#token, this.sessionId);
+			} catch (error) {
+				failures.push(`命令列表：${describeError(error)}`);
+			}
+		}
+		if (this.#disposed) return;
+		this.catalogs = { models, permissions };
+		this.commands = commands;
+		this.listsError = failures.length > 0 ? failures.join('；') : null;
+	}
+
+	async selectModel(model: string): Promise<void> {
+		await this.patchSelections({ model });
+	}
+
+	async selectPermission(permissionMode: string): Promise<void> {
+		await this.patchSelections({ permissionMode });
+	}
+
+	/**
+	 * 显示值只认服务端返回的 selections；失败时也推进版本号，好让受控下拉
+	 * 回到上一次确认值 —— 不乐观翻转。
+	 */
+	private async patchSelections(patch: { model?: string; permissionMode?: string }): Promise<void> {
+		if (this.selectionsSaving) return;
+		this.selectionsSaving = true;
+		this.selectionsError = null;
+		try {
+			this.selections = await patchRuntimeSelections(this.#token, this.sessionId, patch);
+		} catch (error) {
+			this.selectionsError = describeError(error);
+		} finally {
+			this.selectionsSaving = false;
+			this.selectionsRevision += 1;
+		}
+	}
+
+	async steer(content: string): Promise<SteerOutcome> {
+		const text = content.trim();
+		if (text.length === 0) return { ok: false, kind: 'error', message: '补充指令不能为空。' };
+		if (this.steering) return { ok: false, kind: 'error', message: '上一条补充指令还在投递中。' };
+		this.steering = true;
+		this.steerError = null;
+		this.steerNotice = null;
+		try {
+			const delivered = await steerSession(this.#token, this.sessionId, text);
+			this.steerNotice = delivered
+				? '补充指令已投递给运行中的回合。'
+				: 'hub 已受理补充指令，但未回报投递成功。';
+			return { ok: true };
+		} catch (error) {
+			const notRunning = isSessionNotRunning(error);
+			const message = notRunning ? '当前没有运行中的回合，改为发送普通消息。' : describeError(error);
+			this.steerError = message;
+			return { ok: false, kind: notRunning ? 'not_running' : 'error', message };
+		} finally {
+			this.steering = false;
+		}
+	}
+
+	clearSteerMessages(): void {
+		this.steerError = null;
+		this.steerNotice = null;
 	}
 
 	async send(content: string): Promise<boolean> {
@@ -363,7 +520,10 @@ export class SessionController {
 			}
 			case 'runtime.state.updated': {
 				const state = parseRuntimeState(event.payload.state);
-				if (state) this.runtimeState = state;
+				if (state) {
+					this.runtimeState = state;
+					this.selections = state.selections;
+				}
 				break;
 			}
 			case 'runtime.notice.snapshot': {

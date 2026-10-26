@@ -146,12 +146,12 @@ export async function createAndStartSession(
 	return result;
 }
 
-export async function listWorkspaceDir(
+export async function listSessionDir(
 	token: string,
-	connectorId: string,
+	sessionId: string,
 	path: string
 ): Promise<FsListing> {
-	const payload = await apiRequest(`/connectors/${encodeURIComponent(connectorId)}/fs/list`, {
+	const payload = await apiRequest(`/sessions/${encodeURIComponent(sessionId)}/files/list`, {
 		method: 'POST',
 		token,
 		body: { path }
@@ -161,16 +161,15 @@ export async function listWorkspaceDir(
 	return { ...listing, entries: sortFsEntries(listing.entries) };
 }
 
-export async function readWorkspaceText(
+export async function readSessionText(
 	token: string,
-	connectorId: string,
+	sessionId: string,
 	path: string
 ): Promise<FsTextFile> {
-	const payload = await apiRequest(`/connectors/${encodeURIComponent(connectorId)}/fs/readText`, {
-		method: 'POST',
-		token,
-		body: { path }
-	});
+	const payload = await apiRequest(
+		`/sessions/${encodeURIComponent(sessionId)}/files/readText`,
+		{ method: 'POST', token, body: { path } }
+	);
 	const file = parseFsText(payload);
 	if (!file) throw new Error('文件内容的响应格式无法识别。');
 	return file;
@@ -194,15 +193,15 @@ export type OpenTerminalInput = {
 	rows: number;
 };
 
-export async function openTerminal(
+export async function openSessionTerminal(
 	token: string,
-	connectorId: string,
+	sessionId: string,
 	input: OpenTerminalInput
 ): Promise<TerminalSession> {
 	const body: Record<string, unknown> = { cols: input.cols, rows: input.rows };
 	const cwd = input.cwd?.trim() ?? '';
 	if (cwd.length > 0) body.cwd = cwd;
-	const payload = await apiRequest(`/connectors/${encodeURIComponent(connectorId)}/terminals`, {
+	const payload = await apiRequest(`/sessions/${encodeURIComponent(sessionId)}/terminal`, {
 		method: 'POST',
 		token,
 		body
@@ -224,13 +223,13 @@ export async function createTerminalWsTicket(token: string, terminalId: string):
 	return ticket;
 }
 
-export function terminalSocketUrl(
-	connectorId: string,
+export function sessionTerminalSocketUrl(
+	sessionId: string,
 	terminalId: string,
 	ticket: string
 ): string {
 	return webSocketUrl(
-		`/connectors/${encodeURIComponent(connectorId)}/terminals/${encodeURIComponent(terminalId)}/stream`,
+		`/sessions/${encodeURIComponent(sessionId)}/terminal/${encodeURIComponent(terminalId)}/stream`,
 		ticket
 	);
 }

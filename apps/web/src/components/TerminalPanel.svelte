@@ -6,9 +6,9 @@
 	import { parseTerminalFrame, type TerminalSession } from '$lib/api/types';
 	import {
 		createTerminalWsTicket,
-		openTerminal,
-		terminalFailure,
-		terminalSocketUrl
+		openSessionTerminal,
+		sessionTerminalSocketUrl,
+		terminalFailure
 	} from '$lib/api/workspace';
 	import {
 		CLOSE_FRAME,
@@ -22,12 +22,12 @@
 
 	let {
 		token,
-		connectorId,
+		sessionId,
 		cwd,
 		connectorOnline
 	}: {
 		token: string;
-		connectorId: string;
+		sessionId: string;
 		cwd: string;
 		connectorOnline: boolean;
 	} = $props();
@@ -151,11 +151,11 @@
 		exitCode = null;
 		terminalId = '';
 		term?.reset();
-		if (connectorId === '') {
+		if (sessionId === '') {
 			phase = 'error';
 			failure = {
-				title: '这个会话没有绑定设备',
-				hint: '没有 connectorId 就无法在设备上创建 PTY。',
+				title: '缺少会话 id',
+				hint: '终端要走 /sessions/{id}/terminal，没有 id 就没法在设备上创建 PTY。',
 				serverMessage: '',
 				code: null,
 				offline: false
@@ -164,7 +164,7 @@
 		}
 		let created: TerminalSession;
 		try {
-			created = await openTerminal(token, connectorId, {
+			created = await openSessionTerminal(token, sessionId, {
 				cwd: terminalCwd,
 				cols: term?.cols ?? createdDims.cols,
 				rows: term?.rows ?? createdDims.rows
@@ -189,7 +189,7 @@
 			return;
 		}
 		if (disposed || run !== generation) return;
-		const ws = new WebSocket(terminalSocketUrl(connectorId, terminalId, ticket));
+		const ws = new WebSocket(sessionTerminalSocketUrl(sessionId, terminalId, ticket));
 		socket = ws;
 		ws.onmessage = (event: MessageEvent<unknown>) => {
 			if (disposed || run !== generation) return;
