@@ -1,0 +1,124 @@
+# Farwork hub — production deployment for farwork.xacalc.cn.
+#
+# Both services run a published image: nothing here builds, and the container
+# filesystem is never used as a delivery channel. The image is built once by
+# .github/workflows/docker.yml on a v* tag (or a manual run) and pushed to
+# ghcr.io/vpertj/farwork as :latest, :<git tag> and :sha-<short>. Rollback is
+# therefore a one-line change in .env (FARWORK_TAG), not a rebuild.
+#
+# Requires Compose v2 (1Panel ships it): $name:$ and
+# depends_on.condition: service_completed_successfully are v2 features.
+
+name: farwork
+
+services:
+  hub:
+    # Pin a deployment by setting FARWORK_TAG in .env (e.g. v0.1.0 or
+    # sha-1a2b3c4). :latest is only the default so a first $up -d$ works.
+    image: ghcr.io/vpertj/farwork:${FARWORK_TAG:-latest}
+    restart: always
+    environment:
+      # Everything else the binary needs is baked into the image: WORKDIR /srv,
+      # FARWORK_HUB_STATIC_DIR=/srv/web, FARWORK_HUB_PORT=7300 and a HEALTHCHECK
+      # hitting /healthz (Dockerfile, runtime stage). No HEALTHCHECK is redefined
+      # here — one definition, in the image that owns the port.
+      DATABASE_URL: ${DATABASE_URL}
+      # Signs every user token (crates/farwork-hub/src/auth.rs). Changing it logs
+      # everybody out, so set it once: openssl rand -hex 32
+      FARWORK_HUB_SECRET: ${FARWORK_HUB_SECRET}
+      # The one value that must be exact: it is copied verbatim into pairing
+      # commands ("farwork-agent pair --hub ..."), where a typo takes devices
+      # permanently offline. A malformed value fails startup on purpose.
+      FARWORK_HUB_PUBLIC_URL: ${FARWORK_HUB_PUBLIC_URL}
+      FARWORK_HUB_PORT: "7300"
+    ports:
+      # Loopback only. The public entry point is the 1Panel reverse-proxy site
+      # (farwork.xacalc.cn -> 127.0.0.1:13080), which is also where TLS ends.
+      - "127.0.0.1:13080:7300"
+    networks:
+      - 1panel-network
+    depends_on:
+      db-init:
+        # Makes $up -d$ fail loudly when the database cannot be prepared, instead of
+        # leaving a hub that crash-loops on a missing role or database.
+        condition: service_completed_successfully
+
+  db-init:
+    # One-shot: make sure the application role and database exist, then exit.
+    # Idempotent, so it runs on every $docker compose up -d$ — that is also how a
+    # rotated DB_PASSWORD reaches the database.
+    #
+    # Why a container instead of 1Panel's "Database" module: that module only knows
+    # instances it installed itself (its own container naming, data directory and
+    # credential table), so it does not recognise a PostgreSQL instance installed
+    # as an app — a database created through the panel would not be on this
+    # instance. And the panel API has no exec endpoint, so the panel cannot run
+    # this SQL either. Talking to the instance directly is the only path that
+    # cannot drift.
+    image: postgres:18.6-alpine
+    restart: "no"
+    networks:
+      - 1panel-network
+    environment:
+      # Admin identity, used only to connect.
+      PGHOST: ${DB_HOST}
+      PGUSER: ${POSTGRES_ADMIN_USER}
+      PGPASSWORD: ${POSTGRES_ADMIN_PASSWORD}
+      # Values the SQL needs. They are handed over as *container* environment and
+      # read back at run time ($$APP_* below) instead of being pasted into the command
+      # string by compose: a single $ substitution inside the shell command source
+      # would let a quote in a password break the line. As env they stay out of argv
+      # and any character is safe.
+      APP_USER: ${DB_USER}
+      APP_DB: ${DB_NAME}
+      APP_PASSWORD: ${DB_PASSWORD}
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -eu
+        # Fail before touching the database when .env is missing a value: compose
+        # substitutes an empty string for an unknown key, and an empty password
+        # would silently create a role nobody can log in with.
+        : "$${APP_USER:?DB_USER is empty}" "$${APP_DB:?DB_NAME is empty}" "$${APP_PASSWORD:?DB_PASSWORD is empty}"
+        # psql receives the values as variables, so format(%I,%L) quotes them as
+        # identifiers and literals: no hand-built SQL string, no quoting rules to
+        # get right in a .env file.
+        #
+        # Each dollar-quote pair below is written with four dollar signs, because
+        # compose collapses a doubled dollar into one before the shell ever runs.
+        # The heredoc is quoted (<<'SQL'), so the shell leaves the rest untouched.
+        #
+        # Shape: the DO block owns the role (pg_roles existence test, password
+        # re-synced in place), and CREATE DATABASE — which cannot run inside a DO
+        # block or a transaction — is a plain existence test on pg_database whose
+        # result \gexec executes.
+        psql -d postgres -v ON_ERROR_STOP=1 \
+             -v app_user="$$APP_USER" -v app_db="$$APP_DB" -v app_password="$$APP_PASSWORD" <<'SQL'
+        SET farwork.app_user = :'app_user';
+        SET farwork.app_db = :'app_db';
+        SET farwork.app_password = :'app_password';
+        DO $$$$
+        BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_setting('farwork.app_user')) THEN
+            EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L',
+                           current_setting('farwork.app_user'),
+                           current_setting('farwork.app_password'));
+          ELSE
+            EXECUTE format('ALTER ROLE %I WITH LOGIN PASSWORD %L',
+                           current_setting('farwork.app_user'),
+                           current_setting('farwork.app_password'));
+          END IF;
+        END
+        $$$$;
+        SELECT format('CREATE DATABASE %I OWNER %I',
+                      current_setting('farwork.app_db'), current_setting('farwork.app_user'))
+        WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = current_setting('farwork.app_db'));
+        \gexec
+        SQL
+        echo "db-init: role and database are in place"
+
+networks:
+  # The network 1Panel creates and every container it manages joins. Declared
+  # external so compose never creates or owns it.
+  1panel-network:
+    external: true

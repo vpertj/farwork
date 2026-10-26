@@ -53,12 +53,13 @@
 
 | 环境变量 | 默认 | 行为 | 源码 |
 | --- | --- | --- | --- |
-| `DATABASE_URL` | `postgres://tianjun@127.0.0.1:5432/farwork` | hub 的 PostgreSQL 连接串。**库必须已存在**，表由迁移创建；连接失败则启动失败 | `farwork-hub/src/config.rs:6,27` |
-| `FARWORK_HUB_PORT` / `PORT` | `7300` | 监听端口，`FARWORK_HUB_PORT` 优先，其次 `PORT`；`--port <n>` 覆盖两者 | `config.rs:7,28-33`；`main.rs:32-34` |
-| `FARWORK_HUB_SECRET` | `agent-server-dev-secret` | **未设置时打印 warn**（`FARWORK_HUB_SECRET is not set; falling back to the development secret`）并回退到开发密钥 | `config.rs:9,34-37` |
-| `FARWORK_HUB_SETUP_TOKEN` | 未设置 | 首个 admin 注册令牌。未设置时按需生成随机值并 `warn!` 打到日志（30 分钟 TTL，过期轮换），从不出现在 HTTP 响应里 | `config.rs:10,38-40`；`state.rs:55-100` |
-| `FARWORK_HUB_DB_POOL` | `10` | sqlx 连接池上限；非法值静默回退 | `config.rs:46-49` |
-| `FARWORK_HUB_PUBLIC_URL` | 未设置 | hub 对外自报的基地址（`GET /meta` 的 `hubUrl`），规范化为 `scheme://authority`、去尾斜杠；**优先级最高**——设了它，`/meta` 不再看 `Host`/`X-Forwarded-Proto`。**非法值让 hub 启动失败**（不是回退默认），因为这个串会被逐字复制进每条配对命令 | `config.rs:22-26,50-54,76-93`；`routes/meta.rs:63-73` |
+| `DATABASE_URL` | `postgres://tianjun@127.0.0.1:5432/farwork` | hub 的 PostgreSQL 连接串。**库必须已存在**，表由迁移创建；连接失败则启动失败 | `farwork-hub/src/config.rs:9,39-40` |
+| `FARWORK_HUB_PORT` / `PORT` | `7300` | 监听端口，`FARWORK_HUB_PORT` 优先，其次 `PORT`；`--port <n>` 覆盖两者 | `config.rs:10,41-46`；`main.rs:32-34` |
+| `FARWORK_HUB_SECRET` | `agent-server-dev-secret` | **未设置时打印 warn**（`FARWORK_HUB_SECRET is not set; falling back to the development secret`）并回退到开发密钥 | `config.rs:12,47-51` |
+| `FARWORK_HUB_SETUP_TOKEN` | 未设置 | 首个 admin 注册令牌。未设置时按需生成随机值并 `warn!` 打到日志（30 分钟 TTL，过期轮换），从不出现在 HTTP 响应里 | `config.rs:13,51-53`；`state.rs:55-100` |
+| `FARWORK_HUB_DB_POOL` | `10` | sqlx 连接池上限；非法值静默回退 | `config.rs:54-57` |
+| `FARWORK_HUB_PUBLIC_URL` | 未设置 | hub 对外自报的基地址（`GET /meta` 的 `hubUrl`），规范化为 `scheme://authority`、去尾斜杠；**优先级最高**——设了它，`/meta` 不再看 `Host`/`X-Forwarded-Proto`。**非法值让 hub 启动失败**（不是回退默认），因为这个串会被逐字复制进每条配对命令 | `config.rs:25-29,58-62,91-108`；`routes/meta.rs:63-73` |
+| `FARWORK_HUB_STATIC_DIR` | 未设置 | **前端静态产物的根**（`apps/web/build`）：设了 hub 就自己托管 SPA——根路径给 `index.html`，未知深链接回退 `index.html`（hash 路由），`_app/immutable/*` 发一年长缓存、`index.html` 发 `no-cache`；**未设置则完全不挂载**（`/` 仍是 404，测试与 `pnpm dev` 依赖这一点）。挂载方式是根路由的 **fallback**，所以 `/api/v2/*`、`/connector/ws`、`/sessions/{id}/ws`、`/dashboard/ws`、`/healthz`、`/install.sh` 全部优先匹配；**`/api/*` 的未知路径绝不回退成 HTML**（仍是 404 JSON）。**目录不存在或缺 `index.html` 让 hub 启动失败**（不是静默起一个没有前端的服务） | `config.rs:34,63-65,113-145`；`static_site.rs:28-71`；`lib.rs:38-56` |
 | `TEST_DATABASE_URL` | 未设置 | **仅测试**：`tests/e2e.rs` 的目标库。缺失时打印 SKIP 并直接返回（见 §8） | `tests/e2e.rs:125-138` |
 | `PUBLIC_FARWORK_API` | 空 | 仅 web 构建期：API base。留空 = 同源（dev 走 Vite 代理） | `apps/web/.env.example`；`src/lib/api/client.ts:3` |
 | `FARWORK_HUB_DEV_RUNTIMES` | 空 | **dev-only，默认关闭**：逗号分隔的额外 runtime 名，追加到 hub 的允许集合（默认集合是协议规定的 `codex/claude/opencode/acp/dsh`，**不含 `echo`**）。非空时启动打一条 WARN：`dev-only runtimes enabled: <列表> (never set FARWORK_HUB_DEV_RUNTIMES in production)`；不设置时行为完全不变 | `routes/sessions.rs:62,84-120`；`main.rs:36` |

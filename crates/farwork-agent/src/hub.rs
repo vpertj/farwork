@@ -689,6 +689,7 @@ mod tests {
                 platform: String::from("test"),
                 version: String::from("0.1.0"),
                 supported_runtimes: None,
+                agent_id: None,
             },
             runtime_probe: RuntimeProbe::none(),
             runtime,

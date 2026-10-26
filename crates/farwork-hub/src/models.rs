@@ -58,6 +58,9 @@ pub struct ConnectorRow {
     pub name: String,
     pub connector_kind: String,
     pub device_os: Option<String>,
+    /// The device's own stable id (`agent.json`); `None` means it never told us,
+    /// which is why the unique index on it is partial.
+    pub agent_id: Option<String>,
     pub status: String,
     pub last_seen_at: Option<String>,
     pub token_hash: String,

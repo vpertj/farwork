@@ -24,6 +24,7 @@ fn app() -> Router {
         setup_token: None,
         database_max_connections: 1,
         public_url: None,
+        static_dir: None,
     };
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy(UNUSED_DATABASE)

@@ -1,0 +1,16 @@
+# Keep the build context small: cargo and pnpm both write hundreds of MB, and a
+# host `apps/web/build` must never leak into the image (the web stage builds it).
+**/target
+**/node_modules
+**/dist
+**/build
+**/.svelte-kit
+**/.vite
+.git
+.gitignore
+.github
+**/*.log
+.DS_Store
+.env
+.env.*
+!.env.example

@@ -21,6 +21,10 @@ pub struct Claimed {
     pub token: String,
     /// The name the hub echoed back, i.e. the connector it created.
     pub name: String,
+    /// `true` when this device already had a connector and the hub rotated its
+    /// token instead of registering a second one. Only the hub can tell the two
+    /// apart, so the operator has to be told which happened.
+    pub reused: bool,
 }
 
 /// Every variant names the next action a human should take.
@@ -53,11 +57,16 @@ pub enum PairError {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ClaimRequest<'a> {
     code: &'a str,
     name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     platform: Option<&'a str>,
+    /// Always sent: it is the only thing that lets the hub recognise "this machine
+    /// again", and a claim without it creates a duplicate row. A hub that predates
+    /// the key ignores it, so sending it unconditionally stays compatible.
+    agent_id: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +75,10 @@ struct ClaimResponse {
     connector: Option<ClaimedConnector>,
     #[serde(default, rename = "connectorToken")]
     connector_token: Option<String>,
+    /// Absent from a hub that cannot reuse, which is "not reported": the agent
+    /// then says "paired" instead of claiming something it does not know.
+    #[serde(default)]
+    reused: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,11 +147,16 @@ pub fn map_failure(status: u16, detail_code: Option<&str>, code: &str, url: &str
 }
 
 /// Trade a pairing code for a connector token.
+///
+/// `agent_id` is this device's stable identity (`agent.json`): the hub uses it to
+/// hand back the connector the same machine already has instead of creating a
+/// second one.
 pub async fn claim(
     hub: &str,
     code: &str,
     name: &str,
     platform: &str,
+    agent_id: &str,
 ) -> Result<Claimed, PairError> {
     let url = claim_url(hub)?;
     let client = reqwest::Client::builder()
@@ -152,6 +170,7 @@ pub async fn claim(
         code,
         name,
         platform: Some(platform),
+        agent_id,
     };
     let response = client
         .post(&url)
@@ -177,6 +196,7 @@ pub async fn claim(
     let ClaimResponse {
         connector,
         connector_token,
+        reused,
     } = serde_json::from_str(&text).map_err(|_| PairError::MalformedClaim { url: url.clone() })?;
     let token = connector_token
         .map(|value| value.trim().to_owned())
@@ -193,6 +213,7 @@ pub async fn claim(
         connector_id,
         token,
         name,
+        reused,
     })
 }
 
@@ -383,10 +404,14 @@ mod tests {
     async fn a_claim_returns_the_connector_token_and_sends_the_contract_body() {
         let body = r#"{"connector":{"id":"cn_1","name":"\u6211\u7684 Mac","deviceOs":"macos","status":"online"},"connectorToken":"cxt_stub","serverTime":"2026-01-01T00:00:00Z"}"#;
         let (hub, handle) = spawn_stub(200, body).await;
-        let claimed = claim(&hub, "4F2K-9QXM", "我的 Mac", "macos").await.unwrap();
+        let claimed = claim(&hub, "4F2K-9QXM", "我的 Mac", "macos", "agt_stub")
+            .await
+            .unwrap();
         assert_eq!(claimed.connector_id, "cn_1");
         assert_eq!(claimed.token, "cxt_stub");
         assert_eq!(claimed.name, "我的 Mac");
+        // A hub that does not report the key has not reused anything.
+        assert!(!claimed.reused);
 
         let request = handle.await.unwrap();
         assert!(
@@ -395,9 +420,27 @@ mod tests {
         );
         assert!(request.contains("\"code\":\"4F2K-9QXM\""), "{request}");
         assert!(request.contains("\"platform\":\"macos\""), "{request}");
+        // The device identity is what stops a second pair from creating a second
+        // connector, so it is not optional on this side.
+        assert!(request.contains("\"agentId\":\"agt_stub\""), "{request}");
         assert!(
             request.contains("connectorToken") || request.contains("name"),
             "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reused_claim_is_reported_as_a_reuse() {
+        let body = r#"{"connector":{"id":"cn_9","name":"mbp","deviceOs":"macos","status":"offline"},"connectorToken":"cxt_rotated","reused":true,"serverTime":"2026-01-01T00:00:00Z"}"#;
+        let (hub, _handle) = spawn_stub(200, body).await;
+        let claimed = claim(&hub, "4F2K-9QXM", "mbp", "macos", "agt_stub")
+            .await
+            .unwrap();
+        assert_eq!(claimed.connector_id, "cn_9");
+        assert_eq!(claimed.token, "cxt_rotated");
+        assert!(
+            claimed.reused,
+            "the operator must be able to tell a reuse from a fresh pairing"
         );
     }
 
@@ -411,7 +454,9 @@ mod tests {
         ] {
             let body = format!(r#"{{"detail":{{"code":"{detail}","message":"x"}}}}"#);
             let (hub, _handle) = spawn_stub(status, &body).await;
-            let error = claim(&hub, "4F2K-9QXM", "mbp", "macos").await.unwrap_err();
+            let error = claim(&hub, "4F2K-9QXM", "mbp", "macos", "agt_stub")
+                .await
+                .unwrap_err();
             let shown = format!("{error:?}");
             assert!(shown.contains(expected), "{status}: {shown}");
             // A rejection never carries the token: the hub did not send one.
@@ -422,7 +467,9 @@ mod tests {
     #[tokio::test]
     async fn a_200_without_a_connector_token_is_refused() {
         let (hub, _handle) = spawn_stub(200, r#"{"connector":{"id":"cn_1"}}"#).await;
-        let error = claim(&hub, "4F2K-9QXM", "mbp", "macos").await.unwrap_err();
+        let error = claim(&hub, "4F2K-9QXM", "mbp", "macos", "agt_stub")
+            .await
+            .unwrap_err();
         assert_eq!(
             error,
             PairError::MalformedClaim {
@@ -438,7 +485,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
         let hub = format!("http://{addr}");
-        let error = claim(&hub, "4F2K-9QXM", "mbp", "macos").await.unwrap_err();
+        let error = claim(&hub, "4F2K-9QXM", "mbp", "macos", "agt_stub")
+            .await
+            .unwrap_err();
         let shown = error.to_string();
         assert!(
             shown.contains(&format!("{addr}/api/v2/pairing/claim")),

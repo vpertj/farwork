@@ -2,6 +2,9 @@
 //! tests, locally, and in a container.
 
 use std::env;
+use std::path::PathBuf;
+
+use crate::static_site::{INDEX_FILE, STATIC_DIR_ENV};
 
 pub const DEFAULT_DATABASE_URL: &str = "postgres://tianjun@127.0.0.1:5432/farwork";
 pub const DEFAULT_PORT: u16 = 7300;
@@ -24,6 +27,11 @@ pub struct Config {
     /// public name, port and TLS terminator in front of the hub, so this wins
     /// over anything derived from a request (see `routes::meta`).
     pub public_url: Option<String>,
+    /// `FARWORK_HUB_STATIC_DIR`: the built SPA (`apps/web/build`) the hub serves
+    /// itself, so one container can hold both the front end and the API. Unset
+    /// means the static surface is not mounted at all — the pre-existing
+    /// behaviour every test and `pnpm dev` depends on.
+    pub static_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -52,6 +60,10 @@ impl Config {
             .map(|value| parse_public_url(&value))
             .transpose()?
             .flatten();
+        let static_dir = match env::var(STATIC_DIR_ENV) {
+            Ok(value) => parse_static_dir(&value)?,
+            Err(_) => None,
+        };
         Ok(Self {
             database_url,
             port,
@@ -59,6 +71,7 @@ impl Config {
             setup_token,
             database_max_connections,
             public_url,
+            static_dir,
         })
     }
 
@@ -92,6 +105,32 @@ fn parse_public_url(raw: &str) -> Result<Option<String>, ConfigError> {
     Ok(Some(format!("{scheme}://{rest}")))
 }
 
+/// Resolves `FARWORK_HUB_STATIC_DIR` to a directory that can actually serve the
+/// SPA. A configured-but-broken value fails startup on purpose: a hub without a
+/// front end answers `/` with `404`, which from the outside looks like a routing
+/// bug while the deploy log happily says "listening". Empty value = "not set",
+/// like every other variable here.
+fn parse_static_dir(raw: &str) -> Result<Option<PathBuf>, ConfigError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_dir() {
+        return Err(ConfigError::InvalidStaticDir(format!(
+            "{trimmed:?} is not a directory"
+        )));
+    }
+    // Without `index.html` the SPA fallback would answer every route with a 404:
+    // a directory that looks configured but serves nothing.
+    if !path.join(INDEX_FILE).is_file() {
+        return Err(ConfigError::InvalidStaticDir(format!(
+            "{trimmed:?} has no {INDEX_FILE} (build the SPA: cd apps/web && pnpm run build)"
+        )));
+    }
+    Ok(Some(path))
+}
+
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
     #[error("invalid port {0:?}")]
@@ -100,6 +139,8 @@ pub enum ConfigError {
         "invalid FARWORK_HUB_PUBLIC_URL {0:?}: expected http://host[:port] or https://host[:port]"
     )]
     InvalidPublicUrl(String),
+    #[error("invalid FARWORK_HUB_STATIC_DIR: {0}")]
+    InvalidStaticDir(String),
 }
 
 /// `--port <n>` or `--port=<n>`. `Ok(None)` means "no override given".
@@ -127,7 +168,7 @@ pub fn parse_port_arg(args: &[String]) -> Result<Option<u16>, ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_public_url;
+    use super::{parse_public_url, parse_static_dir};
 
     #[test]
     fn public_url_is_normalized_or_rejected() {
@@ -144,5 +185,40 @@ mod tests {
         assert!(parse_public_url("ftp://hub.example.com").is_err());
         assert!(parse_public_url("https://").is_err());
         assert!(parse_public_url("https://hub example.com").is_err());
+    }
+
+    /// An empty value means "not set"; anything else must name a directory that
+    /// can actually answer `/`, because a start-up that "succeeds" without a
+    /// front end is the failure mode this validation exists to prevent.
+    #[test]
+    fn static_dir_is_optional_but_validated() {
+        assert_eq!(parse_static_dir(""), Ok(None));
+        assert_eq!(parse_static_dir("   "), Ok(None));
+
+        let root = std::env::temp_dir().join(format!("farwork-static-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create fixture directory");
+
+        // A directory without index.html cannot serve the SPA shell.
+        let missing_index = parse_static_dir(&root.to_string_lossy()).expect_err("no index.html");
+        assert!(
+            missing_index.to_string().contains("has no index.html"),
+            "unexpected message: {missing_index}"
+        );
+
+        std::fs::write(root.join("index.html"), "<!doctype html>").expect("write index.html");
+        assert_eq!(
+            parse_static_dir(&format!("  {}  ", root.to_string_lossy())),
+            Ok(Some(root.clone())),
+            "surrounding whitespace is trimmed, like every other variable here"
+        );
+
+        let missing_dir = parse_static_dir("/nonexistent/farwork-static-dir");
+        assert!(missing_dir
+            .expect_err("a missing directory must fail startup")
+            .to_string()
+            .contains("is not a directory"),);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

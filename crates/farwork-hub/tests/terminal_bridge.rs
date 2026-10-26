@@ -88,6 +88,7 @@ impl Harness {
             setup_token: Some(SETUP_TOKEN.to_string()),
             database_max_connections: 5,
             public_url: None,
+            static_dir: None,
         };
         let pool = db::connect(&config).await.expect("connect");
         db::migrate(&pool).await.expect("migrate");

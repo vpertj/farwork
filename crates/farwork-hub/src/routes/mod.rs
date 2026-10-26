@@ -7,6 +7,7 @@ pub mod connectors;
 pub mod extract;
 pub mod fs;
 pub mod meta;
+pub mod mobile_login;
 pub mod notices;
 pub mod pairing;
 pub mod projects;
@@ -31,6 +32,9 @@ pub fn api() -> Router<AppState> {
         // Third unauthenticated surface: the hub's own base address, which the
         // pairing page needs *before* it has (or needs) a token.
         .merge(meta::router())
+        // QR mobile login: `qr` takes AuthedUser, `exchange`/`refresh` are
+        // deliberately unauthenticated (the token is the credential).
+        .merge(mobile_login::router())
         .merge(notices::router())
         .merge(pairing::router())
         // The second unauthenticated surface: the device claiming a pairing code

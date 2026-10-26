@@ -89,6 +89,11 @@ pub struct AgentInfo {
         skip_serializing_if = "Option::is_none"
     )]
     pub supported_runtimes: Option<Vec<crate::runtimes::RuntimeReport>>,
+    /// This device's stable id (the `agentId` in `agent.json`). Optional on both
+    /// sides: a hub built before this key existed ignores it, and its absence
+    /// means "not reported" rather than an invalid hello.
+    #[serde(default, rename = "agentId", skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -689,6 +694,7 @@ mod tests {
                 platform: String::from("macos"),
                 version: String::from("0.1.0"),
                 supported_runtimes: None,
+                agent_id: None,
             },
         };
         let encoded = frame.encode().expect("encode");
@@ -700,6 +706,36 @@ mod tests {
             serde_json::from_str::<ClientFrame>(&encoded).unwrap(),
             frame
         );
+    }
+
+    #[test]
+    fn hello_carries_the_device_identity_and_reads_one_without_it() {
+        let frame = ClientFrame::Hello {
+            agent: AgentInfo {
+                name: String::from("mbp"),
+                platform: String::from("macos"),
+                version: String::from("0.1.0"),
+                supported_runtimes: None,
+                agent_id: Some(String::from("agt_1")),
+            },
+        };
+        let encoded = frame.encode().expect("encode");
+        assert!(encoded.contains(r#""agentId":"agt_1""#), "{encoded}");
+        assert_eq!(
+            serde_json::from_str::<ClientFrame>(&encoded).expect("parse"),
+            frame
+        );
+
+        // A hub that predates the key sends nothing, and that must still parse: the
+        // hello is the handshake, so an unknown-to-us extra key is tolerated too.
+        let without: ClientFrame = serde_json::from_str(
+            r#"{"type":"hello","agent":{"name":"mbp","platform":"macos","version":"0.1.0"}}"#,
+        )
+        .expect("hello without an agent id");
+        match without {
+            ClientFrame::Hello { agent } => assert!(agent.agent_id.is_none()),
+            other => panic!("expected hello, got {other:?}"),
+        }
     }
 
     #[test]
@@ -716,6 +752,7 @@ mod tests {
                         "no DSH bridge endpoint found",
                     ),
                 ]),
+                agent_id: None,
             },
         };
         let value: Value = serde_json::from_str(&frame.encode().expect("encode")).expect("json");

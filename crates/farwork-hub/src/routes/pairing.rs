@@ -37,6 +37,7 @@ use serde_json::{json, Value};
 
 use crate::error::{ApiError, ApiResult};
 use crate::ids;
+use crate::models::ConnectorRow;
 use crate::pairing;
 use crate::routes::connectors;
 use crate::routes::extract::AuthedUser;
@@ -94,6 +95,47 @@ struct ClaimRequest {
     /// (`connectors.device_os` is nullable) instead of being invented here.
     #[serde(default)]
     platform: Option<String>,
+    /// The device's own stable id, from its `agent.json`. Optional so an agent
+    /// that predates it keeps pairing: such a claim simply cannot be deduplicated
+    /// (a name would be a guess, and a wrong guess merges two machines), which is
+    /// why the unique index on it is partial.
+    #[serde(default, rename = "agentId")]
+    agent_id: Option<String>,
+}
+
+/// The one index that means "this machine already paired": a violation is a race
+/// to retry as a reuse, never a 500.
+const AGENT_ID_INDEX: &str = "uq_connectors_user_agent_id";
+
+/// What a finished claim produced: the row, its new token, and whether the device
+/// already had it.
+struct Claimed {
+    connector: ConnectorRow,
+    token: String,
+    reused: bool,
+}
+
+/// One claim attempt's result, or the race the caller must resolve.
+///
+/// The row is boxed because [Claimed] dwarfs the race marker: an enum is as large
+/// as its widest variant, and every "the index beat us" value would otherwise
+/// carry a whole connector row it does not have.
+enum Attempt {
+    Done(Box<Claimed>),
+    /// Another claim inserted this device between our lookup and our insert. The
+    /// transaction is dead (Postgres aborts it), so the caller rolls back and
+    /// retries as a reuse.
+    AgentTaken,
+}
+
+fn agent_taken(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Database(database) => {
+            database.code().as_deref() == Some("23505")
+                && database.constraint() == Some(AGENT_ID_INDEX)
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -232,6 +274,14 @@ async fn claim_pairing(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    // An empty string is "not reported", exactly like a missing key: a device that
+    // has no identity must not be able to occupy the unique index with "".
+    let agent_id = payload
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
     let code_hash = pairing::hash_code(&state.config().secret, &code);
     let pairing_row = sqlx::query_as::<_, PairingRow>(
@@ -253,33 +303,59 @@ async fn claim_pairing(
     }
 
     // One transaction: the connector must not survive a lost race for the pairing
-    // row, and the row must not be marked claimed if the connector failed.
+    // row, and the row must not be marked claimed if the connector failed. A
+    // device that pairs again reuses its own connector, so a second pair on one
+    // machine rotates a token instead of adding a row.
     let mut tx = state.pool().begin().await?;
-    let (connector, token) = connectors::insert_connector(
-        &mut *tx,
-        &ids::connector_id(),
+    let (connector, token, reused) = match attempt_claim(
+        &mut tx,
         &pairing_row.user_id,
         &name,
-        "cli",
         device_os.as_deref(),
+        agent_id.as_deref(),
     )
-    .await?;
-    let claimed = sqlx::query(
-        "update pairings
-            set claimed_at = $2, connector_id = $3, attempt_ip = $4
-          where id = $1 and claimed_at is null",
-    )
-    .bind(&pairing_row.id)
-    .bind(timeutil::utc_now())
-    .bind(&connector.id)
-    .bind(&source)
-    .execute(&mut *tx)
-    .await?;
-    if claimed.rows_affected() == 0 {
-        // Dropping `tx` rolls the connector insert back; the other claim wins.
-        return Err(already_claimed());
-    }
-    tx.commit().await?;
+    .await?
+    {
+        Attempt::Done(done) => {
+            let Claimed {
+                connector,
+                token,
+                reused,
+            } = *done;
+            mark_claimed(&mut tx, &pairing_row.id, &connector.id, &source).await?;
+            tx.commit().await?;
+            (connector, token, reused)
+        }
+        Attempt::AgentTaken => {
+            // Rolling back is mandatory (the failed insert aborted the
+            // transaction) *and* correct: this request must not keep a connector
+            // of its own. Postgres reported the violation only after the other
+            // claim committed, so that row is readable now.
+            tx.rollback().await?;
+            let mut tx = state.pool().begin().await?;
+            let agent_id = agent_id
+                .as_deref()
+                .ok_or_else(|| ApiError::internal("device identity lost"))?;
+            let existing =
+                connectors::find_connector_by_agent(&mut *tx, &pairing_row.user_id, agent_id)
+                    .await?
+                    // The index made room for exactly one row holding this id, and
+                    // it is not usable (revoked), so there is nothing to reuse and
+                    // nothing this request may create. Not a 500: the user has an
+                    // action to take.
+                    .ok_or_else(|| {
+                        ApiError::conflict(json!({
+                            "code": "device_identity_taken",
+                            "message": "this device identity belongs to an unusable connector; delete it in the web UI and pair again",
+                        }))
+                    })?;
+            let (connector, token) =
+                rotate_and_refresh(&mut tx, &existing, &name, device_os.as_deref()).await?;
+            mark_claimed(&mut tx, &pairing_row.id, &connector.id, &source).await?;
+            tx.commit().await?;
+            (connector, token, true)
+        }
+    };
 
     Ok(Json(json!({
         "connector": {
@@ -289,8 +365,92 @@ async fn claim_pairing(
             "status": connector.status,
         },
         "connectorToken": token,
+        // The device logs this: "re-paired" and "paired" mean different things to
+        // a user trying to get rid of a duplicate, and only the hub knows which.
+        "reused": reused,
         "serverTime": timeutil::utc_now(),
     })))
+}
+
+/// Resolve the connector this claim owns, creating one only when the device is new
+/// to this account.
+async fn attempt_claim(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: &str,
+    name: &str,
+    device_os: Option<&str>,
+    agent_id: Option<&str>,
+) -> ApiResult<Attempt> {
+    if let Some(agent_id) = agent_id {
+        if let Some(existing) =
+            connectors::find_connector_by_agent(&mut **tx, user_id, agent_id).await?
+        {
+            let (connector, token) = rotate_and_refresh(tx, &existing, name, device_os).await?;
+            return Ok(Attempt::Done(Box::new(Claimed {
+                connector,
+                token,
+                reused: true,
+            })));
+        }
+    }
+    match connectors::insert_connector(
+        &mut **tx,
+        &ids::connector_id(),
+        user_id,
+        name,
+        "cli",
+        device_os,
+        agent_id,
+    )
+    .await
+    {
+        Ok((connector, token)) => Ok(Attempt::Done(Box::new(Claimed {
+            connector,
+            token,
+            reused: false,
+        }))),
+        Err(error) if agent_taken(&error) => Ok(Attempt::AgentTaken),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A device that already has a connector keeps it: the token is rotated (the old
+/// one stops working the moment this commits, which is what makes a leaked
+/// credential useless) and the row restates the name/platform it now reports.
+async fn rotate_and_refresh(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    connector: &ConnectorRow,
+    name: &str,
+    device_os: Option<&str>,
+) -> ApiResult<(ConnectorRow, String)> {
+    let (token, _prefix) = connectors::rotate_token(&mut **tx, &connector.id).await?;
+    let connector = connectors::refresh_device(&mut **tx, &connector.id, name, device_os).await?;
+    Ok((connector, token))
+}
+
+/// The one-time switch, still conditional on `claimed_at is null`: a second claim
+/// of the same code loses here and rolls back whatever it did to a connector.
+async fn mark_claimed(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pairing_id: &str,
+    connector_id: &str,
+    source: &str,
+) -> ApiResult<()> {
+    let claimed = sqlx::query(
+        "update pairings
+            set claimed_at = $2, connector_id = $3, attempt_ip = $4
+          where id = $1 and claimed_at is null",
+    )
+    .bind(pairing_id)
+    .bind(timeutil::utc_now())
+    .bind(connector_id)
+    .bind(source)
+    .execute(&mut **tx)
+    .await?;
+    if claimed.rows_affected() == 0 {
+        return Err(already_claimed());
+    }
+    Ok(())
 }
 
 async fn get_pairing(

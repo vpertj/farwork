@@ -30,13 +30,18 @@ async fn scenario() {
     let hub = format!("http://{addr}");
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let stub = tokio::spawn(async move {
+        // The second claim is the same machine pairing again: the hub answers
+        // `reused: true` and the agent must say so instead of "redeemed".
+        let mut claims = 0u32;
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
             let head = peek_head(&stream).await;
             if head.starts_with("POST ") {
-                let request = respond_claim(stream).await;
+                let reuse = claims > 0;
+                claims += 1;
+                let request = respond_claim(stream, reuse).await;
                 let _ = tx.send(format!("claim {request}"));
             } else {
                 let (request_line, hello) = respond_ws(stream).await;
@@ -132,6 +137,52 @@ async fn scenario() {
         "{restarted_stderr}"
     );
 
+    // 3. the same machine pairs again: the hub reports the reuse, the agent logs
+    // the reuse, and no second device appears from the agent's side either.
+    let repaired = run_agent(
+        &home,
+        &[
+            "pair",
+            "--hub",
+            &hub,
+            "--code",
+            "4f2k-9qxm",
+            "--name",
+            "smoke-mac",
+            "--runtime",
+            "echo",
+            "--workdir",
+            workdir.to_str().unwrap(),
+            "--once",
+        ],
+    )
+    .await;
+    let repaired_stderr = String::from_utf8_lossy(&repaired.stderr).to_string();
+    assert_eq!(
+        repaired.status.code(),
+        Some(0),
+        "second pair failed: {repaired_stderr}"
+    );
+    assert!(
+        repaired_stderr.contains("re-paired an existing device connector=cn_smoke (token rotated)"),
+        "a reuse must be reported as a reuse, not as a new pairing: {repaired_stderr}"
+    );
+    assert!(
+        !repaired_stderr.contains("pairing code redeemed"),
+        "the second pair must not claim it created a device: {repaired_stderr}"
+    );
+    assert!(
+        !repaired_stderr.contains(CLAIM_TOKEN),
+        "connector token leaked into the log: {repaired_stderr}"
+    );
+    let after_repair = std::fs::read_to_string(&identity_file).unwrap();
+    let after_repair: serde_json::Value = serde_json::from_str(&after_repair).unwrap();
+    assert_eq!(
+        after_repair["agentId"], saved["agentId"],
+        "re-pairing must not mint a new device identity"
+    );
+    assert_eq!(after_repair["connectorId"], "cn_smoke");
+
     stub.abort();
 
     let mut events = Vec::new();
@@ -142,22 +193,32 @@ async fn scenario() {
         .iter()
         .filter(|event| event.starts_with("claim "))
         .collect();
-    assert_eq!(claims.len(), 1, "exactly one claim: {events:?}");
-    let claim = claims[0];
-    assert!(
-        claim.starts_with("claim POST /api/v2/pairing/claim "),
-        "{claim}"
-    );
-    let code_key = format!(r#""code":"{CLAIM_CODE}""#);
-    assert!(claim.contains(&code_key), "{claim}");
-    assert!(claim.contains(r#""name":"smoke-mac""#), "{claim}");
-    assert!(claim.contains(r#""platform":""#), "{claim}");
+    assert_eq!(claims.len(), 2, "two pairs claim: {events:?}");
+    let agent_id = saved["agentId"].as_str().expect("agent id").to_string();
+    let agent_key = format!(r#""agentId":"{agent_id}""#);
+    for claim in &claims {
+        assert!(
+            claim.starts_with("claim POST /api/v2/pairing/claim "),
+            "{claim}"
+        );
+        let code_key = format!(r#""code":"{CLAIM_CODE}""#);
+        assert!(claim.contains(&code_key), "{claim}");
+        assert!(claim.contains(r#""name":"smoke-mac""#), "{claim}");
+        assert!(claim.contains(r#""platform":""#), "{claim}");
+        // The identity that lets the hub reuse this device instead of adding a
+        // second row: it is the same one agent.json holds, and it is not optional.
+        assert!(claim.contains(&agent_key), "{claim}");
+    }
 
     let sockets: Vec<&String> = events
         .iter()
         .filter(|event| event.starts_with("ws "))
         .collect();
-    assert_eq!(sockets.len(), 2, "pair and restart each dialed: {events:?}");
+    assert_eq!(
+        sockets.len(),
+        3,
+        "pair, restart and re-pair each dialed: {events:?}"
+    );
     for socket in sockets {
         assert!(socket.contains("/api/v2/connector/ws?token="), "{socket}");
         assert!(
@@ -169,7 +230,13 @@ async fn scenario() {
         .iter()
         .filter(|event| event.starts_with("hello "))
         .count();
-    assert_eq!(hellos, 2, "each connection says hello: {events:?}");
+    assert_eq!(hellos, 3, "each connection says hello: {events:?}");
+    for hello in events.iter().filter(|event| event.starts_with("hello ")) {
+        assert!(
+            hello.contains(&agent_key),
+            "the hello must carry the device identity so the hub can bind it: {hello}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -215,15 +282,15 @@ async fn peek_head(stream: &TcpStream) -> String {
     String::from_utf8_lossy(&buf).to_string()
 }
 
-async fn respond_claim(mut stream: TcpStream) -> String {
+async fn respond_claim(mut stream: TcpStream, reuse: bool) -> String {
     let request = read_request(&mut stream).await;
     let body = format!(
         concat!(
             r#"{{"connector":{{"id":"cn_smoke","name":"smoke-mac","deviceOs":"macos","#,
             r#""status":"offline"}},"connectorToken":"{}","#,
-            r#""serverTime":"2026-01-01T00:00:00Z"}}"#
+            r#""reused":{},"serverTime":"2026-01-01T00:00:00Z"}}"#
         ),
-        CLAIM_TOKEN
+        CLAIM_TOKEN, reuse
     );
     let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",

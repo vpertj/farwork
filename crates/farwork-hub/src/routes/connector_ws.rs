@@ -131,6 +131,61 @@ async fn run_connector_socket(state: AppState, mut socket: WebSocket, connector:
         agent.supported_runtimes.clone(),
     );
 
+    // A connector that has no stored identity learns it here -- the repair path
+    // for rows created before `connectors.agent_id` existed. A row that already
+    // holds one is never overwritten, and an identity another connector of this
+    // account already owns is left alone with one warning: those two rows are a
+    // duplicate only the user may remove.
+    if connector.agent_id.is_none() {
+        if let Some(agent_id) = agent
+            .agent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            match ingress::bind_agent_id(&state, &connector, agent_id).await {
+                Ok(true) => tracing::info!(
+                    connector_id = %connector.id,
+                    agent_id = agent_id,
+                    "connector bound to its device identity"
+                ),
+                Ok(false) => {
+                    match ingress::agent_id_holder(
+                        &state,
+                        &connector.user_id,
+                        agent_id,
+                        &connector.id,
+                    )
+                    .await
+                    {
+                        Ok(Some(holder)) => tracing::warn!(
+                            connector_id = %connector.id,
+                            agent_id = agent_id,
+                            holder = %holder,
+                            "device identity already belongs to another connector of this account;                              leaving this row unbound (delete the duplicate in the UI)"
+                        ),
+                        Ok(None) => tracing::warn!(
+                            connector_id = %connector.id,
+                            agent_id = agent_id,
+                            "device identity could not be bound"
+                        ),
+                        Err(error) => tracing::warn!(
+                            connector_id = %connector.id,
+                            error = %error,
+                            "cannot check which connector holds this device identity"
+                        ),
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    connector_id = %connector.id,
+                    agent_id = agent_id,
+                    detail = ?error.detail,
+                    "cannot bind device identity"
+                ),
+            }
+        }
+    }
+
     // Presence is recorded before \`welcome\` so a connector that has seen the
     // welcome can rely on being routable.
     if let Err(error) = ingress::set_presence(

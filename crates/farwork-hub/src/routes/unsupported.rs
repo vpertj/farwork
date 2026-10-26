@@ -45,13 +45,14 @@ pub fn router() -> Router<AppState> {
         "/runtimes/{*rest}",
         "/devices",
         "/devices/{*rest}",
-        // OAuth, email codes, mobile QR login.
+        // OAuth and email codes. QR mobile login is implemented for the three
+        // endpoints the mobile client actually needs (routes::mobile_login:
+        // qr / exchange / refresh); the request->confirm push flow upstream also
+        // has stays here because this build has no notification channel to
+        // drive it.
         "/auth/oauth/start",
         "/auth/oauth/callback",
         "/auth/oauth/finalize",
-        "/auth/mobile-login/qr",
-        "/auth/mobile-login/exchange",
-        "/auth/mobile-login/refresh",
         "/auth/mobile-login/request",
         "/auth/mobile-login/status",
         "/auth/mobile-login/confirm",
@@ -66,8 +67,10 @@ pub fn router() -> Router<AppState> {
         // /sessions/{id}/terminal, /terminal/{*rest}, /files, /files/{*rest} and
         // the four runtime/* entries are all implemented now. Pairing codes then
         // took it to 35: /pairing and /pairing/{*rest} are now routes::pairing
-        // (start, claim, status). /connectors/{id}/pairing stays here — it is the
-        // per-device runtime switch, a different thing that has no contract yet.
+        // (start, claim, status). Mobile QR login took it to 32: qr / exchange /
+        // refresh are implemented, request / status / confirm are not.
+        // /connectors/{id}/pairing stays here — it is the per-device runtime
+        // switch, a different thing that has no contract yet.
         "/announcements",
         "/announcements/{*rest}",
         "/agents",

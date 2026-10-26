@@ -352,13 +352,18 @@ pub struct MessageCreateRequest {
 
 struct Binding {
     connector_id: String,
-    project_id: String,
-    cwd: String,
+    project_id: Option<String>,
+    cwd: Option<String>,
 }
 
 /// Validate the connector/project/workspace triple the way upstream
 /// \`_validate_project_binding\` does: both must be owned, must agree on the
 /// connector, and a supplied cwd must resolve to the project workspace.
+///
+/// No \`projectId\` at all is a supported shape, not a missing field: the
+/// workspace takes over (upstream \`findWorkspaceProject\`), so a session that
+/// arrives with only a cwd — a DSH session — gets the project its path belongs
+/// to instead of showing up unowned in the dashboard.
 async fn resolve_binding(
     state: &AppState,
     user_id: &str,
@@ -370,6 +375,31 @@ async fn resolve_binding(
         .await?
         .filter(|row| row.user_id == user_id && !row.revoked)
         .ok_or_else(|| ApiError::not_found("connector not found"))?;
+    let cwd = cwd.map(str::trim).filter(|value| !value.is_empty());
+    if project_id.trim().is_empty() {
+        let project = match cwd {
+            Some(cwd) => {
+                crate::routes::projects::ensure_workspace_project(
+                    state,
+                    user_id,
+                    &connector.id,
+                    cwd,
+                )
+                .await?
+            }
+            None => None,
+        };
+        return Ok(Binding {
+            connector_id: connector.id,
+            project_id: project.as_ref().map(|row| row.id.clone()),
+            // Reuse answers with the workspace the project was created for, so
+            // \`/w/app\` and \`/w/app/\` do not leave two spellings of one path
+            // behind in \`sessions.cwd\`.
+            cwd: project
+                .map(|row| row.workspace_path)
+                .or_else(|| cwd.map(String::from)),
+        });
+    }
     let project = crate::routes::projects::find_project(state.pool(), project_id)
         .await?
         .filter(|row| row.user_id == user_id)
@@ -379,7 +409,7 @@ async fn resolve_binding(
             "project connector and workspace must match the session",
         ));
     }
-    let resolved_cwd = match cwd.map(str::trim).filter(|value| !value.is_empty()) {
+    let resolved_cwd = match cwd {
         Some(cwd) => {
             if crate::routes::projects::workspace_key(cwd) != project.workspace_key {
                 return Err(ApiError::unprocessable(
@@ -392,19 +422,21 @@ async fn resolve_binding(
     };
     Ok(Binding {
         connector_id: connector.id,
-        project_id: project.id,
-        cwd: resolved_cwd,
+        project_id: Some(project.id),
+        cwd: Some(resolved_cwd),
     })
 }
 
 struct NewSession<'a> {
     connector_id: &'a str,
-    project_id: &'a str,
+    /// `None` when the request named no workspace, so `project_id` and `cwd`
+    /// stay null in the row rather than carrying an invented value.
+    project_id: Option<&'a str>,
     runtime: &'a str,
     runtime_id: &'a str,
     external_session_id: Option<&'a str>,
     title: Option<&'a str>,
-    cwd: &'a str,
+    cwd: Option<&'a str>,
     takeover: bool,
 }
 
@@ -500,12 +532,12 @@ async fn create_session(
         &user_id,
         NewSession {
             connector_id: &binding.connector_id,
-            project_id: &binding.project_id,
+            project_id: binding.project_id.as_deref(),
             runtime: &runtime,
             runtime_id: &runtime_id,
             external_session_id: Some(external_session_id),
             title: payload.title.as_deref(),
-            cwd: &binding.cwd,
+            cwd: binding.cwd.as_deref(),
             takeover: false,
         },
     )
@@ -551,12 +583,12 @@ async fn create_and_start_session(
         &user_id,
         NewSession {
             connector_id: &binding.connector_id,
-            project_id: &binding.project_id,
+            project_id: binding.project_id.as_deref(),
             runtime: &runtime,
             runtime_id: &runtime_id,
             external_session_id: None,
             title: payload.title.as_deref(),
-            cwd: &binding.cwd,
+            cwd: binding.cwd.as_deref(),
             // Platform-created sessions are writable, like upstream.
             takeover: true,
         },
@@ -578,8 +610,16 @@ async fn create_and_start_session(
 
     // The first user message reaches the agent through `session.start`, not
     // `session.message`: the runtime has no stream to address yet.
-    let stream_id =
-        dispatch_session_start(&state, &session, &binding.cwd, payload.content.trim()).await;
+    // `session.start` always carries a cwd (the agent requires the key), so a
+    // session that named no workspace sends an empty one: the hub cannot invent
+    // a directory, and the runtime is the side that reports what it could not use.
+    let stream_id = dispatch_session_start(
+        &state,
+        &session,
+        binding.cwd.as_deref().unwrap_or_default(),
+        payload.content.trim(),
+    )
+    .await;
     let dispatched = stream_id.is_some();
 
     crate::routes::projects::publish_dashboard_change(&state, &user_id);

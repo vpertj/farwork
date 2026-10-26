@@ -22,7 +22,9 @@ sqlx.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
-tower-http.workspace = true
+# `fs` adds ServeDir/ServeFile, used only when FARWORK_HUB_STATIC_DIR is set
+# (src/static_site.rs). Enabled per crate so the other binaries stay lean.
+tower-http = { workspace = true, features = ["fs"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true

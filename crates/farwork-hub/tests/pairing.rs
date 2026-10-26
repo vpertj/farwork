@@ -121,6 +121,7 @@ async fn bootstrap(database_url: &str) -> Harness {
         setup_token: Some(SETUP_TOKEN.to_string()),
         database_max_connections: 5,
         public_url: None,
+        static_dir: None,
     };
     let pool = db::connect(&config).await.expect("connect");
     db::migrate(&pool).await.expect("migrate");
@@ -684,4 +685,447 @@ async fn neither_the_code_nor_the_connector_token_reaches_the_database() {
         "sha256 hex digest expected: {code_hash}"
     );
     assert_ne!(code_hash, code, "the hash is not the code");
+}
+
+// ------------------------------------------------------- device identity reuse
+//
+// One machine, one connector. These tests pin what "the same device paired again"
+// means: the hub rotates the token of the connector that device already owns and
+// says so, instead of adding a row the user then has to delete by hand.
+
+/// Claim a freshly minted code as the given device. `agent_id` is `None` for the
+/// pre-identity agents ("no key at all"), which must keep pairing.
+async fn claim_as(
+    h: &Harness,
+    from: SocketAddr,
+    agent_id: Option<&str>,
+    name: &str,
+    platform: Option<&str>,
+) -> Resp {
+    let (_, code, _) = start_pairing(h, None).await;
+    let mut body = json!({ "code": code, "name": name });
+    if let Some(agent_id) = agent_id {
+        body["agentId"] = Value::String(agent_id.to_string());
+    }
+    if let Some(platform) = platform {
+        body["platform"] = Value::String(platform.to_string());
+    }
+    claim(h, from, body).await
+}
+
+fn token_of(response: &Resp) -> String {
+    response.json["connectorToken"]
+        .as_str()
+        .expect("connector token")
+        .to_string()
+}
+
+fn connector_id_of(response: &Resp) -> String {
+    response.json["connector"]["id"]
+        .as_str()
+        .expect("connector id")
+        .to_string()
+}
+
+async fn connector_count(h: &Harness) -> i64 {
+    sqlx::query_scalar("select count(*) from connectors")
+        .fetch_one(&h.pool)
+        .await
+        .expect("count")
+}
+
+/// Does this plaintext token still open a connector, and which one?
+async fn token_resolves_to(h: &Harness, token: &str) -> Option<String> {
+    farwork_hub::routes::connectors::find_connector_by_token(
+        &h.pool,
+        &farwork_hub::auth::sha256_hex(token.as_bytes()),
+    )
+    .await
+    .expect("lookup")
+    .map(|row| row.id)
+}
+
+#[tokio::test]
+async fn the_same_agent_id_reuses_its_connector_and_rotates_the_token() {
+    let Some(database_url) = test_database_url() else {
+        return;
+    };
+    let _guard = db_guard().await;
+    let h = bootstrap(&database_url).await;
+
+    let first = claim_as(&h, source(20), Some("agt_mac"), "我的 Mac", Some("macOS")).await;
+    assert_eq!(first.status, StatusCode::OK, "first claim: {}", first.text);
+    assert_eq!(
+        first.json["reused"], false,
+        "the first claim of a device creates it: {}",
+        first.text
+    );
+    let connector_id = connector_id_of(&first);
+    let first_token = token_of(&first);
+    assert_eq!(
+        token_resolves_to(&h, &first_token).await.as_deref(),
+        Some(connector_id.as_str())
+    );
+
+    // Second pairing code, same machine: no platform this time, and a name the
+    // device now reports differently.
+    let second = claim_as(&h, source(21), Some("agt_mac"), "我的 Mac (renamed)", None).await;
+    assert_eq!(
+        second.status,
+        StatusCode::OK,
+        "second claim: {}",
+        second.text
+    );
+    assert_eq!(
+        second.json["reused"], true,
+        "the same device must not create a second connector: {}",
+        second.text
+    );
+    assert_eq!(connector_id_of(&second), connector_id);
+    assert_eq!(second.json["connector"]["name"], "我的 Mac (renamed)");
+    assert_eq!(
+        second.json["connector"]["deviceOs"], "macOS",
+        "a claim that reports no platform must not erase the stored one"
+    );
+    let second_token = token_of(&second);
+    assert_ne!(
+        second_token, first_token,
+        "re-pairing must rotate the token"
+    );
+
+    // Rotation, both directions: the old credential is dead and the new one works.
+    assert_eq!(
+        token_resolves_to(&h, &first_token).await,
+        None,
+        "the superseded token must stop resolving"
+    );
+    assert_eq!(
+        token_resolves_to(&h, &second_token).await.as_deref(),
+        Some(connector_id.as_str())
+    );
+
+    assert_eq!(connector_count(&h).await, 1, "one machine, one row");
+
+    // The second pairing row records that it was claimed *by that* connector.
+    let claimed: Option<String> = sqlx::query_scalar(
+        "select connector_id from pairings where connector_id = $1 and claimed_at is not null",
+    )
+    .bind(&connector_id)
+    .fetch_all(&h.pool)
+    .await
+    .expect("pairing rows")
+    .first()
+    .cloned();
+    assert_eq!(claimed.as_deref(), Some(connector_id.as_str()));
+
+    // And the account sees exactly one device.
+    let listed = call(
+        &h.app,
+        Method::GET,
+        "/api/v2/connectors",
+        Some(&h.owner_token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.text);
+    assert_eq!(
+        listed.json["connectors"].as_array().map(Vec::len),
+        Some(1),
+        "duplicate device in the list: {}",
+        listed.text
+    );
+}
+
+#[tokio::test]
+async fn a_different_agent_id_registers_a_second_connector() {
+    let Some(database_url) = test_database_url() else {
+        return;
+    };
+    let _guard = db_guard().await;
+    let h = bootstrap(&database_url).await;
+
+    let mac = claim_as(&h, source(22), Some("agt_mac"), "我的 Mac", Some("macOS")).await;
+    let mini = claim_as(&h, source(23), Some("agt_mini"), "Mac mini", Some("macOS")).await;
+    assert_eq!(mac.status, StatusCode::OK, "mac: {}", mac.text);
+    assert_eq!(mini.status, StatusCode::OK, "mini: {}", mini.text);
+    assert_eq!(mac.json["reused"], false);
+    assert_eq!(
+        mini.json["reused"], false,
+        "a second machine is a second device: {}",
+        mini.text
+    );
+    assert_ne!(connector_id_of(&mac), connector_id_of(&mini));
+    assert_eq!(connector_count(&h).await, 2);
+}
+
+#[tokio::test]
+async fn one_agent_id_under_two_accounts_is_two_devices() {
+    let Some(database_url) = test_database_url() else {
+        return;
+    };
+    let _guard = db_guard().await;
+    let h = bootstrap(&database_url).await;
+
+    let mine = claim_as(
+        &h,
+        source(24),
+        Some("agt_shared"),
+        "shared box",
+        Some("linux"),
+    )
+    .await;
+    assert_eq!(mine.status, StatusCode::OK, "{}", mine.text);
+    let my_token = token_of(&mine);
+
+    // Same machine id, different account: the (user_id, agent_id) index must not
+    // let one account's device shadow another's.
+    let started = call(
+        &h.app,
+        Method::POST,
+        "/api/v2/pairing/start",
+        Some(&h.other_token),
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(started.status, StatusCode::CREATED, "{}", started.text);
+    let code = started.json["pairing"]["code"]
+        .as_str()
+        .expect("code")
+        .to_string();
+    let theirs = claim(
+        &h,
+        source(25),
+        json!({ "code": code, "name": "someone else's box", "agentId": "agt_shared" }),
+    )
+    .await;
+    assert_eq!(theirs.status, StatusCode::OK, "{}", theirs.text);
+    assert_eq!(
+        theirs.json["reused"], false,
+        "another account's device is not ours to reuse: {}",
+        theirs.text
+    );
+    assert_ne!(connector_id_of(&theirs), connector_id_of(&mine));
+    assert_eq!(connector_count(&h).await, 2);
+
+    // The owner's connector and its token are untouched.
+    assert_eq!(
+        token_resolves_to(&h, &my_token).await.as_deref(),
+        Some(connector_id_of(&mine).as_str())
+    );
+}
+
+#[tokio::test]
+async fn concurrent_claims_for_one_device_leave_a_single_connector() {
+    let Some(database_url) = test_database_url() else {
+        return;
+    };
+    let _guard = db_guard().await;
+    let h = bootstrap(&database_url).await;
+
+    // Two independent codes, both claimed by the same machine at once: the partial
+    // unique index is the arbiter, and neither caller may see a 500.
+    let (_, code_a, _) = start_pairing(&h, None).await;
+    let (_, code_b, _) = start_pairing(&h, None).await;
+    let a_body = json!({ "code": code_a, "name": "racing mac", "agentId": "agt_race" });
+    let b_body = json!({ "code": code_b, "name": "racing mac", "agentId": "agt_race" });
+    let (a, b) = tokio::join!(claim(&h, source(26), a_body), claim(&h, source(27), b_body));
+    assert_eq!(a.status, StatusCode::OK, "claim A: {}", a.text);
+    assert_eq!(b.status, StatusCode::OK, "claim B: {}", b.text);
+    assert_eq!(
+        connector_id_of(&a),
+        connector_id_of(&b),
+        "both claims must land on one connector: {} / {}",
+        a.text,
+        b.text
+    );
+    // Whichever claim lost the race reports the reuse (it either saw the row after
+    // the winner committed, or the unique index sent it down the retry path), so
+    // exactly one of the two created the device.
+    let created = [&a, &b]
+        .iter()
+        .filter(|response| response.json["reused"] == false)
+        .count();
+    assert_eq!(
+        created, 1,
+        "exactly one claim creates the device: {} / {}",
+        a.text, b.text
+    );
+    assert_eq!(
+        connector_count(&h).await,
+        1,
+        "the index must hold under a race"
+    );
+
+    // Both tokens were minted; whichever committed last is the live one, and the
+    // other must not be left working.
+    let a_token = token_of(&a);
+    let b_token = token_of(&b);
+    let live = [
+        token_resolves_to(&h, &a_token).await,
+        token_resolves_to(&h, &b_token).await,
+    ]
+    .iter()
+    .filter(|found| found.is_some())
+    .count();
+    assert_eq!(
+        live, 1,
+        "exactly one surviving token: {} / {}",
+        a.text, b.text
+    );
+}
+
+#[tokio::test]
+async fn a_claim_without_an_agent_id_still_pairs() {
+    let Some(database_url) = test_database_url() else {
+        return;
+    };
+    let _guard = db_guard().await;
+    let h = bootstrap(&database_url).await;
+
+    // An agent old enough to send only code/name/platform keeps working; the hub
+    // cannot deduplicate it, and inventing an identity from the name would merge
+    // two machines that happen to share one.
+    let first = claim_as(&h, source(28), None, "old agent", Some("linux")).await;
+    let second = claim_as(&h, source(29), None, "old agent", Some("linux")).await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text);
+    assert_eq!(second.status, StatusCode::OK, "{}", second.text);
+    assert_eq!(first.json["reused"], false);
+    assert_eq!(second.json["reused"], false);
+    assert_eq!(connector_count(&h).await, 2);
+
+    let stored: Vec<Option<String>> = sqlx::query_scalar("select agent_id from connectors")
+        .fetch_all(&h.pool)
+        .await
+        .expect("agent ids");
+    assert_eq!(stored, vec![None, None]);
+}
+
+// --------------------------------------------------- identity bound from hello
+//
+// The repair path: a connector created before `connectors.agent_id` existed (or by
+// an agent that paired without one) learns its identity from the next hello.
+
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Serve the harness router on a real port: the ingress is a websocket upgrade, so
+/// it cannot go through `oneshot` like the REST calls do.
+async fn serve(app: Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    addr.to_string()
+}
+
+async fn say_hello(addr: &str, token: &str, agent_id: &str) -> Socket {
+    let url = format!("ws://{addr}/api/v2/connector/ws?token={token}");
+    let (mut socket, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio_tungstenite::connect_async(url),
+    )
+    .await
+    .expect("connect timeout")
+    .expect("connect");
+    socket
+        .send(Message::Text(
+            json!({
+                "type": "hello",
+                "agent": { "name": "legacy", "platform": "macos", "version": "0.1.0", "agentId": agent_id },
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send hello");
+    // The hub binds the identity before it answers `welcome`, so receiving it is
+    // the ordering guarantee these assertions rely on.
+    let welcome = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .expect("welcome timeout")
+        .expect("frame")
+        .expect("socket");
+    let welcome = String::from_utf8_lossy(welcome.into_text().expect("text").as_ref()).to_string();
+    assert!(
+        welcome.contains("welcome"),
+        "expected welcome, got {welcome}"
+    );
+    socket
+}
+
+async fn stored_agent_id(h: &Harness, connector_id: &str) -> Option<String> {
+    sqlx::query_scalar("select agent_id from connectors where id = $1")
+        .bind(connector_id)
+        .fetch_one(&h.pool)
+        .await
+        .expect("agent id")
+}
+
+#[tokio::test]
+async fn a_hello_binds_the_device_identity_of_an_unbound_connector() {
+    let Some(database_url) = test_database_url() else {
+        return;
+    };
+    let _guard = db_guard().await;
+    let h = bootstrap(&database_url).await;
+
+    let legacy = claim_as(&h, source(30), None, "legacy mac", Some("macos")).await;
+    assert_eq!(legacy.status, StatusCode::OK, "{}", legacy.text);
+    let connector_id = connector_id_of(&legacy);
+    assert_eq!(stored_agent_id(&h, &connector_id).await, None);
+
+    let addr = serve(h.app.clone()).await;
+    let _socket = say_hello(&addr, &token_of(&legacy), "agt_repair").await;
+
+    assert_eq!(
+        stored_agent_id(&h, &connector_id).await.as_deref(),
+        Some("agt_repair"),
+        "a hello must repair a connector that has no identity"
+    );
+}
+
+#[tokio::test]
+async fn a_hello_never_takes_an_identity_another_connector_holds() {
+    let Some(database_url) = test_database_url() else {
+        return;
+    };
+    let _guard = db_guard().await;
+    let h = bootstrap(&database_url).await;
+
+    // The historical duplicates this feature cannot fix: two rows, one machine id.
+    let legacy = claim_as(&h, source(31), None, "legacy mac", Some("macos")).await;
+    let duplicate = claim_as(&h, source(32), None, "legacy mac", Some("macos")).await;
+    assert_eq!(legacy.status, StatusCode::OK, "{}", legacy.text);
+    assert_eq!(duplicate.status, StatusCode::OK, "{}", duplicate.text);
+    let first_id = connector_id_of(&legacy);
+    let second_id = connector_id_of(&duplicate);
+
+    let addr = serve(h.app.clone()).await;
+    let _first = say_hello(&addr, &token_of(&legacy), "agt_repair").await;
+    assert_eq!(
+        stored_agent_id(&h, &first_id).await.as_deref(),
+        Some("agt_repair")
+    );
+
+    // The duplicate's hello connects normally, but must not steal the identity --
+    // that would 500 on the partial unique index and hide which row to delete.
+    let _second = say_hello(&addr, &token_of(&duplicate), "agt_repair").await;
+    assert_eq!(
+        stored_agent_id(&h, &second_id).await,
+        None,
+        "an identity owned by another connector must not be overwritten"
+    );
+    assert_eq!(
+        stored_agent_id(&h, &first_id).await.as_deref(),
+        Some("agt_repair"),
+        "the holder keeps its identity"
+    );
 }

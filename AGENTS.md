@@ -25,7 +25,8 @@ Farwork = 跨设备 Agent 工作台：在浏览器里接管远端设备上的 Ag
 - `docs/architecture.md` — 当前架构、`/api/v2` 端点表、**Connector Ingress（§5，两个方向的帧表）**、timeline 语义、环境变量、M1 协议附录（唯一协议真相源）。
 - `docs/roadmap.md` — M1–M4 里程碑与验收点（里程碑的唯一事实来源）。
 - `.github/workflows/ci.yml` — CI 双 job：`rust`（fmt/clippy/test + `postgres:18-alpine` service）、`web`（install/check/build）。
-- 根目录：`Cargo.toml`（workspace）、`rust-toolchain.toml`、`README.md`、`NOTICE`、`LICENSE`。
+- `.github/workflows/docker.yml` — tag `v*` 或手动触发时构建并推送 `ghcr.io/vpertj/farwork`（`latest` / git tag / `sha-<short>`，amd64+arm64，只用 `GITHUB_TOKEN`，不需要新 secret）。
+- 根目录：`Cargo.toml`（workspace）、`rust-toolchain.toml`、`README.md`、`NOTICE`、`LICENSE`、`Dockerfile` + `.dockerignore`（**单容器部署**：hub 带着 `FARWORK_HUB_STATIC_DIR` 自己托管静态 SPA，见 §3 与 `crates/farwork-hub/src/static_site.rs`）。
 - 未落盘：`apps/mobile`（M4 的 Capacitor 工程，目前不存在；先别引用它）、本仓 `contracts/`（仓内尚未落库；上游 `/tmp/anywhere-survey/contracts/` 是存在的，见 4.2）。
 
 ## 3. 能跑的命令（单一事实来源，与 CI 一致）
@@ -202,3 +203,4 @@ node packages/dsh-plugin/scripts/selftest-bridge.mjs     # 假 ctx + 真 TCP + m
 2. **子代理必须隔离 `FARWORK_HOME`**。默认 `~/.farwork/agent.json` 是**用户真实凭证**；任何测试（尤其是 "在 `~` 下真跑一遍" 这类验收）都必须 `FARWORK_HOME=/tmp/...`，否则会把用户正在用的设备凭证覆盖成指向测试桩的假地址——真实发生过两次，表现为「怎么改命令都连不上」。
    - 同一个根下还有 **DSH checkpoint**（`$FARWORK_HOME/dsh/sync/checkpoints/`），隔离 `FARWORK_HOME` 时它一起被隔离；**自研桥插件的 rendezvous 目录 `~/.farwork/dsh-bridge/` 不属于 `FARWORK_HOME`**——测桥一律给 `endpointDir` 指到 `mkdtemp`（插件自测就是这么做的），不要写进用户真实的 `~/.farwork/dsh-bridge`。
 3. **不要动别人正在用的端口，也不要 kill 不是自己起的进程**。`7300`（hub）与 `5173`（web dev）是演示/联调常驻口。测试一律用 `7400+`（临时后端）与 `5199+`（临时前端），收尾按 PID 收拾自己起的那几个。清理时用 `pkill -f '<自己的完整命令行>'`，不要 `pkill -f farwork-hub` 这种模糊模式。
+4. **迁移编号是全局唯一资源，并行时必须现查现用**。`crates/farwork-hub/migrations/` 的版本号是 sqlx 的记账键：两个 agent 同时新建 `0008_*.sql` 会让所有集成测试在 bootstrap 阶段直接失败（`migration 8 was previously applied but has been modified`），而且失败信息指向的是迁移系统而不是你的改动，很容易被误判成环境问题（真实发生过）。做法：写迁移前 `ls crates/farwork-hub/migrations/` 取下一个号；提交前再确认一次没被抢；发现撞车时**后落地的一方改名**（例如 0009），不要两边都保留。迁移只加不改：已合入的迁移文件禁止再编辑——那等于篡改已应用的版本，会让所有人的库都需要手工修。

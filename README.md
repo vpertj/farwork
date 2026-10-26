@@ -168,6 +168,24 @@ cargo run -p farwork-agent -- --token '<connectorToken>'
 
 只想验证协议与审批管道、不装 codex：hub 用 `FARWORK_HUB_DEV_RUNTIMES=echo cargo run -p farwork-hub` 启动，agent 加 `--runtime echo`。`echo` 默认**不在**允许的 runtime 集合里，必须显式打开这个 dev-only 开关（启动会打 WARN），生产不要设。
 
+### 5. 单容器部署（hub 自己托管前端，不需要 nginx）
+
+`Dockerfile` 把前端产物与 hub 打进**一个**容器：hub 带着 `FARWORK_HUB_STATIC_DIR=/srv/web` 启动，自己托管 SPA（`/` 与未知深链接回 `index.html`），同时照旧提供 `/api/v2/*`、各 WS、`/healthz`、`/install.sh`。
+
+```bash
+docker build -t farwork:dev .
+docker run -d --name farwork -p 13080:7300 \
+  -e DATABASE_URL='postgres://<user>@<db-host>:5432/farwork' \
+  -e FARWORK_HUB_SECRET='<随机长串>' \
+  -e FARWORK_HUB_PUBLIC_URL='https://farwork.example.com' \
+  farwork:dev
+curl -fsS http://127.0.0.1:13080/healthz && curl -fsS http://127.0.0.1:13080/ | head -3
+```
+
+- 运行阶段是 `debian:bookworm-slim`（**必须有 shell**，不是 distroless），非 root 运行，`HEALTHCHECK` 打 `/healthz`。
+- 打 tag 后 `.github/workflows/docker.yml` 自动构建并推送 `ghcr.io/vpertj/farwork`（`latest` + git tag + `sha-<short>`，amd64/arm64 双架构）。
+- 容器不终止 TLS：域名与证书交给反向代理（例如 1Panel 的网站/反向代理）。
+
 > **端口冲突提醒**：`farwork-hub` 与 M1 的 `farwork-server` **默认都监听 7300**。两套后端不能同时起；要跑 M1 探针请显式 `--port`。
 
 ## 环境变量
@@ -180,6 +198,7 @@ cargo run -p farwork-agent -- --token '<connectorToken>'
 | `FARWORK_HUB_SETUP_TOKEN` | 未设置 | 首个 admin 注册令牌。未设置时进程生成一个随机值并打到日志（30 分钟 TTL，过期轮换），从不经 HTTP 返回 |
 | `FARWORK_HUB_DB_POOL` | `10` | sqlx 连接池最大连接数（非法值回退默认） |
 | `FARWORK_HUB_PUBLIC_URL` | 未设置 | hub 对外自报的基地址（`GET /api/v2/meta` 的 `hubUrl`），优先级最高；**写错则 hub 启动失败**（这个串会被逐字复制进每条配对命令） |
+| `FARWORK_HUB_STATIC_DIR` | 未设置 | **前端静态产物根**（`apps/web/build`）。设了 hub 就自己托管 SPA：`/` 与未知深链接回 `index.html`（`index.html` 发 `no-cache`，`_app/immutable/*` 长缓存），`/api/*` 的未知路径仍是 404 JSON；**未设置则完全不挂载**。目录不存在或缺 `index.html` 时**启动失败** |
 | `TEST_DATABASE_URL` | 未设置 | **仅测试**：hub 集成测试的目标库。未设置时测试打印 `SKIP ...` 并直接返回（不是通过） |
 | `PUBLIC_FARWORK_API` | 空 | **仅 web 构建期**：API base。留空 = 与页面同源（dev 走 Vite 代理） |
 | `FARWORK_HUB_DEV_RUNTIMES` | 空 | **dev-only，默认关闭**：逗号分隔的额外 runtime 名（例如 `echo`），追加到 hub 的允许集合；非空时启动打 WARN。默认允许集合不含 `echo`，生产不要设 |

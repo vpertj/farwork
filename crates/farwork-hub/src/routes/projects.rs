@@ -62,12 +62,157 @@ pub struct ProjectSessionsQuery {
 }
 
 /// Canonical workspace identity for the uniqueness constraint. Trailing
-/// separators are stripped so `/w/app` and `/w/app/` share one project.
+/// separators are stripped so `/w/app` and `/w/app/` share one project, and
+/// case is folded so a case-only difference cannot fork one workspace into two
+/// projects: macOS and Windows default to case-insensitive paths, and a session
+/// silently landing in a twin project is worse than merging two directories the
+/// user typed differently.
 pub fn workspace_key(path: &str) -> String {
     let trimmed = path.trim();
     let stripped = trimmed.trim_end_matches('/');
     let key = if stripped.is_empty() { "/" } else { stripped };
-    key.to_string()
+    key.to_lowercase()
+}
+
+/// Absolute on every platform a connector can report: a POSIX `/...`, a
+/// Windows `C:\...`, or a UNC share. A relative cwd names no workspace, so
+/// it must never be promoted into a project.
+pub fn is_absolute_workspace(path: &str) -> bool {
+    if path.starts_with('/') || path.starts_with("\\\\") {
+        return true;
+    }
+    let mut chars = path.chars();
+    match (chars.next(), chars.next(), chars.next()) {
+        (Some(letter), Some(':'), Some(sep)) => {
+            letter.is_ascii_alphabetic() && (sep == '\\' || sep == '/')
+        }
+        _ => false,
+    }
+}
+
+/// Project name derived from a workspace path (upstream `workspaceName`): the
+/// last path segment, or `Workspace` when the path has none.
+pub fn workspace_name(path: &str) -> String {
+    let trimmed = path.trim().trim_end_matches('/');
+    match trimmed.rsplit('/').next() {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => String::from("Workspace"),
+    }
+}
+
+/// `base`, or the first free `base (n)` — `uq_projects_user_name` is per user,
+/// so an auto-created project must not steal a name the user already chose.
+async fn available_project_name(state: &AppState, user_id: &str, base: &str) -> ApiResult<String> {
+    let base: String = base.trim().chars().take(255).collect();
+    let base = if base.is_empty() {
+        String::from("Workspace")
+    } else {
+        base
+    };
+    let taken: Vec<String> = sqlx::query_scalar("select name from projects where user_id = $1")
+        .bind(user_id)
+        .fetch_all(state.pool())
+        .await?;
+    if !taken.iter().any(|name| name == &base) {
+        return Ok(base);
+    }
+    for suffix in 1..=1000u32 {
+        let ending = format!(" ({suffix})");
+        let head: String = base.chars().take(255 - ending.chars().count()).collect();
+        let candidate = format!("{head}{ending}");
+        if !taken.iter().any(|name| name == &candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(ApiError::conflict(json!({
+        "code": "project_name_conflict",
+        "message": "cannot derive a unique project name for this workspace",
+    })))
+}
+
+pub async fn find_workspace_project(
+    pool: &sqlx::PgPool,
+    user_id: &str,
+    connector_id: &str,
+    workspace_key: &str,
+) -> Result<Option<ProjectRow>, sqlx::Error> {
+    sqlx::query_as::<_, ProjectRow>(&format!(
+        "select {PROJECT_COLUMNS} from projects
+          where user_id = $1 and connector_id = $2 and workspace_key = $3"
+    ))
+    .bind(user_id)
+    .bind(connector_id)
+    .bind(workspace_key)
+    .fetch_optional(pool)
+    .await
+}
+
+/// The project that owns `cwd`, created on first sight (upstream
+/// `findWorkspaceProject`). A DSH session arrives with only a cwd; without this
+/// step the dashboard shows it as an orphan that belongs to no project.
+///
+/// `None` is the honest answer for a cwd that names no workspace (empty or
+/// relative): that session stays project-less instead of being filed under a
+/// directory the user never created.
+pub async fn ensure_workspace_project(
+    state: &AppState,
+    user_id: &str,
+    connector_id: &str,
+    cwd: &str,
+) -> ApiResult<Option<ProjectRow>> {
+    let cwd = cwd.trim();
+    if !is_absolute_workspace(cwd) {
+        return Ok(None);
+    }
+    let key = workspace_key(cwd);
+    // At most three rounds: one to find-or-create, one to re-read after losing
+    // the insert race (or the name race), one spare. Losing both twice in a row
+    // means something other than concurrency is wrong.
+    for _ in 0..3 {
+        if let Some(existing) =
+            find_workspace_project(state.pool(), user_id, connector_id, &key).await?
+        {
+            return Ok(Some(existing));
+        }
+        let name = available_project_name(state, user_id, &workspace_name(cwd)).await?;
+        let now = timeutil::utc_now();
+        let inserted = sqlx::query_as::<_, ProjectRow>(&format!(
+            "insert into projects
+                (id, user_id, connector_id, name, workspace_path, workspace_key,
+                 manually_created, pinned, created_at, updated_at)
+             values ($1, $2, $3, $4, $5, $6, false, false, $7, $7)
+             returning {PROJECT_COLUMNS}"
+        ))
+        .bind(ids::project_id())
+        .bind(user_id)
+        .bind(connector_id)
+        .bind(&name)
+        .bind(cwd)
+        .bind(&key)
+        .bind(&now)
+        .fetch_one(state.pool())
+        .await;
+        match inserted {
+            Ok(row) => {
+                publish_dashboard_change(state, user_id);
+                return Ok(Some(row));
+            }
+            // Concurrent sessions for one workspace both find nothing and both
+            // insert; `uq_projects_user_connector_workspace` lets exactly one
+            // win, and the loser re-reads that row instead of forking a twin.
+            Err(sqlx::Error::Database(error)) if error.is_unique_violation() => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    find_workspace_project(state.pool(), user_id, connector_id, &key)
+        .await?
+        .map(Some)
+        .ok_or_else(|| {
+            ApiError::conflict(json!({
+                "code": "project_name_conflict",
+                "message": "cannot bind this workspace to a project",
+            }))
+        })
 }
 
 pub async fn find_project(
@@ -386,5 +531,29 @@ mod tests {
         assert_eq!(workspace_key(" /w/app/ "), "/w/app");
         assert_eq!(workspace_key("/"), "/");
         assert_eq!(workspace_key("   "), "/");
+    }
+
+    #[test]
+    fn workspace_key_folds_case_so_one_directory_is_one_project() {
+        assert_eq!(workspace_key("/w/App/"), workspace_key("/w/app"));
+        assert_eq!(workspace_key("/W/APP"), "/w/app");
+    }
+
+    #[test]
+    fn only_absolute_paths_name_a_workspace() {
+        assert!(is_absolute_workspace("/tmp/fw"));
+        assert!(is_absolute_workspace("C:\\work"));
+        assert!(is_absolute_workspace("c:/work"));
+        assert!(!is_absolute_workspace("relative/path"));
+        assert!(!is_absolute_workspace("./x"));
+        assert!(!is_absolute_workspace(""));
+        assert!(!is_absolute_workspace("~/x"));
+    }
+
+    #[test]
+    fn workspace_name_uses_the_last_segment() {
+        assert_eq!(workspace_name("/tmp/fw-autoproj"), "fw-autoproj");
+        assert_eq!(workspace_name("/tmp/fw-autoproj/"), "fw-autoproj");
+        assert_eq!(workspace_name("/"), "Workspace");
     }
 }

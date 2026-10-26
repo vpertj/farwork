@@ -19,6 +19,7 @@ pub mod routes;
 pub mod runtime_caps;
 pub mod runtimes;
 pub mod state;
+pub mod static_site;
 pub mod termrelay;
 pub mod timeline;
 pub mod timeutil;
@@ -35,13 +36,23 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 pub fn app(state: AppState) -> Router {
-    Router::new()
+    let static_dir = state.config().static_dir.clone();
+    let router = Router::new()
         .route("/healthz", get(health))
         // The pairing page hands the user `curl -fsSL <hubUrl>/install.sh | sh`,
         // so this route lives at the root, next to `/healthz` — not under
         // `/api/v2`, which no part of that command carries.
         .merge(install::router())
-        .nest("/api/v2", routes::api())
+        .nest("/api/v2", routes::api());
+    // The SPA is a fallback, never a route: every path above is matched first
+    // and keeps its own status code, and only when
+    // `FARWORK_HUB_STATIC_DIR` names a real build is any static surface
+    // mounted (tests and `pnpm dev` run with `/` answering 404).
+    let router = match static_dir {
+        Some(dir) => router.fallback_service(static_site::router(dir)),
+        None => router,
+    };
+    router
         .layer(TraceLayer::new_for_http())
         .layer(
             CorsLayer::new()

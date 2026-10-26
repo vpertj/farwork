@@ -41,7 +41,7 @@ pub fn router() -> Router<AppState> {
 }
 
 const CONNECTOR_COLUMNS: &str =
-    "id, user_id, name, connector_kind, device_os, status, last_seen_at,
+    "id, user_id, name, connector_kind, device_os, agent_id, status, last_seen_at,
             token_hash, token_prefix, revoked, created_at, updated_at";
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +100,10 @@ pub async fn find_connector_by_token(
 /// connector registered by `POST /connectors`, so both paths must mint the same
 /// object (same id shape, same token digest, same `offline` start). The caller
 /// receives the plaintext token once; the row keeps only its digest.
+///
+/// Returns the raw `sqlx` error rather than [ApiError]: pairing has to recognise
+/// the `uq_connectors_user_agent_id` violation and retry as a reuse, and a
+/// flattened "internal database error" would hide that.
 pub async fn insert_connector<'e, E>(
     executor: E,
     connector_id: &str,
@@ -107,7 +111,8 @@ pub async fn insert_connector<'e, E>(
     name: &str,
     connector_kind: &str,
     device_os: Option<&str>,
-) -> ApiResult<(ConnectorRow, String)>
+    agent_id: Option<&str>,
+) -> Result<(ConnectorRow, String), sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
@@ -116,9 +121,9 @@ where
     let now = timeutil::utc_now();
     let connector = sqlx::query_as::<_, ConnectorRow>(&format!(
         "insert into connectors
-            (id, user_id, name, connector_kind, device_os, status, token_hash, token_prefix,
-             revoked, created_at, updated_at)
-         values ($1, $2, $3, $4, $5, 'offline', $6, $7, false, $8, $8)
+            (id, user_id, name, connector_kind, device_os, agent_id, status, token_hash,
+             token_prefix, revoked, created_at, updated_at)
+         values ($1, $2, $3, $4, $5, $6, 'offline', $7, $8, false, $9, $9)
          returning {CONNECTOR_COLUMNS}"
     ))
     .bind(connector_id)
@@ -126,12 +131,65 @@ where
     .bind(name)
     .bind(connector_kind)
     .bind(device_os)
+    .bind(agent_id)
     .bind(sha256_hex(token.as_bytes()))
     .bind(&prefix)
     .bind(&now)
     .fetch_one(executor)
     .await?;
     Ok((connector, token))
+}
+
+/// The connector that already represents this device under this account.
+///
+/// `for update` because a claim that finds a row here rotates its token: two
+/// claims for one machine must rotate one after the other, not interleave two
+/// updates that both think they own the row.
+pub async fn find_connector_by_agent<'e, E>(
+    executor: E,
+    user_id: &str,
+    agent_id: &str,
+) -> Result<Option<ConnectorRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query_as::<_, ConnectorRow>(&format!(
+        "select {CONNECTOR_COLUMNS} from connectors
+          where user_id = $1 and agent_id = $2 and revoked = false
+          for update"
+    ))
+    .bind(user_id)
+    .bind(agent_id)
+    .fetch_optional(executor)
+    .await
+}
+
+/// Restate what a re-pairing device calls itself.
+///
+/// A re-pair is the device speaking about itself, so its name wins; `device_os`
+/// only overwrites when this claim reported one, because an agent that does not
+/// know its platform must not erase what it told the hub before.
+pub async fn refresh_device<'e, E>(
+    executor: E,
+    connector_id: &str,
+    name: &str,
+    device_os: Option<&str>,
+) -> Result<ConnectorRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query_as::<_, ConnectorRow>(&format!(
+        "update connectors
+            set name = $2, device_os = coalesce($3, device_os), updated_at = $4
+          where id = $1
+          returning {CONNECTOR_COLUMNS}"
+    ))
+    .bind(connector_id)
+    .bind(name)
+    .bind(device_os)
+    .bind(timeutil::utc_now())
+    .fetch_one(executor)
+    .await
 }
 
 async fn owned_connector(
@@ -225,8 +283,19 @@ async fn create_connector(
         })));
     }
 
-    let (connector, token) =
-        insert_connector(state.pool(), &connector_id, &user_id, &name, &kind, None).await?;
+    // Registration without an installation id is a new device every time: this
+    // path has no device identity to reuse (`pairing/claim` does, see its
+    // `agentId`).
+    let (connector, token) = insert_connector(
+        state.pool(),
+        &connector_id,
+        &user_id,
+        &name,
+        &kind,
+        None,
+        None,
+    )
+    .await?;
 
     Ok(Json(json!({
         "connector": connector_view(&state, &connector),
@@ -235,7 +304,13 @@ async fn create_connector(
     })))
 }
 
-async fn rotate_token(pool: &sqlx::PgPool, connector_id: &str) -> ApiResult<(String, String)> {
+/// Mint a new token for an existing connector: the only place a device token is
+/// issued after creation, so `POST /connectors/{id}/revoke`, the idempotent
+/// `POST /connectors` retry and a re-pairing claim all rotate the same way.
+pub async fn rotate_token<'e, E>(executor: E, connector_id: &str) -> ApiResult<(String, String)>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let token = ids::connector_token();
     let prefix: String = token.chars().take(12).collect();
     let now = timeutil::utc_now();
@@ -248,7 +323,7 @@ async fn rotate_token(pool: &sqlx::PgPool, connector_id: &str) -> ApiResult<(Str
     .bind(sha256_hex(token.as_bytes()))
     .bind(&prefix)
     .bind(&now)
-    .execute(pool)
+    .execute(executor)
     .await?;
     if row.rows_affected() == 0 {
         return Err(ApiError::not_found("connector not found"));

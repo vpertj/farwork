@@ -60,16 +60,30 @@ async fn run() -> Result<()> {
             .code
             .clone()
             .ok_or_else(|| anyhow!("pair needs --code <code>"))?;
-        let claimed = pair::claim(&cli.hub, &code, &name, cli::platform()).await?;
+        let claimed =
+            pair::claim(&cli.hub, &code, &name, cli::platform(), &identity.agent_id).await?;
         identity.set_credentials(&cli.hub, &claimed.connector_id, &claimed.token);
         identity::save(&identity_path, &identity)?;
-        tracing::info!(
-            hub = %cli.hub,
-            connector_id = %claimed.connector_id,
-            connector_name = %claimed.name,
-            identity_file = %identity_path.display(),
-            "pairing code redeemed and saved; starting connector"
-        );
+        if claimed.reused {
+            // Same device, same connector: the hub rotated the token instead of
+            // registering a second one. A user cleaning up duplicates needs to see
+            // that this run did *not* add a row.
+            tracing::info!(
+                hub = %cli.hub,
+                connector_name = %claimed.name,
+                identity_file = %identity_path.display(),
+                "re-paired an existing device connector={} (token rotated)",
+                claimed.connector_id
+            );
+        } else {
+            tracing::info!(
+                hub = %cli.hub,
+                connector_id = %claimed.connector_id,
+                connector_name = %claimed.name,
+                identity_file = %identity_path.display(),
+                "pairing code redeemed and saved; starting connector"
+            );
+        }
     }
 
     let credentials = credentials::resolve(&cli, &identity, &identity_path)?;
@@ -189,6 +203,9 @@ async fn run() -> Result<()> {
             platform: String::from(cli::platform()),
             version: String::from(VERSION),
             supported_runtimes: None,
+            // The hub binds this to the connector so a hello can repair a row
+            // created before `connectors.agent_id` existed.
+            agent_id: Some(identity.agent_id.clone()),
         },
         runtime_probe,
         runtime: cli.runtime,

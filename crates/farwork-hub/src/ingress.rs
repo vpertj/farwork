@@ -182,6 +182,62 @@ pub async fn set_presence(
     Ok(())
 }
 
+/// Bind a device identity to a connector that has none.
+///
+/// The pairing claim already writes `agent_id`; this is the repair path for rows
+/// created before the column existed (and for agents old enough to pair without
+/// reporting one). Two rules, both deliberate:
+///
+/// * Never overwrite: a connector that already holds an id keeps it, so a
+///   reconnecting device cannot steal another row's identity.
+/// * Never rebind a taken id: if another connector of this account already owns
+///   it, those two rows are history the user must see and delete in the UI.
+///   Writing it here would violate the partial unique index and, worse, hide the
+///   duplicate behind a 500 at handshake time.
+pub async fn bind_agent_id(
+    state: &AppState,
+    connector: &crate::models::ConnectorRow,
+    agent_id: &str,
+) -> ApiResult<bool> {
+    let bound = sqlx::query(
+        "update connectors
+            set agent_id = $2, updated_at = $3
+          where id = $1 and agent_id is null
+            and not exists (
+                select 1 from connectors held
+                 where held.user_id = connectors.user_id
+                   and held.agent_id = $2
+                   and held.id <> connectors.id
+            )",
+    )
+    .bind(&connector.id)
+    .bind(agent_id)
+    .bind(timeutil::utc_now())
+    .execute(state.pool())
+    .await?;
+    Ok(bound.rows_affected() == 1)
+}
+
+/// Whether some other connector of the same account already owns this identity —
+/// the read that turns "the bind did nothing" into a message a human can act on.
+pub async fn agent_id_holder(
+    state: &AppState,
+    user_id: &str,
+    agent_id: &str,
+    connector_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "select id from connectors
+          where user_id = $1 and agent_id = $2 and id <> $3
+          limit 1",
+    )
+    .bind(user_id)
+    .bind(agent_id)
+    .bind(connector_id)
+    .fetch_optional(state.pool())
+    .await
+}
+
 /// Heartbeat: liveness only. Deliberately not a dashboard invalidation — a
 /// rebuild every 15s per connector would be pure noise.
 pub async fn touch_last_seen(state: &AppState, connector_id: &str) -> ApiResult<()> {
@@ -515,6 +571,11 @@ pub struct AgentInfo {
     /// must keep connecting.
     #[serde(default, rename = "supportedRuntimes")]
     pub supported_runtimes: Option<Vec<crate::runtimes::RuntimeReport>>,
+    /// The device's own stable id. Optional for the same reason as
+    /// `supported_runtimes`: an older agent omits the key entirely, and a hello
+    /// without it must still be a valid handshake (it just cannot bind anything).
+    #[serde(default, rename = "agentId")]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
