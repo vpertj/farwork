@@ -56,6 +56,13 @@ pub fn terminal_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// Share id. Upstream `infra/repositories/shares.py` mints
+/// `shr_<secrets.token_urlsafe(24)>`; the id is the only thing a public link
+/// carries, so it stays opaque and unguessable.
+pub fn share_id() -> String {
+    format!("shr_{}", token_urlsafe(24))
+}
+
 /// Connector device credential (`cxt_` prefix, 32 random bytes).
 pub fn connector_token() -> String {
     format!("cxt_{}", token_urlsafe(32))

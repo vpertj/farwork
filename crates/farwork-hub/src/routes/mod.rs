@@ -8,6 +8,7 @@ pub mod fs;
 pub mod notices;
 pub mod projects;
 pub mod sessions;
+pub mod shares;
 pub mod terminals;
 pub mod unsupported;
 pub mod ws;
@@ -25,6 +26,10 @@ pub fn api() -> Router<AppState> {
         .merge(notices::router())
         .merge(projects::router())
         .merge(sessions::router())
+        .merge(shares::router())
+        // The one unauthenticated surface under /api/v2: a public share link is
+        // the visitor's only credential, so this router takes no AuthedUser.
+        .merge(shares::public_router())
         .merge(terminals::router())
         .merge(ws::router())
         .merge(unsupported::router())

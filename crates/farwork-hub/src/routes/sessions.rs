@@ -165,7 +165,13 @@ pub async fn find_session(
     .await
 }
 
-async fn owned_session(state: &AppState, user_id: &str, session_id: &str) -> ApiResult<SessionRow> {
+/// Session lookup that also enforces ownership: someone else's session id is a
+/// 404, so a caller cannot probe for sessions it does not own.
+pub(crate) async fn owned_session(
+    state: &AppState,
+    user_id: &str,
+    session_id: &str,
+) -> ApiResult<SessionRow> {
     find_session(state.pool(), session_id)
         .await?
         .filter(|row| row.user_id == user_id)

@@ -30,9 +30,10 @@ pub fn router() -> Router<AppState> {
         "/sessions/{session_id}/terminal/{*rest}",
         "/sessions/{session_id}/files",
         "/sessions/{session_id}/files/{*rest}",
-        // Sharing.
-        "/sessions/{session_id}/shares",
-        "/sessions/{session_id}/shares/{*rest}",
+        // Sharing: POST/DELETE on the session's shares and the public read are
+        // implemented (routes::shares), so only the account-level share list and
+        // any share sub-path we have no contract for stay here. That is 2 fewer
+        // paths than the 49 M3 left behind: 47.
         "/shares",
         "/shares/{*rest}",
         // Bulk session maintenance.

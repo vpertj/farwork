@@ -199,18 +199,32 @@ test p0_journey_login_to_websocket_delta ... ok
 | GET | `/api/v2/sessions/{id}/runtime/state` | `SessionRuntimeStateResponse` |
 | GET | `/api/v2/sessions/{id}/runtime/capabilities` | `ProtocolCapabilitiesResponse`（空能力集，见 §7） |
 | POST | `/api/v2/sessions/{id}/runtime/messages` | `{ok, result:{item, eventCursor, clientMessageId, duplicate}}` |
+| POST | `/api/v2/sessions/{id}/shares` | `201 {share:{id, scope, urlPath, createdAt}, serverTime}`；`scope=session\|message`（`message` 需 `messageId`）。快照在会话写锁下取，**建完即不可变** |
+| DELETE | `/api/v2/sessions/{id}/shares/{shareId}` | `204`（无 body）；owner 才能删，软删除后公开读 404 |
+| GET | `/api/v2/public/shares/{shareId}` | **免鉴权**（不带 `Authorization` 也 200）：`{share:{id, scope, sessionTitle, createdAt, timeline:{items}}, serverTime}`，只回快照 |
 | WS | `/api/v2/sessions/{id}/ws?ticket=` | `session.subscribed` + `timeline.item_created/updated` + `session.meta.updated` + `session.refetch_required` + `keepalive` |
 | WS | `/api/v2/dashboard/ws?ticket=` | `dashboard.snapshot` + 变更后重发快照 |
 
-### 501 清单（`{"error":"not_implemented","detail":...,"serverTime":...}`）
+### 501 清单（`{"error":"not_implemented","detail":...,"serverTime":...}`）· **47 条**
 
 审批 / steer / interrupt / runtime commands / notices 应答 / runtime selections / catalogs
 / `POST|DELETE /sessions/{id}/takeover` / `POST /sessions/{id}/sync` / 终端
-（`/sessions/{id}/terminal/**`）/ 文件浏览（`/sessions/{id}/files/**`）/ 分享
-（`/sessions/{id}/shares`、`/shares/**`）/ 批量 archive|unarchive|read / device runtime 管理
+（`/sessions/{id}/terminal/**`）/ 文件浏览（`/sessions/{id}/files/**`）/ 账号级分享列表
+（`/shares/**`；会话/消息分享的三条端点已实现，见上表）/ 批量 archive|unarchive|read / device runtime 管理
 （`/connectors/{id}/runtimes/**`、`/runtimes/**`、`/devices/**`）/ OAuth（`/auth/oauth/*`）/
 扫码登录（`/auth/mobile-login/*`）/ 邮箱验证码、改密、换头像 / admin、announcements、agents、
 pairing、usage。未知路径返回 404 `{"detail":"no route for ..."}`。
+
+---
+
+### 分享：免鉴权读端点的边界
+
+`GET /api/v2/public/shares/{shareId}` 挂在 `routes::shares::public_router()`，**不取
+`AuthedUser`**（其余 `/api/v2` handler 全部取），所以「带不带 token」都不影响它：有票的人和无票的
+游客看到的是同一份快照。它只读 `shares.snapshot_json` 这一列，不回查 `sessions`/`connectors`/
+`projects`/`timeline_items`，因此不可能顺带带出 `connectorId`、`workspacePath`、`cwd`、
+`sessionId`、`source`、token 或邮箱。条目字段是**白名单**（`id/type/status/role/content/orderSeq/
+itemTime`）：以后给 HTTP timeline 加字段，不会自动出现在公开页上。
 
 ---
 
@@ -226,6 +240,12 @@ pairing、usage。未知路径返回 404 `{"detail":"no route for ..."}`。
   同时把 `type/status/role/order_seq/updated_seq/revision/content_hash` 摊成列，
   `client_message_id` 上有 `(session_id, client_message_id)` 唯一索引做幂等；
 * `sessions.seq` 镜像 timeline 头部 sequence。
+
+`migrations/0004_shares.sql`：`shares`（`id / user_id / session_id / scope / message_id /
+snapshot_json / allowed_file_ids_json / created_at / deleted_at`）。`snapshot_json` 是
+`{"version":1, "sessionTitle", "eventCursor", "items":[{id,type,status,role,content,orderSeq,itemTime}]}`
+的**一次性副本**：公开读只读这一列，不回查 `sessions`/`timeline_items`，所以原会话之后怎么变都不会
+改动已发布的分享；`deleted_at` 是软删，撤销后的 id 与从未存在过一样回 404。
 
 ---
 
@@ -274,7 +294,9 @@ pairing、usage。未知路径返回 404 `{"detail":"no route for ..."}`。
 4. `GET /sessions/list` 上游是"全部会话清单"，这里加了 `limit ≤ 100` 上限防止单账号拉爆。
 5. `connections.token_prefix`、`installationId` 幂等注册、`/connectors/{id}/revoke` 已实现；
    但 `connector.user_preferences` 未实现（永远 `{}`）。
-6. 审批/终端/文件/分享/OAuth/扫码全部 501，不返回假成功。
+6. 审批/终端/文件/OAuth/扫码、账号级分享列表（`/shares/**`）全部 501，不返回假成功；
+   会话/消息分享已实现，但**只有**快照里白名单字段会出现在公开响应里（见 §5 的 `shares`
+   说明，白名单实现是 `src/routes/shares.rs` 的 `shared_item`）。
 7. `snapshot` 的 `catalogs` 为空、`notices`/`approvals` 为空数组（runtime 侧数据本 build 不存在）。
 8. 事件里的 `session.refetch_required` 由 hub 在 WS 订阅者 lag 时发出；HTTP `events` 的
    refetch 分支不额外附带 reason 字段（保持 `ProtocolEventRecoveryResponse` 的字段集合不变，
