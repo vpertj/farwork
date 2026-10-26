@@ -70,7 +70,7 @@ const NO_CONNECTION_WARN =
   'the Farwork panel channel ' +
   PANEL_CHANNEL +
   ' is not registered: this host exposes no connection service (neither ctx.get("connection") nor ' +
-  'ctx.connection gives an rpc.handle) and no ctx.inject to defer it, so the panel stays inert. ' +
+  'ctx.connection gives a channel registry) and no ctx.inject to defer it, so the panel stays inert. ' +
   'The bridge itself is unaffected and nothing is wrong with DSH; the panel needs a host that provides ' +
   'the connection service.'
 
@@ -78,34 +78,37 @@ const NO_CONNECTION_WARN =
  * Register the panel channel through the first route this host supports.
  *
  * Three tiers, in order, each guarded on its own:
- *   1. the connection service resolves right now, so register immediately; a
- *      throw here does NOT end the attempt, because a direct probe cannot know
- *      whether the reading context owns webServer (see PANEL_INJECT);
- *   2. Cordis offers ctx.inject, so register the moment both services the
- *      registration needs exist, instead of staying inert for the whole run;
+ *   1. the connection service resolves on *this* plugin's context, so register
+ *      immediately; the same context is handed over as the owner, which means the
+ *      registration only succeeds when that context can also reach webServer;
+ *   2. Cordis offers ctx.inject, so register the moment a context exists that
+ *      declared both services, instead of staying inert for the whole run;
  *   3. neither exists, so say so in one actionable line.
  *
- * The disposer must be called by us: rpc.handle is owned by the *connection*
- * service's context, so it does not die with this plugin, and a second
- * registration of the same channel is refused as already-registered. That is why
- * every returned handle - and the inject subscription itself - is threaded into
- * the plugin's own stop chain.
+ * The disposer must be called by us: the route is filed under the *owner* context,
+ * so it does not die with this plugin, and a second registration of the same
+ * channel is refused as already-registered. That is why every returned handle - and
+ * the inject subscription itself, when the host returns one - is threaded into the
+ * plugin's own stop chain.
  */
 export function installPanel(options: PanelOptions): PanelRegistration {
   const logger = options.logger
   const state: PairState = { connectorToken: null, hub: null }
   const handler = createHandler(options.bridge, state, logger)
 
-  let rpc: RpcLike | null = null
+  // A linked plugin declares no inject, so on DSH even reading ctx.connection
+  // throws ("without inject"). That is expected, not a fault: tier 2 exists for
+  // exactly this host.
+  let direct: ChannelRegistrar | null = null
   try {
-    rpc = resolveRpc(options.ctx)
+    direct = channelRegistrar(options.ctx)
   } catch (error) {
-    logger.warn('the connection service probe failed; the Farwork panel is inert', error)
-    rpc = null
+    logger.debug('this host does not expose the connection service to the plugin context', error)
+    direct = null
   }
-  if (rpc !== null) {
+  if (direct !== null) {
     try {
-      const release = rpc.handle(PANEL_CHANNEL, handler)
+      const release = direct(PANEL_CHANNEL, handler)
       if (typeof release !== 'function') {
         logger.warn('the Farwork panel channel returned no disposer; it cannot be released on stop')
         return inert()
@@ -113,11 +116,10 @@ export function installPanel(options: PanelOptions): PanelRegistration {
       logger.info('the Farwork panel channel ' + PANEL_CHANNEL + ' is registered (mode: direct)')
       return registrationOf([release as () => void], logger)
     } catch (error) {
-      // Keep going instead of giving up: rpc.handle registers its route through
-      // the reading context's webServer, so a ctx that never injected that
-      // service throws right here. ctx.inject below supplies a context that owns
-      // both services, which is what the shipped host plugins always use.
-      logger.warn('the Farwork panel channel could not be registered directly; trying ctx.inject', error)
+      // The registration files its route under the owner context we pass in, so a
+      // plugin context that never declared webServer throws right here. ctx.inject
+      // below supplies a context that declared both, which is what this host needs.
+      logger.debug('the Farwork panel channel could not be registered directly; trying ctx.inject', error)
     }
   }
 
@@ -143,21 +145,27 @@ export function installPanel(options: PanelOptions): PanelRegistration {
 
 /**
  * A host whose connection service is not up yet. ctx.inject defers the callback
- * until the service exists, which is the difference between a panel that appears
+ * until the services exist, which is the difference between a panel that appears
  * late and one that never appears.
+ *
+ * The callback is the only context this path may use. Cordis passes it the
+ * context that declared PANEL_INJECT, so *that* context is both where the service
+ * is read from and the owner the route is filed under; the outer plugin context
+ * appears in this file exactly once, as the receiver of ctx.inject itself.
  */
 function injectPanel(inject: InjectLike, handler: PanelHandler, logger: Logger): PanelRegistration {
   const releases: Array<() => void> = []
   let registered = false
+  let subscription: unknown
   try {
-    const stop = inject(PANEL_INJECT, (ctxWithConnection: unknown) => {
+    subscription = inject(PANEL_INJECT, (ownedCtx: unknown) => {
       try {
-        const rpc = resolveRpc(ctxWithConnection)
-        if (rpc === null) {
-          logger.warn('the connection service appeared without rpc.handle; the Farwork panel is inert')
+        const registrar = channelRegistrar(ownedCtx)
+        if (registrar === null) {
+          logger.warn('the connection service appeared without a channel registry; the Farwork panel is inert')
           return
         }
-        const release = rpc.handle(PANEL_CHANNEL, handler)
+        const release = registrar(PANEL_CHANNEL, handler)
         if (typeof release !== 'function') {
           logger.warn('the Farwork panel channel returned no disposer; it cannot be released on stop')
           return
@@ -170,8 +178,15 @@ function injectPanel(inject: InjectLike, handler: PanelHandler, logger: Logger):
         logger.warn('the Farwork panel channel could not be registered once connection appeared', error)
       }
     })
-    if (typeof stop === 'function') releases.push(stop as () => void)
-    else logger.warn('ctx.inject returned no disposer; a late Farwork panel registration would leak')
+    // Cordis 4 hands back the injected fiber here, not a disposer: the deferred
+    // callback is torn down with the fiber that owns it, so there is nothing to
+    // release and nothing to leak. Only an actual function is kept.
+    if (typeof subscription === 'function') releases.push(subscription as () => void)
+    else {
+      logger.debug(
+        'ctx.inject returns no disposer in this host; the deferred Farwork panel registration is torn down with its fiber',
+      )
+    }
   } catch (error) {
     logger.warn('ctx.inject refused the Farwork panel registration; the panel is inert', error)
     return inert()
@@ -185,7 +200,7 @@ function injectPanel(inject: InjectLike, handler: PanelHandler, logger: Logger):
   return registrationOf(releases, logger)
 }
 
-/** Both a late rpc.handle disposer and the inject subscription must be released, newest first. */
+/** The channel route and the inject subscription are released newest first. */
 function registrationOf(releases: Array<() => void>, logger: Logger): PanelRegistration {
   let disposed = false
   return {
@@ -326,20 +341,23 @@ function inert(): PanelRegistration {
   return { dispose: () => undefined }
 }
 
-interface RpcLike {
-  handle(channel: string, handler: PanelHandler): unknown
-}
+/** The connection service's own channel registry. It files the route under `owner`. */
+type RegisterLike = (owner: unknown, channel: string, handler: PanelHandler) => unknown
+
+/** Registers one channel; the return value is whatever the host calls a disposer. */
+type ChannelRegistrar = (channel: string, handler: PanelHandler) => unknown
 
 /** Cordis' deferred-registration form: run the callback once these services exist. */
 type InjectLike = (services: string[], callback: (ctx: unknown) => void) => unknown
 
 /**
- * connection.rpc.handle registers an HTTP route through the *reading* context's
- * webServer, so the context it is read from must own both services. The shipped
- * host plugins inject exactly this pair for the same reason (api-gateway:
- * `ctx.inject(["connection", "webServer"], ...)`); injecting only `connection`
- * throws inside webServer.register and leaves the panel inert - which is exactly
- * the "HTTP 405 on /farwork/status" this plugin shipped with.
+ * Both services, and the pair matters: the connection service mounts a channel by
+ * registering an HTTP route on the *owner context's* webServer, so the context we
+ * file the route under must itself have declared webServer. The shipped host
+ * plugins inject exactly this pair for the same reason (api-gateway:
+ * `ctx.inject(["connection", "webServer"], ...)`); a context that declared only
+ * `connection` throws inside the registration - which is the "HTTP 405 on
+ * /farwork/status" this plugin shipped with.
  */
 const PANEL_INJECT = ['connection', 'webServer']
 
@@ -365,18 +383,36 @@ function resolveConnection(ctx: unknown): unknown {
   }
 }
 
-/** Duck-typed probe: a linked plugin cannot import the connection service's types. */
-function resolveRpc(ctx: unknown): RpcLike | null {
+/**
+ * Bind a channel registrar to one context, so that both halves of the registration
+ * - reading the connection service and owning the route - happen on that same
+ * context. Duck-typed: a linked plugin cannot import the connection service's types.
+ *
+ * Why the owner is passed explicitly instead of `connection.rpc.handle`:
+ * the `rpc` getter captures `owner = this.ctx`, and Cordis resolves a service's own
+ * `ctx` against the fiber that *provided* it, not the one that read it - it comes
+ * back as a shadow context anchored at `client-connection`, whose inject list is
+ * `["credentials"]`. `owner.webServer` is then a property that owner never declared
+ * and Cordis throws `cannot get property "webServer" without inject` from inside
+ * register(). Measured on DSH's Cordis 4.0.5: reading the service on the injected
+ * context does not help, because the owner is replaced after the read. The fix is
+ * to call the method `rpc.handle` itself calls and hand it the injected context as
+ * owner; `rpc.handle` remains the fallback for hosts that expose only that.
+ */
+function channelRegistrar(ctx: unknown): ChannelRegistrar | null {
   const connection = resolveConnection(ctx)
   if (!isRecord(connection)) return null
-  const rpc = connection.rpc
-  if (!isRecord(rpc)) return null
-  const handle = rpc.handle
-  if (typeof handle !== 'function') return null
-  const bound = handle as (channel: string, handler: PanelHandler) => unknown
-  return {
-    handle: (channel, handler) => bound.call(rpc, channel, handler),
+  const register = connection.register
+  // Three parameters is the contract that takes the owner; a two-parameter
+  // register(channel, handler) would mistake the context for a channel.
+  if (typeof register === 'function' && register.length >= 3) {
+    const call = register as RegisterLike
+    return (channel, handler) => call.call(connection, ctx, channel, handler)
   }
+  const rpc = connection.rpc
+  if (!isRecord(rpc) || typeof rpc.handle !== 'function') return null
+  const handle = rpc.handle as (channel: string, handler: PanelHandler) => unknown
+  return (channel, handler) => handle.call(rpc, channel, handler)
 }
 
 /**

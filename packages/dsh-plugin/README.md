@@ -127,19 +127,35 @@ gateway owns that channel), with exactly three endpoints:
 | `command` | `{ command }` — the `farwork-agent … --dsh-endpoint <path>` line, built host-side so the template lives in one place |
 | `savePair` | `{ accepted, hasToken, hub }` — keeps a pasted `connectorToken` in host memory only (never logged, never echoed back) |
 
-`rpc.handle` is owned by the *connection* service's context, so the plugin keeps
-every disposer it is given — the registration and, when used, the `ctx.inject`
-subscription — and releases them on stop. Registration tries the first route the
-host supports: direct (`ctx.get('connection')` / `ctx.connection`), then
-`ctx.inject(['connection', 'webServer'], …)` — **both** services, because
-`rpc.handle` mounts its HTTP route through the reading context's `webServer`; a
-context that injected only `connection` throws on registration and the browser
-then sees `HTTP 405` on `/farwork/status`. A direct refusal therefore falls
-through to the injection instead of ending the attempt, and only when neither
-route works does the plugin log one actionable `warn`. A successful registration logs one `info`
-line with the channel and the mode (`direct` / `inject`) — that line is what to
-grep when the panel does not appear. A refused registration only logs; nothing
-here can throw into DSH.
+A channel is mounted by filing an HTTP route under an **owner context**, and the
+route lives on that owner's `webServer`. The plugin therefore calls the
+connection service's `register(owner, channel, handler)` and hands it the *same*
+context the service was read from, so reading and owning can never disagree. It
+deliberately does **not** use the documented `connection.rpc.handle`: that getter
+captures its owner as `this.ctx`, and Cordis resolves a service's own `ctx`
+against the fiber that provided the service, not the one that read it — the owner
+comes back anchored at `client-connection`, which injects `credentials` only, and
+`owner.webServer` then throws `cannot get property "webServer" without inject`
+(measured on Cordis 4.0.5). Reading `connection` on an injected context does not
+help, because the owner is replaced after the read. `rpc.handle` remains the
+fallback for hosts that expose only it.
+
+Registration tries the first route the host supports: direct (this plugin's own
+context — on DSH a linked plugin declares no `inject`, so even reading
+`ctx.connection` throws and that tier is skipped quietly), then
+`ctx.inject(['connection', 'webServer'], …)` — **both** services, because the
+owner we pass has to reach `webServer` itself; an owner that declared only
+`connection` throws on registration and the browser then sees `HTTP 405` on
+`/farwork/status`. A refused direct registration therefore falls through to the
+injection instead of ending the attempt, and only when neither route works does the
+plugin log one actionable `warn`. A successful registration logs one `info` line
+with the channel and the mode (`direct` / `inject`) — that line is what to grep
+when the panel does not appear. A refused registration only logs; nothing here can
+throw into DSH.
+
+Every disposer the host hands back is kept and released on stop. `ctx.inject` in
+Cordis 4 returns the injected fiber, not a disposer: the deferred callback is torn
+down with that fiber, so nothing leaks and nothing needs releasing.
 
 Panel contents, v1: the readiness badge plus the verbatim `lastError`, the endpoint
 path and port with copy buttons, the copyable agent command, a `connectorToken`
