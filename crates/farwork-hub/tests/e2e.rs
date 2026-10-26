@@ -66,6 +66,7 @@ async fn bootstrap(database_url: &str) -> Option<Harness> {
         secret: SECRET.to_string(),
         setup_token: Some(SETUP_TOKEN.to_string()),
         database_max_connections: 5,
+        public_url: None,
     };
     let pool = db::connect(&config).await.expect("connect");
     db::migrate(&pool).await.expect("migrate");

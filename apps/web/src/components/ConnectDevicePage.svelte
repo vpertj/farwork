@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { API_NAMESPACE } from '$lib/api/client';
+	import { fetchHubMeta } from '$lib/api/meta';
 	import { fetchPairing, startPairing, type PairingCode } from '$lib/api/pairing';
 	import { listConnectors } from '$lib/api/workspace';
 	import { workspace } from '$lib/workspace.svelte';
@@ -25,8 +26,10 @@
 		{ value: 'echo', label: 'echo' }
 	];
 
-	// install.sh 与 pair 都指向真实 origin：部署时静态产物由 hub 自己托管，origin 就是 hub。
-	// PUBLIC_FARWORK_API 指向别的 host 时以它为准，否则用当前页面 origin。
+	// 回退用的 origin：优先 PUBLIC_FARWORK_API（构建期指定了别的 host 时以它为准），
+	// 否则就是当前页面 origin。它只在 hub 自报地址拿不到时才进入命令 —— dev 下页面在
+	// 5173、hub 在 7300（vite 代理），反代下更是两个域名，把页面 origin 当 hub 写进
+	// `--hub` 会让 agent 把它存进 agent.json 然后永远连不上。
 	function apiOrigin(): string {
 		const base = API_NAMESPACE.endsWith(API_SUFFIX)
 			? API_NAMESPACE.slice(0, -API_SUFFIX.length)
@@ -35,10 +38,13 @@
 		return typeof window === 'undefined' ? '' : window.location.origin;
 	}
 
+	/** 本页 origin：只在拿不到 hub 自报地址时兜底，用上了要在界面上标注。 */
 	const installOrigin = apiOrigin();
 
 	let step = $state<Step>('generate');
 	let hubUrl = $state('');
+	/** hub 自报的基地址（GET /api/v2/meta）；null = 还没拿到或拿不到。 */
+	let hubBaseFromMeta = $state<string | null>(null);
 	let workdir = $state('');
 	let runtime = $state<Runtime>(AGENT_DEFAULT_RUNTIME);
 	let busy = $state(false);
@@ -61,11 +67,13 @@
 	/** 生成配对码之前的设备集合：claimed 但 hub 没给 connectorId 时用它认出「新上线的那台」。 */
 	let knownConnectorIds: string[] = [];
 
-	const effectiveHub = $derived(hubUrl.trim() || installOrigin);
-	const installCommand = $derived(`curl -fsSL ${installOrigin}/install.sh | sh`);
+	/** 命令里的 hub 地址：手填 > hub 自报 > 本页 origin（回退，界面要标注）。 */
+	const hubBase = $derived(hubUrl.trim() || hubBaseFromMeta || installOrigin);
+	const usingFallbackHub = $derived(hubUrl.trim().length === 0 && hubBaseFromMeta === null);
+	const installCommand = $derived(`curl -fsSL ${hubBase}/install.sh | sh`);
 	const pairCommand = $derived.by(() => {
 		if (pairing === null) return '';
-		const parts = ['farwork-agent', 'pair', '--hub', effectiveHub, '--code', pairing.code];
+		const parts = ['farwork-agent', 'pair', '--hub', hubBase, '--code', pairing.code];
 		const dir = workdir.trim();
 		if (dir.length > 0) parts.push('--workdir', dir);
 		if (runtime !== AGENT_DEFAULT_RUNTIME) parts.push('--runtime', runtime);
@@ -98,6 +106,16 @@
 		return describeError(error);
 	}
 
+	// 拿不到就回退到本页 origin；失败本身不报错，界面上的「这是回退值」标注更有用。
+	async function loadMeta(): Promise<void> {
+		try {
+			const meta = await fetchHubMeta();
+			hubBaseFromMeta = meta?.hubUrl ?? null;
+		} catch {
+			hubBaseFromMeta = null;
+		}
+	}
+
 	function isAbsolutePath(value: string): boolean {
 		return value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value);
 	}
@@ -113,6 +131,10 @@
 	}
 
 	$effect(() => () => stopTimers());
+	// 进页面就取一次：还没生成配对码时，高级选项的占位符也该是 hub 的真实地址。
+	$effect(() => {
+		void loadMeta();
+	});
 
 
 	function startCountdown(): void {
@@ -227,6 +249,8 @@
 		busy = true;
 		stopTimers();
 		try {
+			// 每次生成都重新问一次：hub 可能刚换过地址，别把上一条命令里的旧地址接着用。
+			if (hub.length === 0) await loadMeta();
 			knownConnectorIds = (await listConnectors(token)).map((row) => row.id);
 			const started = await startPairing(token);
 			pairing = started.pairing;
@@ -343,11 +367,12 @@
 							bind:value={hubUrl}
 							spellcheck="false"
 							autocomplete="off"
-							placeholder={installOrigin}
+							placeholder={hubBaseFromMeta ?? installOrigin}
 						/>
 					</label>
 					<p class="hint">
-						只影响命令里的 <code class="mono">--hub</code>；留空就用本页面的 origin。
+						只影响命令里的 <code class="mono">--hub</code>；留空就用 hub 自报的地址（
+						<code class="mono">GET /api/v2/meta</code>）。
 					</p>
 
 					<label class="field">
@@ -385,6 +410,14 @@
 				bind:this={commandField}
 				value={commandText}
 			></textarea>
+			{#if usingFallbackHub}
+				<p class="hint warn-line" data-testid="connect-fallback">
+					拿不到 hub 自报的地址（<code class="mono">GET /api/v2/meta</code> 失败），上面的命令用的是本页面
+					origin <code class="mono">{installOrigin}</code>。本页不是 hub 时（dev 在 5173、hub 在 7300，
+					反代下更是两个域名）命令里的 <code class="mono">--hub</code> 就是错的：在高级选项里手填 hub
+					地址再生成一次。
+				</p>
+			{/if}
 			<div class="row">
 				<button class="btn" data-variant="primary" type="button" onclick={() => void copyCommand()}>
 					复制命令
@@ -464,7 +497,7 @@
 					不是绝对路径都会以退出码 1 结束）。
 				</li>
 				<li>
-					hub 地址通吗：<code class="mono">{effectiveHub}</code> 要能从设备上连到。
+					hub 地址通吗：<code class="mono">{hubBase}</code> 要能从设备上连到。
 				</li>
 				<li>
 					配对码有 TTL，领了就作废一次：客户端要重试得重新生成一个码。

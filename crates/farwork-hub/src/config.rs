@@ -19,6 +19,11 @@ pub struct Config {
     /// logged, mirroring upstream's behaviour.
     pub setup_token: Option<String>,
     pub database_max_connections: u32,
+    /// `FARWORK_HUB_PUBLIC_URL`: the address clients should dial, normalized to
+    /// `scheme://authority` with no trailing slash. Only the operator knows the
+    /// public name, port and TLS terminator in front of the hub, so this wins
+    /// over anything derived from a request (see `routes::meta`).
+    pub public_url: Option<String>,
 }
 
 impl Config {
@@ -42,12 +47,18 @@ impl Config {
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(10);
+        let public_url = env::var("FARWORK_HUB_PUBLIC_URL")
+            .ok()
+            .map(|value| parse_public_url(&value))
+            .transpose()?
+            .flatten();
         Ok(Self {
             database_url,
             port,
             secret,
             setup_token,
             database_max_connections,
+            public_url,
         })
     }
 
@@ -57,10 +68,38 @@ impl Config {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+/// Normalizes the advertised public URL: lowercase `http`/`https` scheme,
+/// no trailing slash, empty value means "not set".
+///
+/// A malformed value fails startup on purpose. This string is copied verbatim
+/// into every pairing command, so a typo must break loudly here instead of
+/// handing users an address no agent can reach — which is the exact shape of
+/// the bug `routes::meta` exists to prevent.
+fn parse_public_url(raw: &str) -> Result<Option<String>, ConfigError> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let invalid = || ConfigError::InvalidPublicUrl(raw.to_string());
+    let (scheme, rest) = trimmed.split_once("://").ok_or_else(invalid)?;
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https")
+        || rest.is_empty()
+        || rest.contains(char::is_whitespace)
+    {
+        return Err(invalid());
+    }
+    Ok(Some(format!("{scheme}://{rest}")))
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
     #[error("invalid port {0:?}")]
     InvalidPort(String),
+    #[error(
+        "invalid FARWORK_HUB_PUBLIC_URL {0:?}: expected http://host[:port] or https://host[:port]"
+    )]
+    InvalidPublicUrl(String),
 }
 
 /// `--port <n>` or `--port=<n>`. `Ok(None)` means "no override given".
@@ -84,4 +123,26 @@ pub fn parse_port_arg(args: &[String]) -> Result<Option<u16>, ConfigError> {
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_public_url;
+
+    #[test]
+    fn public_url_is_normalized_or_rejected() {
+        assert_eq!(
+            parse_public_url("https://hub.example.com/"),
+            Ok(Some(String::from("https://hub.example.com")))
+        );
+        assert_eq!(
+            parse_public_url("  HTTP://Farwork.example.com:8080//  "),
+            Ok(Some(String::from("http://Farwork.example.com:8080")))
+        );
+        assert_eq!(parse_public_url("   "), Ok(None));
+        assert!(parse_public_url("hub.example.com").is_err());
+        assert!(parse_public_url("ftp://hub.example.com").is_err());
+        assert!(parse_public_url("https://").is_err());
+        assert!(parse_public_url("https://hub example.com").is_err());
+    }
 }
