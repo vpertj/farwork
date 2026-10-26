@@ -265,6 +265,23 @@ test('a missing panel channel is described as a host-side registration failure',
   assert.match(line, /farwork-dsh-bridge/)
 })
 
+test('an HTTP 405 on the channel is reported as a host-side registration failure', async () => {
+  // Exactly what the panel showed before the host half registered the channel:
+  // the request reached DSH's web server and no route claimed /farwork.
+  const rendered = await openPanelText({
+    connection: {
+      rpc: {
+        call(): Promise<unknown> {
+          return Promise.reject(new Error('transport failure for /farwork/status: HTTP 405'))
+        },
+      },
+    },
+  })
+  const line = rendered.find((text) => text.includes('面板通道未注册')) ?? ''
+  assert.match(line, /面板通道未注册/)
+  assert.match(line, /farwork-dsh-bridge/)
+})
+
 test('apply is inert when the slots service is missing', () => {
   const { module } = loadClient()
   const apply = module.apply as (ctx: unknown) => void

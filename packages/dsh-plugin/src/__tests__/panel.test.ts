@@ -265,8 +265,10 @@ test('a host without connection yet registers through ctx.inject once it appears
   // Nothing is registered yet, but the panel is no longer permanently inert: it
   // subscribed to the service instead.
   assert.equal(registrations.length, 0)
-  assert.deepEqual(injects.map((entry) => entry.services), [['connection']])
-  assert.match(lines.at(-1)!.message, /waiting for connection \(mode: inject\)/)
+  // Both services: rpc.handle mounts its route through the reading context's
+  // webServer, so injecting only `connection` would throw on registration.
+  assert.deepEqual(injects.map((entry) => entry.services), [['connection', 'webServer']])
+  assert.match(lines.at(-1)!.message, /waiting for connection \+ webServer \(mode: inject\)/)
 
   injects[0]!.callback({ connection: connectionService(registrations) })
 
@@ -282,6 +284,45 @@ test('a host without connection yet registers through ctx.inject once it appears
   registration.dispose()
   assert.equal(registrations[0]!.released, 1)
   assert.deepEqual(injectReleases, ['inject'])
+})
+
+test('a refused direct registration falls through to ctx.inject instead of giving up', async () => {
+  const { logger, lines } = captureLogger()
+  const registrations: Registration[] = []
+  const injects: Array<{ services: string[]; callback: (ctx: unknown) => void }> = []
+  // The real failure shape on a DSH host: the service resolves, but the reading
+  // context never injected webServer, so handle() throws before any route exists
+  // and the browser then sees HTTP 405 on /farwork/status.
+  const refusing = {
+    rpc: {
+      handle(): () => void {
+        throw new TypeError("Cannot read properties of undefined (reading 'register')")
+      },
+    },
+  }
+  const ctx = {
+    get: () => refusing,
+    inject(services: string[], callback: (ctx: unknown) => void): () => void {
+      injects.push({ services, callback })
+      return () => undefined
+    },
+  }
+
+  const registration = installPanel({ ctx, bridge: fakeBridge(), logger })
+
+  assert.equal(registrations.length, 0)
+  assert.match(lines[0]!.message, /could not be registered directly; trying ctx\.inject/)
+  assert.deepEqual(injects[0]!.services, ['connection', 'webServer'])
+
+  injects[0]!.callback({ connection: connectionService(registrations) })
+  assert.equal(registrations.length, 1)
+  assert.equal(registrations[0]!.channel, PANEL_CHANNEL)
+  assert.match(lines.filter((line) => line.level === 'info').at(-1)!.message, /registered \(mode: inject\)/)
+  const value = valueOf(await registrations[0]!.handler('status', {}))
+  assert.equal(value.ready, true)
+
+  registration.dispose()
+  assert.equal(registrations[0]!.released, 1)
 })
 
 test('a deferred callback that carries no rpc.handle stays inert instead of throwing', () => {

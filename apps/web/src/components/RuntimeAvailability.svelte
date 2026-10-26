@@ -43,7 +43,7 @@
 	<div class="guide">
 		<p class="guide-title">DSH 运行时不可用</p>
 		<p>
-			DSH 桥需要两端都开：设备侧 agent 必须带 <code class="mono">--runtime {DSH_RUNTIME}</code> 启动；DSH 侧要先在 DSH 里启用 <code class="mono">agents-anywhere</code> 插件，桥才会在设备本地起来，agent 才探得到它。
+			DSH 桥需要两端都开：设备侧 agent 必须带 <code class="mono">--runtime {DSH_RUNTIME}</code> 启动；DSH 侧要先在 DSH 里安装并启用 <code class="mono">@farwork/dsh-bridge</code> 插件（本仓 <code class="mono">packages/dsh-plugin</code>），桥才会在设备本地起来，agent 才探得到它。
 		</p>
 		{#if guidance.reason}
 			<p>设备探测给出的原因（原文）：<span class="reason-raw">{guidance.reason}</span></p>

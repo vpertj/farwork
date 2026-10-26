@@ -353,7 +353,7 @@
 					{/each}
 				</div>
 				<p class="hint">
-					dsh 连本机 DSH 桥（要先在 DSH 里启用 agents-anywhere 插件）；echo 仅联调，不执行任何东西。
+					dsh 连本机 DSH 桥（要先在 DSH 里安装并启用 @farwork/dsh-bridge 插件）；echo 仅联调，不执行任何东西。
 				</p>
 			</div>
 

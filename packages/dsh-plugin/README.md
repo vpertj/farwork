@@ -131,9 +131,12 @@ gateway owns that channel), with exactly three endpoints:
 every disposer it is given — the registration and, when used, the `ctx.inject`
 subscription — and releases them on stop. Registration tries the first route the
 host supports: direct (`ctx.get('connection')` / `ctx.connection`), then
-`ctx.inject(['connection'], …)` so a host whose connection service is not up yet
-still gets the panel late, then a single actionable `warn` saying the host
-provides no connection service at all. A successful registration logs one `info`
+`ctx.inject(['connection', 'webServer'], …)` — **both** services, because
+`rpc.handle` mounts its HTTP route through the reading context's `webServer`; a
+context that injected only `connection` throws on registration and the browser
+then sees `HTTP 405` on `/farwork/status`. A direct refusal therefore falls
+through to the injection instead of ending the attempt, and only when neither
+route works does the plugin log one actionable `warn`. A successful registration logs one `info`
 line with the channel and the mode (`direct` / `inject`) — that line is what to
 grep when the panel does not appear. A refused registration only logs; nothing
 here can throw into DSH.

@@ -78,9 +78,11 @@ const NO_CONNECTION_WARN =
  * Register the panel channel through the first route this host supports.
  *
  * Three tiers, in order, each guarded on its own:
- *   1. the connection service resolves right now, so register immediately;
- *   2. Cordis offers ctx.inject, so register the moment the service appears
- *      instead of staying inert for the whole run;
+ *   1. the connection service resolves right now, so register immediately; a
+ *      throw here does NOT end the attempt, because a direct probe cannot know
+ *      whether the reading context owns webServer (see PANEL_INJECT);
+ *   2. Cordis offers ctx.inject, so register the moment both services the
+ *      registration needs exist, instead of staying inert for the whole run;
  *   3. neither exists, so say so in one actionable line.
  *
  * The disposer must be called by us: rpc.handle is owned by the *connection*
@@ -111,8 +113,11 @@ export function installPanel(options: PanelOptions): PanelRegistration {
       logger.info('the Farwork panel channel ' + PANEL_CHANNEL + ' is registered (mode: direct)')
       return registrationOf([release as () => void], logger)
     } catch (error) {
-      logger.warn('the Farwork panel channel could not be registered; the panel is inert', error)
-      return inert()
+      // Keep going instead of giving up: rpc.handle registers its route through
+      // the reading context's webServer, so a ctx that never injected that
+      // service throws right here. ctx.inject below supplies a context that owns
+      // both services, which is what the shipped host plugins always use.
+      logger.warn('the Farwork panel channel could not be registered directly; trying ctx.inject', error)
     }
   }
 
@@ -145,7 +150,7 @@ function injectPanel(inject: InjectLike, handler: PanelHandler, logger: Logger):
   const releases: Array<() => void> = []
   let registered = false
   try {
-    const stop = inject(['connection'], (ctxWithConnection: unknown) => {
+    const stop = inject(PANEL_INJECT, (ctxWithConnection: unknown) => {
       try {
         const rpc = resolveRpc(ctxWithConnection)
         if (rpc === null) {
@@ -173,7 +178,9 @@ function injectPanel(inject: InjectLike, handler: PanelHandler, logger: Logger):
   }
   if (!registered) {
     // Without this line a user who restarts and sees no panel has nothing to grep.
-    logger.info('the Farwork panel channel ' + PANEL_CHANNEL + ' is waiting for connection (mode: inject)')
+    logger.info(
+      'the Farwork panel channel ' + PANEL_CHANNEL + ' is waiting for ' + PANEL_INJECT.join(' + ') + ' (mode: inject)',
+    )
   }
   return registrationOf(releases, logger)
 }
@@ -325,6 +332,16 @@ interface RpcLike {
 
 /** Cordis' deferred-registration form: run the callback once these services exist. */
 type InjectLike = (services: string[], callback: (ctx: unknown) => void) => unknown
+
+/**
+ * connection.rpc.handle registers an HTTP route through the *reading* context's
+ * webServer, so the context it is read from must own both services. The shipped
+ * host plugins inject exactly this pair for the same reason (api-gateway:
+ * `ctx.inject(["connection", "webServer"], ...)`); injecting only `connection`
+ * throws inside webServer.register and leaves the panel inert - which is exactly
+ * the "HTTP 405 on /farwork/status" this plugin shipped with.
+ */
+const PANEL_INJECT = ['connection', 'webServer']
 
 /** The documented route is ctx.get('connection'); a direct property is accepted too. */
 function resolveConnection(ctx: unknown): unknown {

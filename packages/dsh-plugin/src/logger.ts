@@ -24,7 +24,7 @@ export function createLogger(ctx: unknown, component: string): Logger {
   const write = (level: string): Sink => (message, details) => {
     try {
       if (details === undefined) sink(`[${level}] ${message}`)
-      else sink(`[${level}] ${message} ${JSON.stringify(details)}`)
+      else sink(`[${level}] ${message} ${serialize(details)}`)
     } catch {
       // A logger that throws is worse than a lost line.
     }
@@ -34,6 +34,21 @@ export function createLogger(ctx: unknown, component: string): Logger {
 
 export function NO_LOGGER(): Logger {
   return NOOP
+}
+
+/**
+ * JSON.stringify renders an Error as `{}`, which is how "registration refused"
+ * reached a log with no reason attached. Keep the message and the stack.
+ */
+function serialize(details: unknown): string {
+  const replacement = (value: unknown): unknown =>
+    value instanceof Error ? { name: value.name, message: value.message, stack: value.stack } : value
+  try {
+    return JSON.stringify(details, (_key, value: unknown) => replacement(value)) ?? String(details)
+  } catch {
+    // Circular or otherwise unprintable: a string is still better than nothing.
+    return String(replacement(details) === details ? details : (details as Error).message)
+  }
 }
 
 function resolveSink(ctx: unknown, component: string): Sink {

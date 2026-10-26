@@ -181,6 +181,11 @@
         if (/channel|not registered|no handler|unregistered/i.test(message)) {
           return '面板通道未注册（host 侧没能登记 /farwork），请查看 DSH 日志里 farwork-dsh-bridge 的行'
         }
+        // 404/405 on the channel path means nothing is mounted for /farwork at all:
+        // the request reached DSH's web server and no host handler claimed it.
+        if (/\b40[45]\b/.test(message)) {
+          return '面板通道未注册（host 侧没能登记 /farwork），请查看 DSH 日志里 farwork-dsh-bridge 的行'
+        }
         if (/unavailable/i.test(message)) return '连接服务不可用，请刷新页面'
         // Always a sentence: an empty string here would render an empty panel.
         return message.length > 0 ? message : '连接服务不可用，请刷新页面'
