@@ -18,6 +18,7 @@
 		stepCommandIndex
 	} from '$lib/commands';
 	import ApprovalCard from './ApprovalCard.svelte';
+	import CwdLabel from './CwdLabel.svelte';
 	import FilePanel from './FilePanel.svelte';
 	import TerminalPanel from './TerminalPanel.svelte';
 	import TimelineEntry from './TimelineEntry.svelte';
@@ -233,6 +234,9 @@
 					<span>{runtimeLabel(session?.runtime ?? 'unknown')}</span>
 					<span>·</span>
 					<span>游标 seq:{controller.cursorSeq}</span>
+				</div>
+				<div class="cwd-line" data-testid="session-cwd">
+					<CwdLabel cwd={session?.cwd ?? null} label="工作目录" maxLength={72} />
 				</div>
 			</div>
 			<div class="badges">
@@ -585,6 +589,14 @@
 	.back:hover {
 		background: oklch(1 0 0 / 8%);
 		color: var(--foreground);
+	}
+
+	.cwd-line {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		margin-top: 4px;
+		min-width: 0;
 	}
 
 	.title-block {

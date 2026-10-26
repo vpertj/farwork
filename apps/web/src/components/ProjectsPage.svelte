@@ -11,6 +11,8 @@
 	import { describeError, formatRelative } from '$lib/format';
 	import { sessionStatusLabel, sessionStatusTone } from '$lib/timeline';
 	import type { Project, Session } from '$lib/api/types';
+	import CwdLabel from './CwdLabel.svelte';
+	import ProjectBrowser from './ProjectBrowser.svelte';
 
 	let { token }: { token: string } = $props();
 
@@ -39,6 +41,9 @@
 	let confirmingId = $state<string | null>(null);
 	let deletingId = $state<string | null>(null);
 	let deleteError = $state<string | null>(null);
+
+	/** 正在浏览目录的项目：null = 弹窗关闭。 */
+	let browsing = $state<Project | null>(null);
 
 	let expandedId = $state<string | null>(null);
 	let expandedSessions = $state<Session[]>([]);
@@ -424,6 +429,15 @@
 								class="btn"
 								data-variant="ghost"
 								type="button"
+								data-testid="browse-project-dir"
+								onclick={() => (browsing = project)}
+							>
+								浏览目录
+							</button>
+							<button
+								class="btn"
+								data-variant="ghost"
+								type="button"
 								onclick={() => startRename(project)}
 							>
 								重命名
@@ -539,6 +553,9 @@
 												<span class="session-status">{sessionStatusLabel(session.status)}</span>
 												<span class="session-time">{formatRelative(session.lastActivityAt)}</span>
 											</a>
+											<span class="session-cwd">
+												<CwdLabel cwd={session.cwd} maxLength={56} />
+											</span>
 										</li>
 									{/each}
 								</ul>
@@ -553,6 +570,17 @@
 		</ul>
 	{/if}
 </section>
+
+{#if browsing}
+	<ProjectBrowser
+		{token}
+		connectorId={browsing.connectorId}
+		connectorName={deviceName(browsing.connectorId)}
+		projectName={browsing.name}
+		workspacePath={browsing.workspacePath}
+		onclose={() => (browsing = null)}
+	/>
+{/if}
 
 <style>
 	.projects {
@@ -820,6 +848,12 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+
+	.session-cwd {
+		display: flex;
+		align-items: center;
+		padding: 0 8px 4px 22px;
 	}
 
 	.session-status,

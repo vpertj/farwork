@@ -52,3 +52,11 @@ export function describeError(error: unknown): string {
 	if (typeof error === 'string') return error;
 	return '未知错误';
 }
+/** 路径这类「头尾都有用」的字符串：省略中间而不是尾部。 */
+export function truncateMiddle(text: string, max: number): string {
+	if (max <= 1 || text.length <= max) return text;
+	const keep = max - 1;
+	const head = Math.ceil(keep / 2);
+	const tail = keep - head;
+	return `${text.slice(0, head)}…${text.slice(text.length - tail)}`;
+}

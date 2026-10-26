@@ -23,6 +23,28 @@ export function joinFsPath(base: string, name: string): string {
 	return parent === '/' ? `/${name}` : `${parent}/${name}`;
 }
 
+export function isInsideFsRoot(path: string, root: string): boolean {
+	const base = trimFsPath(root);
+	const target = trimFsPath(path);
+	if (base === '' || target === '') return false;
+	if (base === '/') return target.startsWith('/');
+	return target === base || target.startsWith(`${base}/`);
+}
+
+/**
+ * 上一级目录，但不越过浏览根：到了根就没有上一级（返回 null），
+ * 前端因此不会发出一个注定被设备沙箱 403 的请求。
+ */
+export function parentFsPath(path: string, root: string): string | null {
+	const base = trimFsPath(root);
+	const current = trimFsPath(path);
+	if (base === '' || current === '' || current === base) return null;
+	const cut = current.lastIndexOf('/');
+	const parent = cut <= 0 ? '/' : current.slice(0, cut);
+	if (!isInsideFsRoot(parent, base)) return base;
+	return parent === current ? null : parent;
+}
+
 export function fsBreadcrumb(root: string, current: string): FsCrumb[] {
 	const rootPath = trimFsPath(root);
 	if (rootPath === '') return [];

@@ -10,6 +10,7 @@
 	import NewSessionPage from '../components/NewSessionPage.svelte';
 	import ProjectsPage from '../components/ProjectsPage.svelte';
 	import ConnectDevicePage from '../components/ConnectDevicePage.svelte';
+	import DevicePage from '../components/DevicePage.svelte';
 	import PlaceholderPage from '../components/PlaceholderPage.svelte';
 	import SharePage from '../components/SharePage.svelte';
 	import AdminPage from '../components/AdminPage.svelte';
@@ -85,10 +86,7 @@
 				description="上游设置页包含账号、服务、通知等多个分区，本轮只打通会话链路，因此这里先给占位。"
 			/>
 		{:else if route.page === 'device'}
-			<PlaceholderPage
-				title={`设备详情 · ${route.connectorId}`}
-				description="设备页需要设备运行时列表、终端与文件浏览，属于后续切片。"
-			/>
+			<DevicePage connectorId={route.connectorId} {token} />
 		{:else if route.page === 'projects'}
 			<ProjectsPage {token} />
 		{:else if route.page === 'new-session'}

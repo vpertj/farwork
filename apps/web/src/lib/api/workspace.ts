@@ -55,6 +55,57 @@ export async function createConnector(token: string, name: string): Promise<Crea
 	return { connector, connectorToken };
 }
 
+export type RevokedConnectorToken = {
+	connector: Connector;
+	/** 新的明文 token：只在这一条响应里出现一次，hub 只存 sha256。 */
+	connectorToken: string;
+};
+
+/** 破坏性：hub 先删该设备的会话、再删项目、最后删设备本身，没有回收站。 */
+export async function deleteConnector(token: string, connectorId: string): Promise<void> {
+	await apiRequest(`/connectors/${encodeURIComponent(connectorId)}`, { method: 'DELETE', token });
+}
+
+/** 不删设备、只换凭证：旧 token 立刻失效，设备要拿新 token 才能再连上。 */
+export async function revokeConnectorToken(
+	token: string,
+	connectorId: string
+): Promise<RevokedConnectorToken> {
+	const payload = await apiRequest(`/connectors/${encodeURIComponent(connectorId)}/revoke`, {
+		method: 'POST',
+		token
+	});
+	const raw = asRecord(payload);
+	const connector = parseConnector(raw?.connector ?? payload);
+	if (!connector) throw new Error('重新签发 token 的响应里没有可识别的 connector。');
+	const connectorToken = asString(raw?.connectorToken).trim();
+	if (connectorToken.length === 0) throw new Error('hub 没有返回新的 connectorToken。');
+	return { connector, connectorToken };
+}
+
+/** `/sessions/list` 会截断到 100 行，所以会话计数可能是下界而不是精确值。 */
+export const SESSION_INVENTORY_CAP = 100;
+
+export type ConnectorChildren = {
+	sessions: number;
+	projects: number;
+	/** 为 true 时会话计数只是下界：删设备前必须如实说明，不能报一个看起来精确的数。 */
+	sessionsCapped: boolean;
+};
+
+/** 删设备确认弹窗用的真实计数：当场重新读，不用页面里可能过期的缓存。 */
+export async function countConnectorChildren(
+	token: string,
+	connectorId: string
+): Promise<ConnectorChildren> {
+	const [projects, sessions] = await Promise.all([listProjects(token), listSessions(token)]);
+	return {
+		projects: projects.filter((project) => project.connectorId === connectorId).length,
+		sessions: sessions.filter((session) => session.connectorId === connectorId).length,
+		sessionsCapped: sessions.length >= SESSION_INVENTORY_CAP
+	};
+}
+
 export async function listProjects(token: string): Promise<Project[]> {
 	return parseProjects(await apiRequest('/projects', { token }));
 }
@@ -239,33 +290,43 @@ export async function createAndStartSession(
 	return result;
 }
 
-export async function listSessionDir(
-	token: string,
-	sessionId: string,
-	path: string
-): Promise<FsListing> {
-	const payload = await apiRequest(`/sessions/${encodeURIComponent(sessionId)}/files/list`, {
-		method: 'POST',
-		token,
-		body: { path }
-	});
+async function postFsListing(token: string, url: string, path: string): Promise<FsListing> {
+	const payload = await apiRequest(url, { method: 'POST', token, body: { path } });
 	const listing = parseFsListing(payload);
 	if (!listing) throw new Error('目录列表格式无法识别。');
 	return { ...listing, entries: sortFsEntries(listing.entries) };
 }
 
-export async function readSessionText(
-	token: string,
-	sessionId: string,
-	path: string
-): Promise<FsTextFile> {
-	const payload = await apiRequest(
-		`/sessions/${encodeURIComponent(sessionId)}/files/readText`,
-		{ method: 'POST', token, body: { path } }
-	);
+async function postFsText(token: string, url: string, path: string): Promise<FsTextFile> {
+	const payload = await apiRequest(url, { method: 'POST', token, body: { path } });
 	const file = parseFsText(payload);
 	if (!file) throw new Error('文件内容的响应格式无法识别。');
 	return file;
+}
+
+export function listSessionDir(token: string, sessionId: string, path: string): Promise<FsListing> {
+	return postFsListing(token, `/sessions/${encodeURIComponent(sessionId)}/files/list`, path);
+}
+
+export function readSessionText(token: string, sessionId: string, path: string): Promise<FsTextFile> {
+	return postFsText(token, `/sessions/${encodeURIComponent(sessionId)}/files/readText`, path);
+}
+
+/** connector 命名空间的路径必须是绝对路径（hub 拒绝相对路径）。 */
+export function listConnectorDir(
+	token: string,
+	connectorId: string,
+	path: string
+): Promise<FsListing> {
+	return postFsListing(token, `/connectors/${encodeURIComponent(connectorId)}/fs/list`, path);
+}
+
+export function readConnectorText(
+	token: string,
+	connectorId: string,
+	path: string
+): Promise<FsTextFile> {
+	return postFsText(token, `/connectors/${encodeURIComponent(connectorId)}/fs/readText`, path);
 }
 
 export function fsFailure(error: unknown): FsFailure {

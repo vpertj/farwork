@@ -4,6 +4,7 @@
 	import { formatRelative } from '$lib/format';
 	import { sessionStatusLabel, sessionStatusTone } from '$lib/timeline';
 	import type { Route } from '$lib/router';
+	import CwdLabel from './CwdLabel.svelte';
 
 	let { route }: { route: Route } = $props();
 
@@ -99,6 +100,9 @@
 										<span class="session-time">{formatRelative(session.lastActivityAt)}</span>
 									</a>
 									<span class="sr-only">{sessionStatusLabel(session.status)}</span>
+									<span class="session-cwd">
+										<CwdLabel cwd={session.cwd} maxLength={34} />
+									</span>
 								</li>
 							{/each}
 						</ul>
@@ -125,6 +129,17 @@
 </aside>
 
 <style>
+	.session-cwd :global(.btn) {
+		padding: 0 4px;
+		font-size: 10px;
+		opacity: 0;
+	}
+
+	.session-cwd:hover :global(.btn),
+	.session-cwd :global(.btn:focus-visible) {
+		opacity: 1;
+	}
+
 	.sidebar {
 		display: flex;
 		flex-direction: column;
@@ -336,6 +351,13 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+
+	.session-cwd {
+		display: flex;
+		align-items: center;
+		padding: 0 8px 4px 22px;
+		opacity: 0.85;
 	}
 
 	.session-time {
