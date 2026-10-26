@@ -1,9 +1,9 @@
 //! `/connectors/*` — device registration, listing, rename, delete, token
 //! rotation.
 //!
-//! P0 note: this build has no connector ingress (`/ws/connector`), so every
-//! connector is reported `offline` from its stored status. That is the truthful
-//! value; no synthetic presence is invented.
+//! Presence comes from the connector ingress (`GET /connector/ws`), which writes
+//! `connectors.status`/`last_seen_at` and pushes a dashboard change. A connector
+//! with no live socket is `offline` because the ingress said so.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -75,6 +75,21 @@ pub async fn find_connector(
         "select {CONNECTOR_COLUMNS} from connectors where id = $1"
     ))
     .bind(connector_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Resolve a connector from the digest of its device token. Revoked connectors
+/// are invisible here, so revoking a token also invalidates a live socket on the
+/// next handshake.
+pub async fn find_connector_by_token(
+    pool: &sqlx::PgPool,
+    token_hash: &str,
+) -> Result<Option<ConnectorRow>, sqlx::Error> {
+    sqlx::query_as::<_, ConnectorRow>(&format!(
+        "select {CONNECTOR_COLUMNS} from connectors where token_hash = $1 and revoked = false"
+    ))
+    .bind(token_hash)
     .fetch_optional(pool)
     .await
 }

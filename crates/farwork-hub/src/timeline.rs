@@ -253,6 +253,40 @@ impl TimelineHub {
         }
     }
 
+    /// Apply an item reported by a connector (`item.upsert`).
+    ///
+    /// The engine stays the only allocator of `order_seq`/`updated_seq`; the hub
+    /// persists the committed item and hands back the wire event, or `None` when
+    /// the runtime re-reported identical state (dedupe) and nothing was committed.
+    pub async fn apply_runtime_item(
+        &self,
+        pool: &PgPool,
+        session: &SessionRow,
+        input: ItemInput,
+        source: Value,
+    ) -> ApiResult<(TimelineItem, Option<Value>)> {
+        let engine = self.engine(&session.id).await;
+        let mut guard = engine.lock().await;
+        hydrate_if_needed(&mut guard, pool, &session.id).await?;
+
+        let now = timeutil::utc_now();
+        let outcome = guard
+            .timeline
+            .upsert(input, &now)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        match outcome {
+            ApplyOutcome::NoChange { item } => Ok((item, None)),
+            ApplyOutcome::Created { item, event }
+            | ApplyOutcome::Updated { item, event }
+            | ApplyOutcome::RefetchRequired { item, event, .. } => {
+                guard.sources.insert(item.id.clone(), source.clone());
+                let head = guard.timeline.sequence();
+                persist_item(pool, session, &item, &source, None, head, &now).await?;
+                Ok((item, Some(wire_event(&event))))
+            }
+        }
+    }
+
     /// Live `session.meta.updated` projection event at the current head.
     ///
     /// A meta edit does not commit timeline content, so it consumes no sequence:

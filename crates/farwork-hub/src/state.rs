@@ -128,6 +128,9 @@ struct Inner {
     hub: Hub,
     setup_token: SetupTokenState,
     timelines: crate::timeline::TimelineHub,
+    /// Live connector sockets. Presence and routing live here, not in Postgres:
+    /// a socket cannot be shared between processes.
+    connectors: crate::ingress::ConnectorRegistry,
 }
 
 #[derive(Clone)]
@@ -145,6 +148,7 @@ impl AppState {
                 hub: Hub::new(1024),
                 setup_token,
                 timelines: crate::timeline::TimelineHub::new(),
+                connectors: crate::ingress::ConnectorRegistry::new(),
             }),
         }
     }
@@ -168,5 +172,10 @@ impl AppState {
     /// Domain engine cache plus its Postgres persistence layer.
     pub fn timelines(&self) -> &crate::timeline::TimelineHub {
         &self.inner.timelines
+    }
+
+    /// Routable connector connections (connector_id -> live socket).
+    pub fn connectors(&self) -> &crate::ingress::ConnectorRegistry {
+        &self.inner.connectors
     }
 }

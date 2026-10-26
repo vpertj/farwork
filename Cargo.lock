@@ -328,6 +328,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "farwork-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "farwork-connector"
 version = "0.1.0"
 dependencies = [

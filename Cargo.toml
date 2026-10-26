@@ -6,6 +6,7 @@ members = [
     "crates/farwork-connector",
     "crates/farwork-hub",
     "crates/farwork-timeline",
+    "crates/farwork-agent",
 ]
 
 [workspace.package]

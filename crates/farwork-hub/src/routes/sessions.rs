@@ -47,6 +47,10 @@ pub fn router() -> Router<AppState> {
             "/sessions/{session_id}/runtime/messages",
             post(send_message),
         )
+        .route(
+            "/sessions/{session_id}/runtime/interrupt",
+            post(interrupt_session),
+        )
 }
 
 /// Runtime names advertised by upstream protocol 1.0.
@@ -123,8 +127,9 @@ async fn owned_session(state: &AppState, user_id: &str, session_id: &str) -> Api
         .ok_or_else(|| ApiError::not_found("session not found"))
 }
 
-/// Connector presence is read from the connector rows; with no ingress in this
-/// build they stay \`offline\` — the honest value, not a placeholder.
+/// Connector presence is read from the connector rows. A connector with no live
+/// ingress socket is \`offline\` because the ingress wrote that; nothing here invents a
+/// status.
 pub async fn connector_status_map(
     state: &AppState,
     user_id: &str,
@@ -520,6 +525,12 @@ async fn create_and_start_session(
         WriteOutcome::Committed { item, .. } | WriteOutcome::Unchanged { item } => item.clone(),
     };
 
+    // The first user message reaches the agent through `session.start`, not
+    // `session.message`: the runtime has no stream to address yet.
+    let stream_id =
+        dispatch_session_start(&state, &session, &binding.cwd, payload.content.trim()).await;
+    let dispatched = stream_id.is_some();
+
     crate::routes::projects::publish_dashboard_change(&state, &user_id);
     // Re-read: the message commit advanced the session's seq, and the response
     // must not report the pre-write projection.
@@ -529,20 +540,57 @@ async fn create_and_start_session(
     let statuses = connector_status_map(&state, &user_id).await?;
     Ok(Json(json!({
         "session": session_view(&session, &statuses),
-        // There is no connector ingress in this build, so nothing was
-        // dispatched to a runtime. Say so instead of faking a start.
-        "connectorResult": {
-            "ok": false,
-            "code": "connector_offline",
-            "message": "no connector ingress in this build; the platform session and its \
-    first message are durable, runtime dispatch is deferred",
-            "sessionId": session.id,
+        // Never report a start that did not happen: the session and its first
+        // message are durable either way, but only a delivered `session.start`
+        // counts as a dispatched runtime.
+        "connectorResult": match &stream_id {
+            Some(stream_id) => json!({
+                "ok": true,
+                "streamId": stream_id,
+                "sessionId": session.id,
+            }),
+            None => json!({
+                "ok": false,
+                "code": "connector_offline",
+                "message": "the connector is not connected; the platform session and its \
+    first message are durable, runtime dispatch is pending",
+                "sessionId": session.id,
+            }),
         },
-        "runtimeDispatched": false,
+        "runtimeDispatched": dispatched,
         "eventCursor": Cursor::new(item.updated_seq)
             .map_err(|error| ApiError::internal(error.to_string()))?
             .to_wire(),
     })))
+}
+
+/// Push `session.start` to the session's connector and remember the stream it
+/// drives. `None` means nothing was dispatched — no connector is connected, or the
+/// socket closed mid-send — and the caller must say so instead of faking a start.
+async fn dispatch_session_start(
+    state: &AppState,
+    session: &SessionRow,
+    cwd: &str,
+    prompt: &str,
+) -> Option<String> {
+    let handle = state.connectors().get(&session.connector_id)?;
+    let stream_id = ids::stream_id();
+    if let Err(error) = crate::ingress::open_stream(state, session, &stream_id).await {
+        tracing::warn!(
+            session_id = %session.id,
+            detail = ?error.detail,
+            "cannot record connector stream"
+        );
+        return None;
+    }
+    let frame =
+        crate::ingress::session_start_frame(&stream_id, &session.id, &session.runtime, cwd, prompt);
+    if handle.send(&frame) {
+        Some(stream_id)
+    } else {
+        let _ = crate::ingress::close_stream(state, &stream_id).await;
+        None
+    }
 }
 
 // ------------------------------------------------------------- handlers
@@ -726,6 +774,11 @@ async fn session_snapshot(
         .items_latest(state.pool(), &session_id, limit)
         .await?;
     let state_row = runtime_state_row(state.pool(), &session_id).await?;
+    let notices: Vec<Value> = crate::routes::notices::fetch_notices(state.pool(), &session_id)
+        .await?
+        .iter()
+        .map(crate::routes::notices::NoticeRow::view)
+        .collect();
     let next_seq = cursor.sequence();
     Ok(Json(json!({
         "session": session_view(&session, &statuses),
@@ -738,7 +791,7 @@ async fn session_snapshot(
         // Approvals/notices/catalogs are runtime-owned; with no connector
         // ingress the truthful answer is empty rather than fabricated content.
         "approvals": [],
-        "notices": [],
+        "notices": notices,
         "effectiveCapabilities": { "revision": 0, "capabilities": [] },
         "runtimeCapabilities": { "revision": 0, "capabilities": [] },
         "catalogs": {},
@@ -747,7 +800,10 @@ async fn session_snapshot(
     })))
 }
 
-async fn runtime_state_row(pool: &PgPool, session_id: &str) -> ApiResult<Option<RuntimeStateRow>> {
+pub async fn runtime_state_row(
+    pool: &PgPool,
+    session_id: &str,
+) -> ApiResult<Option<RuntimeStateRow>> {
     Ok(sqlx::query_as::<_, RuntimeStateRow>(&format!(
         "select {RUNTIME_STATE_COLUMNS} from session_runtime_states where session_id = $1"
     ))
@@ -833,9 +889,8 @@ async fn session_runtime_capabilities(
     Path(session_id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let session = owned_session(&state, &user_id, &session_id).await?;
-    // Capabilities are negotiated with the connector at runtime. With no
-    // ingress the truthful set is empty — claiming \`session.send_message\`
-    // would promise execution this build cannot perform.
+    // Ingress Protocol v1 has no capability frame, so nothing has been
+    // negotiated: the truthful set is empty rather than an invented one.
     Ok(Json(json!({
         "connectorId": session.connector_id,
         "capabilitySet": { "revision": 0, "capabilities": [] },
@@ -893,6 +948,34 @@ async fn send_message(
             .publish_json(&user_id, Some(&session_id), event.to_string());
         crate::routes::projects::publish_dashboard_change(&state, &user_id);
     }
+    // Dispatch after the write committed, and never for a duplicate: replaying a
+    // `clientMessageId` must not run the same turn on the agent twice.
+    let mut dispatched = false;
+    if !duplicate {
+        match crate::ingress::active_stream(&state, &session_id).await? {
+            Some(stream_id) => {
+                if let Some(handle) = state.connectors().get(&session.connector_id) {
+                    let frame = crate::ingress::session_message_frame(
+                        &stream_id,
+                        content,
+                        client_message_id,
+                    );
+                    dispatched = handle.send(&frame);
+                    if !dispatched {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            "connector socket closed during session.message dispatch"
+                        );
+                    }
+                }
+            }
+            None => tracing::debug!(
+                session_id = %session_id,
+                "no runtime stream for this session; message stored without dispatch"
+            ),
+        }
+    }
+
     let cursor =
         Cursor::new(item.updated_seq).map_err(|error| ApiError::internal(error.to_string()))?;
     let source =
@@ -904,7 +987,57 @@ async fn send_message(
             "eventCursor": cursor.to_wire(),
             "clientMessageId": client_message_id,
             "duplicate": duplicate,
+            "runtimeDispatched": dispatched,
         },
+    })))
+}
+
+/// `POST /sessions/{id}/runtime/interrupt` — stop the turn the connector is running.
+///
+/// Refuses with 409 rather than answering 200 when there is nothing to interrupt:
+/// a client that got 200 would believe the agent stopped.
+async fn interrupt_session(
+    State(state): State<AppState>,
+    AuthedUser(user_id): AuthedUser,
+    Path(session_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let session = owned_session(&state, &user_id, &session_id).await?;
+    if session.archived {
+        return Err(ApiError::conflict("session is archived"));
+    }
+    if !session.takeover {
+        return Err(ApiError::conflict(
+            "session is read-only until takeover is enabled",
+        ));
+    }
+    let stream_id = crate::ingress::active_stream(&state, &session_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::conflict(json!({
+                "code": "session_not_running",
+                "message": "no active runtime stream for this session",
+            }))
+        })?;
+    let handle = state
+        .connectors()
+        .get(&session.connector_id)
+        .ok_or_else(|| {
+            ApiError::conflict(json!({
+                "code": "connector_offline",
+                "message": "connector is not connected; the interrupt was not delivered",
+            }))
+        })?;
+    if !handle.send(&crate::ingress::session_interrupt_frame(&stream_id)) {
+        return Err(ApiError::conflict(json!({
+            "code": "connector_offline",
+            "message": "connector socket closed; the interrupt was not delivered",
+        })));
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "sessionId": session_id,
+        "streamId": stream_id,
+        "serverTime": timeutil::utc_now(),
     })))
 }
 

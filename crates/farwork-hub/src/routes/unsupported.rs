@@ -17,12 +17,10 @@ macro_rules! unimplemented_paths {
 
 pub fn router() -> Router<AppState> {
     unimplemented_paths!(
-        // Session runtime control (approvals, steer, interrupt, commands).
-        "/sessions/{session_id}/runtime/interrupt",
+        // Session runtime control. Interrupt, notices and notice responses are
+        // implemented (routes::sessions / routes::notices) and are not listed here.
         "/sessions/{session_id}/runtime/steer",
         "/sessions/{session_id}/runtime/commands",
-        "/sessions/{session_id}/runtime/notices",
-        "/sessions/{session_id}/runtime/notices/{notice_id}/respond",
         "/sessions/{session_id}/runtime/selections",
         "/sessions/{session_id}/runtime/catalogs/{catalog}",
         "/sessions/{session_id}/sync",
