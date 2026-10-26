@@ -13,6 +13,7 @@ import {
 	parseProjects,
 	parseRecovery,
 	parseSessions,
+	parseTerminalSession,
 	parseSnapshot,
 	seqToCursor,
 	type Connector,
@@ -25,7 +26,8 @@ import {
 	type Project,
 	type RuntimeNotice,
 	type Session,
-	type SessionSnapshot
+	type SessionSnapshot,
+	type TerminalSession
 } from './types';
 
 export async function listConnectors(token: string): Promise<Connector[]> {
@@ -185,3 +187,52 @@ export function fsFailure(error: unknown): FsFailure {
 }
 
 export { cursorToSeq, seqToCursor };
+
+export type OpenTerminalInput = {
+	cwd?: string;
+	cols: number;
+	rows: number;
+};
+
+export async function openTerminal(
+	token: string,
+	connectorId: string,
+	input: OpenTerminalInput
+): Promise<TerminalSession> {
+	const body: Record<string, unknown> = { cols: input.cols, rows: input.rows };
+	const cwd = input.cwd?.trim() ?? '';
+	if (cwd.length > 0) body.cwd = cwd;
+	const payload = await apiRequest(`/connectors/${encodeURIComponent(connectorId)}/terminals`, {
+		method: 'POST',
+		token,
+		body
+	});
+	const created = parseTerminalSession(payload);
+	if (!created) throw new Error('创建终端的响应格式无法识别。');
+	return created;
+}
+
+// 终端流按 terminalId 单独取票：票据一次性读即删，复用会话票据会让终端握手跨作用域。
+export async function createTerminalWsTicket(token: string, terminalId: string): Promise<string> {
+	const payload = await apiRequest('/ws-ticket', {
+		method: 'POST',
+		token,
+		body: { clientId: clientId(), scope: { terminalId } }
+	});
+	const ticket = asString(asRecord(payload)?.ticket);
+	if (!ticket) throw new Error('未取得 WebSocket 票据。');
+	return ticket;
+}
+
+export function terminalSocketUrl(
+	connectorId: string,
+	terminalId: string,
+	ticket: string
+): string {
+	return webSocketUrl(
+		`/connectors/${encodeURIComponent(connectorId)}/terminals/${encodeURIComponent(terminalId)}/stream`,
+		ticket
+	);
+}
+
+export const terminalFailure = fsFailure;

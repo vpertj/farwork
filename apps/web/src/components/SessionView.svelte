@@ -10,6 +10,7 @@
 	import { workspace } from '$lib/workspace.svelte';
 	import ApprovalCard from './ApprovalCard.svelte';
 	import FilePanel from './FilePanel.svelte';
+	import TerminalPanel from './TerminalPanel.svelte';
 	import TimelineEntry from './TimelineEntry.svelte';
 
 	let { sessionId, token }: { sessionId: string; token: string } = $props();
@@ -29,7 +30,12 @@
 	const workspacePath = $derived(project?.workspacePath ?? session?.cwd ?? '');
 	const connectorOnline = $derived((session?.connectorStatus ?? 'offline') === 'online');
 
-	let filesOpen = $state(true);
+	type SidePanel = 'none' | 'files' | 'terminal';
+	let panel = $state<SidePanel>('files');
+
+	function togglePanel(target: SidePanel): void {
+		panel = panel === target ? 'none' : target;
+	}
 
 	const connectionLabel = $derived(
 		controller.connection === 'open'
@@ -128,14 +134,24 @@
 					</button>
 				{/if}
 				{#if session}
-					<button
-						class="btn"
-						type="button"
-						aria-expanded={filesOpen}
-						onclick={() => (filesOpen = !filesOpen)}
-					>
-						{filesOpen ? '收起文件' : '文件'}
-					</button>
+					<div class="panel-switch" role="group" aria-label="侧边面板">
+						<button
+							class="btn"
+							type="button"
+							aria-pressed={panel === 'files'}
+							onclick={() => togglePanel('files')}
+						>
+							{panel === 'files' ? '收起文件' : '文件'}
+						</button>
+						<button
+							class="btn"
+							type="button"
+							aria-pressed={panel === 'terminal'}
+							onclick={() => togglePanel('terminal')}
+						>
+							{panel === 'terminal' ? '收起终端' : '终端'}
+						</button>
+					</div>
 				{/if}
 			</div>
 		</header>
@@ -243,12 +259,19 @@
 		</form>
 	</section>
 
-	{#if filesOpen && session}
+	{#if panel === 'files' && session}
 		<FilePanel
 			{token}
 			connectorId={session.connectorId}
 			workspacePath={workspacePath}
-			connectorOnline={connectorOnline}
+			{connectorOnline}
+		/>
+	{:else if panel === 'terminal' && session}
+		<TerminalPanel
+			{token}
+			connectorId={session.connectorId}
+			cwd={workspacePath}
+			{connectorOnline}
 		/>
 	{/if}
 </div>
@@ -297,7 +320,7 @@
 		display: flex;
 		flex-direction: column;
 		gap: 3px;
-		min-width: 0;
+		min-width: 140px;
 		flex: 1;
 	}
 
@@ -322,8 +345,16 @@
 	.badges {
 		display: flex;
 		align-items: center;
+		justify-content: flex-end;
+		flex-wrap: wrap;
 		gap: 6px;
+		min-width: 0;
+		flex: 0 1 auto;
+	}
+
+	.badges button {
 		flex: none;
+		white-space: nowrap;
 	}
 
 	.banner {
@@ -492,4 +523,14 @@
 	code {
 		font-size: 10px;
 	}
+	.panel-switch {
+		display: flex;
+		gap: 4px;
+	}
+
+	.panel-switch .btn[aria-pressed='true'] {
+		border-color: color-mix(in oklch, var(--info) 45%, transparent);
+		color: var(--info);
+	}
+
 </style>

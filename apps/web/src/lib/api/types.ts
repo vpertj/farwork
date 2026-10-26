@@ -532,3 +532,79 @@ export function sortFsEntries(entries: FsEntry[]): FsEntry[] {
 		return left.name.localeCompare(right.name, 'zh-CN');
 	});
 }
+
+
+export type TerminalInfo = {
+	id: string;
+	cwd: string | null;
+	cols: number;
+	rows: number;
+	createdAt: string | null;
+};
+
+export function parseTerminalInfo(value: unknown): TerminalInfo | null {
+	const raw = asRecord(value);
+	if (!raw) return null;
+	const id = asString(raw.id);
+	if (!id) return null;
+	const cols = Math.trunc(asNumber(raw.cols, 80));
+	const rows = Math.trunc(asNumber(raw.rows, 24));
+	return {
+		id,
+		cwd: asNullableString(raw.cwd),
+		cols: cols > 0 ? cols : 80,
+		rows: rows > 0 ? rows : 24,
+		createdAt: asNullableString(raw.createdAt)
+	};
+}
+
+export type TerminalSession = {
+	terminal: TerminalInfo;
+	serverTime: string;
+};
+
+export function parseTerminalSession(value: unknown): TerminalSession | null {
+	const raw = asRecord(value);
+	if (!raw) return null;
+	const terminal = parseTerminalInfo(raw.terminal);
+	if (!terminal) return null;
+	return { terminal, serverTime: asString(raw.serverTime) };
+}
+
+export type TerminalServerFrame =
+	| { type: 'terminal.opened' }
+	| { type: 'terminal.data'; data: string }
+	| { type: 'terminal.exit'; code: number | null }
+	| { type: 'terminal.error'; message: string; code: string | null };
+
+export type TerminalClientFrame =
+	| { type: 'terminal.input'; data: string }
+	| { type: 'terminal.resize'; cols: number; rows: number }
+	| { type: 'terminal.close' };
+
+export function parseTerminalFrame(value: unknown): TerminalServerFrame | null {
+	const raw = asRecord(value);
+	if (!raw) return null;
+	const type = asString(raw.type);
+	switch (type) {
+		case 'terminal.opened':
+			return { type };
+		case 'terminal.data': {
+			const data = asString(raw.data);
+			return data.length > 0 ? { type, data } : null;
+		}
+		case 'terminal.exit': {
+			const code =
+				typeof raw.code === 'number' && Number.isFinite(raw.code) ? Math.trunc(raw.code) : null;
+			return { type, code };
+		}
+		case 'terminal.error':
+			return {
+				type,
+				message: asString(raw.message, '终端出错'),
+				code: asNullableString(raw.code)
+			};
+		default:
+			return null;
+	}
+}
