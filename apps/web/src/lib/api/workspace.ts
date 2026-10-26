@@ -3,6 +3,7 @@ import {
 	asRecord,
 	asString,
 	cursorToSeq,
+	parseConnector,
 	parseConnectors,
 	parseFsListing,
 	parseFsText,
@@ -33,6 +34,23 @@ import {
 
 export async function listConnectors(token: string): Promise<Connector[]> {
 	return parseConnectors(await apiRequest('/connectors', { token }));
+}
+
+export type CreatedConnector = {
+	connector: Connector;
+	/** 明文 token：hub 只存 sha256，这个值只在这一条响应里出现一次。 */
+	connectorToken: string;
+};
+
+export async function createConnector(token: string, name: string): Promise<CreatedConnector> {
+	const payload = await apiRequest('/connectors', { method: 'POST', token, body: { name } });
+	const raw = asRecord(payload);
+	const connector = parseConnector(raw?.connector ?? payload);
+	if (!connector) throw new Error('创建设备的响应里没有可识别的 connector。');
+	const connectorToken = asString(raw?.connectorToken).trim();
+	if (connectorToken.length === 0)
+		throw new Error('hub 没有返回 connectorToken：明文 token 只在那一次响应里，请重新创建设备。');
+	return { connector, connectorToken };
 }
 
 export async function listProjects(token: string): Promise<Project[]> {

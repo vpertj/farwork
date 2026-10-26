@@ -6,6 +6,7 @@ export type Route =
 	| { page: 'settings'; tab: string }
 	| { page: 'device'; connectorId: string }
 	| { page: 'new-session'; projectId: string | null }
+	| { page: 'connect' }
 	| { page: 'admin' }
 	| { page: 'share'; shareId: string };
 
@@ -30,6 +31,8 @@ export function parseHash(hash: string): Route {
 				page: 'new-session',
 				projectId: parts[1] ? decodeURIComponent(parts[1]) : null
 			};
+		case 'connect':
+			return { page: 'connect' };
 		case 'admin':
 			return { page: 'admin' };
 		case 'share':
@@ -57,6 +60,8 @@ export function hrefFor(route: Route): string {
 			return route.projectId
 				? `#/new-session/${encodeURIComponent(route.projectId)}`
 				: '#/new-session';
+		case 'connect':
+			return '#/connect';
 		case 'admin':
 			return '#/admin';
 		case 'share':

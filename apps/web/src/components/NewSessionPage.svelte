@@ -3,18 +3,16 @@
 	import { createAndStartSession } from '$lib/api/workspace';
 	import { describeError } from '$lib/format';
 	import { navigate } from '$lib/router';
-	import {
-		runtimeLabel,
-		SUPPORTED_RUNTIMES,
-		type SupportedRuntime
-	} from '$lib/timeline';
+	import { runtimeLabel } from '$lib/timeline';
+	import { availableRuntimes, reportedRuntimes } from '$lib/runtimes';
+	import RuntimeAvailability from './RuntimeAvailability.svelte';
 	import type { ConnectorResult } from '$lib/api/types';
 
 	let { projectId, token }: { projectId: string | null; token: string } = $props();
 
 	let connectorId = $state('');
 	let chosenProjectId = $state('');
-	let runtime = $state<SupportedRuntime>('codex');
+	let runtime = $state('');
 	let content = $state('');
 	let busy = $state(false);
 	let errorMessage = $state<string | null>(null);
@@ -27,6 +25,16 @@
 	const projects = $derived(workspace.projects.filter((row) => row.connectorId === connectorId));
 	const project = $derived(projects.find((row) => row.id === chosenProjectId) ?? null);
 	const undispatched = $derived(connectorResult !== null && !connectorResult.ok);
+	// 运行时列表来自设备自己的探测上报：空数组是「未知」，不是「全部可用」。
+	const runtimeOptions = $derived(reportedRuntimes(connector));
+	const usableRuntimes = $derived(availableRuntimes(connector));
+	const blockedByRuntime = $derived(connector !== null && usableRuntimes.length === 0);
+
+	$effect(() => {
+		const usable = usableRuntimes;
+		if (usable.some((row) => row.name === runtime)) return;
+		runtime = usable.length > 0 ? (usable[0]?.name ?? '') : '';
+	});
 
 	$effect(() => {
 		const key = projectId ?? '';
@@ -72,6 +80,10 @@
 		}
 		if (chosenProjectId.length === 0) {
 			errorMessage = '请选择项目。';
+			return;
+		}
+		if (runtime.length === 0) {
+			errorMessage = '这台设备没有可用运行时，提交也不会启动；先修好设备侧。';
 			return;
 		}
 		const text = content.trim();
@@ -171,23 +183,66 @@
 			{/if}
 
 			<label class="field">
-				<span>运行时</span>
-				<select
-					class="input"
-					value={runtime}
-					onchange={(event) => {
-						const target = event.currentTarget;
-						if (target instanceof HTMLSelectElement) {
-							const next = SUPPORTED_RUNTIMES.find((code) => code === target.value);
-							if (next) runtime = next;
-						}
-					}}
-				>
-					{#each SUPPORTED_RUNTIMES as code (code)}
-						<option value={code}>{runtimeLabel(code)} · {code}</option>
-					{/each}
-				</select>
+				<span>运行时（按设备能力）</span>
+				{#if connectorId.length === 0}
+					<select class="input" disabled>
+						<option value="">先选择设备</option>
+					</select>
+				{:else if runtimeOptions.length === 0}
+					<select class="input" disabled>
+						<option value="">设备未上报可用运行时</option>
+					</select>
+				{:else}
+					<select
+						class="input"
+						value={runtime}
+						disabled={usableRuntimes.length === 0}
+						onchange={(event) => {
+							const target = event.currentTarget;
+							if (!(target instanceof HTMLSelectElement)) return;
+							const next = usableRuntimes.find((row) => row.name === target.value);
+							if (next) runtime = next.name;
+						}}
+					>
+						{#each runtimeOptions as row (row.name)}
+							<option value={row.name} disabled={!row.available}>
+								{runtimeLabel(row.name)} · {row.name}{row.available ? '' : ' — 不可用'}
+							</option>
+						{/each}
+					</select>
+				{/if}
 			</label>
+
+			{#if connectorId.length > 0 && runtimeOptions.length === 0}
+				<p class="note-line">
+					设备未上报可用运行时（<code class="mono">runtimes: []</code>）：状态未知，不当作全部可用。
+					等 agent 连上 hub 并上报探测结果后再来。
+				</p>
+			{:else if runtimeOptions.length > 0}
+				<ul class="runtime-list">
+					{#each runtimeOptions as row (row.name)}
+						<li class:off={!row.available}>
+							<span>{runtimeLabel(row.name)} · <code class="mono">{row.name}</code></span>
+							<span class="state" data-tone={row.available ? 'ok' : 'warn'}>
+								{row.available ? '可用' : '不可用'}
+							</span>
+							{#if !row.available}
+								<span class="reason">{row.reason ?? '设备没有给出原因。'}</span>
+							{/if}
+						</li>
+					{/each}
+				</ul>
+			{/if}
+
+			{#if blockedByRuntime}
+				<p class="note-line blocked">
+					这台设备现在一个可用运行时都没有，提交不会启动任何东西，按钮已禁用。
+				</p>
+			{/if}
+
+			{#if connector}
+				<RuntimeAvailability {connector} mode="dsh-only" />
+			{/if}
 
 			<label class="field">
 				<span>首条消息</span>
@@ -203,7 +258,7 @@
 				<p class="alert" role="alert">{errorMessage}</p>
 			{/if}
 
-			<button class="btn" data-variant="primary" type="submit" disabled={busy}>
+			<button class="btn" data-variant="primary" type="submit" disabled={busy || blockedByRuntime}>
 				{busy ? '正在创建并下发…' : '创建并启动会话'}
 			</button>
 		</form>
@@ -321,6 +376,49 @@
 	.hint {
 		font-size: 11px;
 		color: var(--muted-foreground);
+	}
+
+	.runtime-list {
+		list-style: none;
+		margin: -4px 0 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		font-size: 11.5px;
+	}
+
+	.runtime-list li {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 8px;
+	}
+
+	.runtime-list li.off > span:first-child {
+		color: var(--muted-foreground);
+	}
+
+	.runtime-list .state {
+		font-size: 11px;
+	}
+
+	.runtime-list .state[data-tone='ok'] {
+		color: var(--ok);
+	}
+
+	.runtime-list .state[data-tone='warn'] {
+		color: var(--warn);
+	}
+
+	.runtime-list .reason {
+		flex-basis: 100%;
+		color: var(--muted-foreground);
+		font-size: 11px;
+	}
+
+	.blocked {
+		color: var(--warn);
 	}
 
 	code {

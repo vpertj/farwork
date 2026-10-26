@@ -8,6 +8,7 @@
 	import TaskHome from '../components/TaskHome.svelte';
 	import SessionView from '../components/SessionView.svelte';
 	import NewSessionPage from '../components/NewSessionPage.svelte';
+	import ConnectDevicePage from '../components/ConnectDevicePage.svelte';
 	import PlaceholderPage from '../components/PlaceholderPage.svelte';
 	import SharePage from '../components/SharePage.svelte';
 	import AdminPage from '../components/AdminPage.svelte';
@@ -87,6 +88,8 @@
 			/>
 		{:else if route.page === 'new-session'}
 			<NewSessionPage projectId={route.projectId} {token} />
+		{:else if route.page === 'connect'}
+			<ConnectDevicePage {token} />
 		{:else if route.page === 'admin'}
 			<AdminPage
 				{token}

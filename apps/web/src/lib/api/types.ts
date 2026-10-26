@@ -77,6 +77,25 @@ export function parseAuthUser(value: unknown): AuthUser | null {
 	};
 }
 
+/** 设备自己上报的运行时探测结果；available 为 false 时 reason 是设备给的原因原文。 */
+export type ConnectorRuntime = {
+	name: string;
+	available: boolean;
+	reason: string | null;
+};
+
+export function parseConnectorRuntime(value: unknown): ConnectorRuntime | null {
+	const raw = asRecord(value);
+	if (!raw) return null;
+	const name = asString(raw.name).trim();
+	if (!name) return null;
+	return {
+		name,
+		available: asBoolean(raw.available),
+		reason: asNullableString(raw.reason)
+	};
+}
+
 export type Connector = {
 	id: string;
 	name: string;
@@ -84,6 +103,8 @@ export type Connector = {
 	deviceOs: string;
 	status: string;
 	lastSeenAt: string | null;
+	/** 缺键与空数组同义：设备没有上报，等于「未知」，不是「全部可用」。 */
+	runtimes: ConnectorRuntime[];
 };
 
 export function parseConnector(value: unknown): Connector | null {
@@ -97,7 +118,8 @@ export function parseConnector(value: unknown): Connector | null {
 		connectorKind: asString(raw.connectorKind, 'cli'),
 		deviceOs: asString(raw.deviceOs),
 		status: asString(raw.status, 'offline'),
-		lastSeenAt: asNullableString(raw.lastSeenAt)
+		lastSeenAt: asNullableString(raw.lastSeenAt),
+		runtimes: parseList(raw, 'runtimes', parseConnectorRuntime)
 	};
 }
 

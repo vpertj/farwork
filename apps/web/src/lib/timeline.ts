@@ -33,11 +33,7 @@ export function sortItems(items: readonly TimelineItem[]): TimelineItem[] {
 	);
 }
 
-/** Runtime codes the hub accepts on create-and-start; labels come from `runtimeLabel`. */
-export const SUPPORTED_RUNTIMES = ['codex', 'claude', 'opencode', 'acp', 'dsh'] as const;
-
-export type SupportedRuntime = (typeof SUPPORTED_RUNTIMES)[number];
-
+/** 运行时列表由设备上报（`connector.runtimes`）决定，这里只负责把 code 翻成人话。 */
 export function runtimeLabel(runtime: string): string {
 	switch (runtime) {
 		case 'codex':

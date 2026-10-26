@@ -38,6 +38,17 @@
 	{/if}
 
 	<nav>
+		<div class="nav-links">
+			<a class="nav-link" class:active={route.page === 'connect'} href="#/connect">
+				<span class="glyph" aria-hidden="true">＋</span>
+				<span>连接设备</span>
+			</a>
+			<a class="nav-link" class:active={route.page === 'new-session'} href="#/new-session">
+				<span class="glyph" aria-hidden="true">✦</span>
+				<span>新建会话</span>
+			</a>
+		</div>
+
 		{#if auth.user?.role === 'admin'}
 			<a class="admin-link" class:active={route.page === 'admin'} href="#/admin">
 				<span class="glyph" aria-hidden="true">⚙</span>
@@ -154,6 +165,35 @@
 		display: flex;
 		flex-direction: column;
 		gap: 14px;
+	}
+
+	.nav-links {
+		display: flex;
+		gap: 6px;
+	}
+
+	.nav-link {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 7px 10px;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border);
+		background: oklch(1 0 0 / 3%);
+		color: var(--muted-foreground);
+		font-size: 12.5px;
+		font-weight: 500;
+		flex: 1;
+	}
+
+	.nav-link:hover,
+	.nav-link.active {
+		background: var(--sidebar-accent);
+		color: var(--foreground);
+	}
+
+	.nav-link .glyph {
+		font-size: 12px;
 	}
 
 	.admin-link {
