@@ -1,0 +1,26 @@
+{
+	"name": "Farwork 控制台",
+	"short_name": "Farwork",
+	"description": "跨设备 Agent 工作台：列出设备并在浏览器里操作远程终端。",
+	"lang": "zh-CN",
+	"dir": "ltr",
+	"start_url": "/",
+	"scope": "/",
+	"display": "standalone",
+	"background_color": "#0b0d10",
+	"theme_color": "#0b0d10",
+	"icons": [
+		{
+			"src": "/icon.svg",
+			"sizes": "any",
+			"type": "image/svg+xml",
+			"purpose": "any"
+		},
+		{
+			"src": "/icon.svg",
+			"sizes": "any",
+			"type": "image/svg+xml",
+			"purpose": "maskable"
+		}
+	]
+}

@@ -1,0 +1,20 @@
+[package]
+name = "farwork-connector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "farwork-connector"
+path = "src/main.rs"
+
+[dependencies]
+base64 = { workspace = true }
+farwork-protocol = { workspace = true }
+futures-util = { workspace = true }
+portable-pty = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

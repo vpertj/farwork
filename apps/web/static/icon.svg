@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Farwork">
+	<defs>
+		<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+			<stop offset="0" stop-color="#101820" />
+			<stop offset="1" stop-color="#05080b" />
+		</linearGradient>
+		<linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
+			<stop offset="0" stop-color="#7fdcff" />
+			<stop offset="1" stop-color="#2f9ee0" />
+		</linearGradient>
+	</defs>
+	<rect width="512" height="512" rx="112" fill="url(#bg)" />
+	<rect x="60" y="60" width="392" height="392" rx="76" fill="none" stroke="#1f2a34" stroke-width="6" />
+	<path d="M214 150 L118 256 L214 362" fill="none" stroke="url(#mark)" stroke-width="34" stroke-linecap="round" stroke-linejoin="round" />
+	<path d="M298 150 L394 256 L298 362" fill="none" stroke="url(#mark)" stroke-width="34" stroke-linecap="round" stroke-linejoin="round" opacity="0.55" />
+	<circle cx="256" cy="256" r="18" fill="#7fdcff" />
+</svg>

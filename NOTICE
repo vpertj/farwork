@@ -1,0 +1,17 @@
+Farwork
+Copyright (c) 2026 vpertj and Farwork contributors
+
+本仓库在产品形态上借鉴了以下上游开源项目，特此致谢并声明归属：
+
+  项目名:  Agents-Anywhere
+  维护者:   anywhere-labs
+  仓库:     https://github.com/anywhere-labs/Agents-Anywhere
+  许可:     MIT License
+  上游版权: Copyright (c) anywhere-labs and Agents-Anywhere contributors
+
+声明事项：
+
+1. 本仓库为独立重写（Rust + Svelte），**未包含上游源代码**；上游代码未在本仓库中再分发、修改或再许可。
+2. 借鉴范围限于产品形态与交互概念（跨设备 Agent 工作台、Connector 出站连接、浏览器内远程终端）。
+3. 本仓库与 anywhere-labs 无隶属、赞助或背书关系，"Farwork" 名称与上游品牌无关。
+4. 上游项目以 MIT 许可发布，其著作权归上游作者所有；如需使用上游代码，请遵守上游仓库中的 MIT 许可条款。
