@@ -358,6 +358,10 @@ async fn connector_ingress_end_to_end() {
                 "name": "integration-connector",
                 "platform": "macos",
                 "version": "0.1.0",
+                "supportedRuntimes": [
+                    { "name": "dsh", "available": true, "reason": null },
+                    { "name": "codex", "available": false, "reason": "codex CLI 不在 PATH 上" },
+                ],
             },
         }))
         .await;
@@ -368,6 +372,17 @@ async fn connector_ingress_end_to_end() {
         connector_status(&app, &token, &harness.connector_id).await,
         "online",
         "hello must make the connector online"
+    );
+
+    // --- runtimes: the device's own probe result reaches the REST surface ----
+    let reported = connector_row(&app, &token, &harness.connector_id).await;
+    assert_eq!(
+        reported["runtimes"],
+        json!([
+            { "name": "dsh", "available": true, "reason": null },
+            { "name": "codex", "available": false, "reason": "codex CLI 不在 PATH 上" },
+        ]),
+        "the report must be forwarded as the device sent it: {reported}"
     );
 
     // --- heartbeat refreshes last_seen_at --------------------------------
@@ -950,6 +965,15 @@ async fn connector_ingress_end_to_end() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(status_now, "offline", "a closed socket must clear presence");
+
+    // The probe result described a process that no longer exists: the device
+    // must read as "unreported" instead of keeping its last answer.
+    let after_close = connector_row(&app, &token, &harness.connector_id).await;
+    assert_eq!(
+        after_close["runtimes"],
+        json!([]),
+        "a disconnected device cannot still claim runtimes: {after_close}"
+    );
 
     // A stream whose runtime died with the socket cannot be addressed any more,
     // and the projection says so instead of leaving a phantom "running".

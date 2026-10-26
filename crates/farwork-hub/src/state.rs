@@ -138,6 +138,10 @@ struct Inner {
     /// Last runtime capability report per session. In memory on purpose: it
     /// describes a live process, so it must not outlive the process.
     runtime_caps: crate::runtime_caps::RuntimeCapsCache,
+    /// What each connected device says it can run (`hello.supportedRuntimes`).
+    /// In memory on purpose: it describes the device's current process, and a
+    /// device that is gone must not keep answering for it.
+    connector_runtimes: crate::runtimes::ConnectorRuntimeCache,
     /// Claim attempts per source address. In memory on purpose: it only has to
     /// bound a brute-force budget, and a restart resetting it is harmless.
     pairing_limiter: crate::pairing::ClaimLimiter,
@@ -162,6 +166,7 @@ impl AppState {
                 fs_relay: crate::fsrelay::FsRelay::new(),
                 term_relay: crate::termrelay::TerminalRelay::new(),
                 runtime_caps: crate::runtime_caps::RuntimeCapsCache::new(),
+                connector_runtimes: crate::runtimes::ConnectorRuntimeCache::new(),
                 pairing_limiter: crate::pairing::ClaimLimiter::new(),
             }),
         }
@@ -206,6 +211,11 @@ impl AppState {
     /// The last capability report of each session (what it can do right now).
     pub fn runtime_caps(&self) -> &crate::runtime_caps::RuntimeCapsCache {
         &self.inner.runtime_caps
+    }
+
+    /// What each online connector reported it can run (`connector.runtimes`).
+    pub fn connector_runtimes(&self) -> &crate::runtimes::ConnectorRuntimeCache {
+        &self.inner.connector_runtimes
     }
 
     /// Sliding window that bounds `POST /pairing/claim` attempts per address.

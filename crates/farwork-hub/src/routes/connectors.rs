@@ -146,6 +146,23 @@ async fn owned_connector(
     Ok(connector)
 }
 
+/// A connector row plus what the device says it can run.
+///
+/// `runtimes` is always present: an empty array means "not reported" (offline, or
+/// no `hello` yet), which the web client renders as unknown rather than as
+/// "nothing is available". The entries come from the ingress' in-memory cache and
+/// are never inferred here.
+pub fn connector_view(state: &AppState, connector: &ConnectorRow) -> Value {
+    let mut view = connector.view();
+    if let Some(map) = view.as_object_mut() {
+        map.insert(
+            String::from("runtimes"),
+            state.connector_runtimes().views(&connector.id),
+        );
+    }
+    view
+}
+
 pub async fn connector_views(state: &AppState, user_id: &str) -> ApiResult<Vec<Value>> {
     let rows = sqlx::query_as::<_, ConnectorRow>(&format!(
         "select {CONNECTOR_COLUMNS} from connectors where user_id = $1 order by created_at, id"
@@ -153,7 +170,7 @@ pub async fn connector_views(state: &AppState, user_id: &str) -> ApiResult<Vec<V
     .bind(user_id)
     .fetch_all(state.pool())
     .await?;
-    Ok(rows.iter().map(|row| row.view()).collect())
+    Ok(rows.iter().map(|row| connector_view(state, row)).collect())
 }
 
 async fn list_connectors(
@@ -202,7 +219,7 @@ async fn create_connector(
             .await?
             .ok_or_else(|| ApiError::not_found("connector not found"))?;
         return Ok(Json(json!({
-            "connector": connector.view(),
+            "connector": connector_view(&state, &connector),
             "connectorToken": token,
             "tokenPrefix": prefix,
         })));
@@ -212,7 +229,7 @@ async fn create_connector(
         insert_connector(state.pool(), &connector_id, &user_id, &name, &kind, None).await?;
 
     Ok(Json(json!({
-        "connector": connector.view(),
+        "connector": connector_view(&state, &connector),
         "connectorToken": token,
         "tokenPrefix": connector.token_prefix,
     })))
@@ -246,7 +263,7 @@ async fn get_connector(
 ) -> ApiResult<Json<Value>> {
     let connector = owned_connector(&state, &user_id, &connector_id).await?;
     Ok(Json(json!({
-        "connector": connector.view(),
+        "connector": connector_view(&state, &connector),
         "serverTime": timeutil::utc_now(),
     })))
 }
@@ -272,7 +289,7 @@ async fn patch_connector(
     }
     let connector = owned_connector(&state, &user_id, &connector_id).await?;
     Ok(Json(json!({
-        "connector": connector.view(),
+        "connector": connector_view(&state, &connector),
         "serverTime": timeutil::utc_now(),
     })))
 }
@@ -313,7 +330,7 @@ async fn revoke_connector(
         .await?
         .ok_or_else(|| ApiError::not_found("connector not found"))?;
     Ok(Json(json!({
-        "connector": connector.view(),
+        "connector": connector_view(&state, &connector),
         "connectorToken": token,
         "tokenPrefix": prefix,
         "serverTime": timeutil::utc_now(),

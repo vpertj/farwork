@@ -30,6 +30,7 @@ use crate::identity::AgentIdentity;
 use crate::protocol::{
     parse_server_frame, AgentInfo, ClientFrame, FsOp, ParsedServerFrame, ServerFrame,
 };
+use crate::runtimes::RuntimeProbe;
 use crate::term::{TerminalHost, TerminalSpec};
 use crate::timeutil;
 
@@ -42,6 +43,10 @@ pub struct HubOptions {
     pub hub_url: String,
     pub token: String,
     pub agent: AgentInfo,
+    /// The start-up runtime probe. `hello` carries its result as
+    /// `supportedRuntimes`; a reconnect reuses the same answer instead of
+    /// re-dialling the bridge, because it describes the launch, not the socket.
+    pub runtime_probe: RuntimeProbe,
     pub runtime: RuntimeKind,
     pub workdir: PathBuf,
     pub codex_bin: String,
@@ -150,10 +155,12 @@ impl Connector {
         let (mut sink, mut source) = stream.split();
 
         let (tx, mut rx) = unbounded_channel::<ClientFrame>();
-        tx.send(ClientFrame::Hello {
-            agent: self.opts.agent.clone(),
-        })
-        .map_err(|_| anyhow!("writer channel closed"))?;
+        // The probe was started before this dial, so this await is normally
+        // already satisfied; it is bounded either way.
+        let mut agent = self.opts.agent.clone();
+        agent.supported_runtimes = Some(self.opts.runtime_probe.reports().await);
+        tx.send(ClientFrame::Hello { agent })
+            .map_err(|_| anyhow!("writer channel closed"))?;
         for frame in pending.drain(..) {
             if tx.send(frame).is_err() {
                 break;
@@ -681,7 +688,9 @@ mod tests {
                 name: String::from("test-host"),
                 platform: String::from("test"),
                 version: String::from("0.1.0"),
+                supported_runtimes: None,
             },
+            runtime_probe: RuntimeProbe::none(),
             runtime,
             workdir: PathBuf::from("/tmp"),
             codex_bin: String::from("codex"),

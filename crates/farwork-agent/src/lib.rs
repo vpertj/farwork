@@ -23,6 +23,7 @@ pub mod ids;
 pub mod pair;
 pub mod protocol;
 pub mod rpc;
+pub mod runtimes;
 pub mod term;
 pub mod timeutil;
 

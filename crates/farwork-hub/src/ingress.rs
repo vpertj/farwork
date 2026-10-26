@@ -510,6 +510,11 @@ pub struct AgentInfo {
     pub platform: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
+    /// Optional: absent means "not reported", which is unknown (`runtimes: []`),
+    /// not "reported nothing available". An older agent sends no such key and
+    /// must keep connecting.
+    #[serde(default, rename = "supportedRuntimes")]
+    pub supported_runtimes: Option<Vec<crate::runtimes::RuntimeReport>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1084,6 +1089,41 @@ mod tests {
             ConnectorFrame::Hello { agent } => {
                 assert_eq!(agent.name, "mac");
                 assert_eq!(agent.platform.as_deref(), Some("macos"));
+                // No key: "not reported", which must stay distinguishable from an
+                // explicitly empty list.
+                assert!(agent.supported_runtimes.is_none());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let frame: ConnectorFrame = serde_json::from_str(
+            r#"{"type":"hello","agent":{"name":"mac","platform":"macos","version":"0.1.0","supportedRuntimes":[{"name":"dsh","available":true,"reason":null},{"name":"codex","available":false,"reason":"spawn codex ENOENT"}]}}"#,
+        )
+        .expect("parses");
+        match frame {
+            ConnectorFrame::Hello { agent } => {
+                let reported = agent.supported_runtimes.expect("reported");
+                assert_eq!(reported.len(), 2);
+                assert_eq!(reported[0].name, "dsh");
+                assert!(reported[0].available);
+                assert_eq!(reported[0].reason, None);
+                assert!(!reported[1].available);
+                assert_eq!(reported[1].reason.as_deref(), Some("spawn codex ENOENT"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // An entry missing every optional key is still read, as unavailable: the
+        // hub must never upgrade silence into availability.
+        let frame: ConnectorFrame = serde_json::from_str(
+            r#"{"type":"hello","agent":{"name":"mac","supportedRuntimes":[{"name":"dsh"}]}}"#,
+        )
+        .expect("parses");
+        match frame {
+            ConnectorFrame::Hello { agent } => {
+                let reported = agent.supported_runtimes.expect("reported");
+                assert!(!reported[0].available);
+                assert_eq!(reported[0].reason, None);
             }
             other => panic!("wrong variant: {other:?}"),
         }

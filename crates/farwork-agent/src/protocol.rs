@@ -80,6 +80,15 @@ pub struct AgentInfo {
     pub name: String,
     pub platform: String,
     pub version: String,
+    /// What this device can serve, probed once at startup. Absent means "not
+    /// reported": the hub turns that into `runtimes: []` (unknown), never into a
+    /// claim that nothing is available, so an older agent keeps working.
+    #[serde(
+        default,
+        rename = "supportedRuntimes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub supported_runtimes: Option<Vec<crate::runtimes::RuntimeReport>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -679,6 +688,7 @@ mod tests {
                 name: String::from("mbp"),
                 platform: String::from("macos"),
                 version: String::from("0.1.0"),
+                supported_runtimes: None,
             },
         };
         let encoded = frame.encode().expect("encode");
@@ -690,6 +700,47 @@ mod tests {
             serde_json::from_str::<ClientFrame>(&encoded).unwrap(),
             frame
         );
+    }
+
+    #[test]
+    fn hello_carries_supported_runtimes_and_reads_a_hello_without_them() {
+        let frame = ClientFrame::Hello {
+            agent: AgentInfo {
+                name: String::from("mbp"),
+                platform: String::from("macos"),
+                version: String::from("0.1.0"),
+                supported_runtimes: Some(vec![
+                    crate::runtimes::RuntimeReport::available("echo"),
+                    crate::runtimes::RuntimeReport::unavailable(
+                        "dsh",
+                        "no DSH bridge endpoint found",
+                    ),
+                ]),
+            },
+        };
+        let value: Value = serde_json::from_str(&frame.encode().expect("encode")).expect("json");
+        assert_eq!(
+            value["agent"]["supportedRuntimes"],
+            json!([
+                { "name": "echo", "available": true, "reason": null },
+                { "name": "dsh", "available": false, "reason": "no DSH bridge endpoint found" }
+            ])
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientFrame>(&value.to_string()).expect("parse"),
+            frame
+        );
+
+        // An agent that predates the field must still parse: "not reported" is a
+        // legal answer, and it is not the same value as an empty list.
+        let legacy: ClientFrame = serde_json::from_str(
+            r#"{"type":"hello","agent":{"name":"mbp","platform":"macos","version":"0.1.0"}}"#,
+        )
+        .expect("legacy hello");
+        match legacy {
+            ClientFrame::Hello { agent } => assert!(agent.supported_runtimes.is_none()),
+            other => panic!("expected hello, got {other:?}"),
+        }
     }
 
     #[test]

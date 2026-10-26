@@ -11,6 +11,7 @@ use farwork_agent::hub::{Connector, HubOptions};
 use farwork_agent::identity;
 use farwork_agent::pair;
 use farwork_agent::protocol::AgentInfo;
+use farwork_agent::runtimes::{self, RuntimeProbe};
 use farwork_agent::VERSION;
 
 #[tokio::main]
@@ -166,6 +167,20 @@ async fn run() -> Result<()> {
         "configured"
     );
 
+    // Probed once, in the background: connecting is not held back by it, and the
+    // first `hello` carries whatever the probe found. Every entry is an
+    // observation the UI renders verbatim, so it must never be guessed.
+    let runtime_probe = RuntimeProbe::new(runtimes::ProbeRequest {
+        runtime: cli.runtime,
+        codex_bin: cli.codex_bin.clone(),
+        dsh_endpoint: dsh_endpoint.clone(),
+        dsh_endpoint_override: cli.dsh_endpoint.clone(),
+        agent_id: identity.agent_id.clone(),
+        client_version: String::from(VERSION),
+        timeout: runtimes::PROBE_TIMEOUT,
+    });
+    runtime_probe.warm();
+
     let options = HubOptions {
         hub_url: credentials.hub,
         token: credentials.token,
@@ -173,7 +188,9 @@ async fn run() -> Result<()> {
             name,
             platform: String::from(cli::platform()),
             version: String::from(VERSION),
+            supported_runtimes: None,
         },
+        runtime_probe,
         runtime: cli.runtime,
         workdir,
         codex_bin: cli.codex_bin,

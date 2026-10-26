@@ -115,6 +115,22 @@ async fn run_connector_socket(state: AppState, mut socket: WebSocket, connector:
         ));
     }
 
+    // What this device says it can run, kept next to its socket: `GET /connectors`
+    // renders it verbatim. `None` (the agent omitted the key) records nothing, so
+    // the reader sees `[]` — unknown, not "nothing available".
+    if let Some(runtimes) = agent.supported_runtimes.as_ref() {
+        tracing::info!(
+            connector_id = %connector.id,
+            reported = runtimes.len(),
+            "connector reported supported runtimes"
+        );
+    }
+    state.connector_runtimes().record(
+        &connector.id,
+        &connection_id,
+        agent.supported_runtimes.clone(),
+    );
+
     // Presence is recorded before \`welcome\` so a connector that has seen the
     // welcome can rely on being routable.
     if let Err(error) = ingress::set_presence(
@@ -231,6 +247,17 @@ async fn run_connector_socket(state: AppState, mut socket: WebSocket, connector:
 
     // Only the connection that still owns the route may clear presence.
     if state.connectors().unregister(&connector.id, &connection_id) {
+        // The device is gone, so its probe results no longer describe anything
+        // that is running: the connector reads as `[]` again.
+        if state
+            .connector_runtimes()
+            .clear(&connector.id, &connection_id)
+        {
+            tracing::debug!(
+                connector_id = %connector.id,
+                "dropped the disconnected connector's reported runtimes"
+            );
+        }
         if let Err(error) =
             ingress::set_presence(&state, &connector.id, &connector.user_id, false, None).await
         {
