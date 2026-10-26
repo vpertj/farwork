@@ -65,7 +65,7 @@
 
 ## 3. `/api/v2` 端点（已实现）
 
-`/api/v2` 下共 **46 个已实现的 method+path 组合**（**含** §5 单独记录的 `GET /connector/ws`；只数 §3 这几节是 45），由 **38 次** `.route(...)` 注册（auth 5 + connectors 5 + fs 2 + projects 3 + sessions 11 + notices 3 + shares 3 + connector_ws 1 + terminals 2 + ws 3 = 38；`routes/mod.rs:20-36` 合并 11 个模块、12 次 `.merge`——`shares` 贡献两个 router：认证面与公开面；其中 `unsupported` 子 router 用宏注册 47 条 `501` 路径，见 §4）。另有 `GET /healthz` 挂在根（`lib.rs:33,35`）。
+`/api/v2` 下共 **51 个已实现的 method+path 组合**（**含** §5 单独记录的 `GET /connector/ws`；只数 §3 这几节是 50），由 **41 次** `.route(...)` 注册（admin 3 + auth 5 + connectors 5 + fs 2 + projects 3 + sessions 11 + notices 3 + shares 3 + connector_ws 1 + terminals 2 + ws 3 = 41；`routes/mod.rs:21-38` 合并 12 个模块、13 次 `.merge`——`shares` 贡献两个 router：认证面与公开面；其中 `unsupported` 子 router 用宏注册 45 条 `501` 路径，见 §4）。另有 `GET /healthz` 挂在根（`lib.rs:33,35`）。管理台那 3 次 `.route(...)`（`admin.rs:63-65`）展开成 5 个 method+path：`GET` 与 `POST` 共用同一条 `/admin/users`，另两条各带 `PATCH` 与 `GET`+`PATCH`。
 
 ### 3.1 认证 —— `routes/auth.rs`
 
@@ -175,7 +175,28 @@
 
 **空 timeline 的分享按上游口径 `422 there is no content to share`**（`shares.rs:136-140`）：宁可拒绝，也不发一个空页面——对访客来说那看起来就是 bug。配套两条：`scope:"message"` 必须给 `messageId`（缺失 `422`、不在本会话 `404`，`shares.rs:120-133,266-273`），`scope` 是闭集 `session|message`（其他值 `422`，`shares.rs:66-75,119`）。快照自带 `version`/`sessionTitle`/`eventCursor`（`shares.rs:142-147`），所以公开读不必回表查会话。
 
-### 3.9 WebSocket —— `routes/ws.rs`
+### 3.9 管理台（实例管理） —— `routes/admin.rs`
+
+| 方法 | 路径 | 说明 | 源码 |
+| --- | --- | --- | --- |
+| `GET` | `/admin/users` | 用户目录，按 `created_at desc, id desc` 分页（`limit` 缺省 50、夹在 1..=100；`cursor` 是 base64url 的 `{created_at,id}`，坏游标 `400`）；回 `{users, nextCursor, serverTime}`，每项是七键投影 | `admin.rs:63,193-234` |
+| `POST` | `/admin/users` | 建号（`email`/`password`/`role`/`displayName`）：`201` 回 `{user, serverTime}`。邮箱重复 `409`（唯一索引说了算，不先查后写）；`role` 只收 `admin|member`（其他 `422`）、`password` 必填（`422`）。口令走 `password_hash_from_plaintext`，与注册路径同一套 verifier 派生 | `admin.rs:64,248-298` |
+| `PATCH` | `/admin/users/{user_id}` | 改 `role`/`disabled`/`displayName`（没给的键不动，`200` 回 `{user, serverTime}`）；未知 id `404`；会让实例失去最后一个 admin 的改动 `409 admin_lockout`（见下） | `admin.rs:65,310-379` |
+| `GET` | `/admin/settings` | `{settings:{registrationOpen, emailVerificationRequired}, serverTime}`——读的就是 `/auth/config` 读的那两行 `app_settings` | `admin.rs:65,391-409` |
+| `PATCH` | `/admin/settings` | 部分更新同一组开关（缺省的键不动，空 body 是 no-op），回更新后的值 | `admin.rs:65,411-425` |
+
+三条语义（这张表的全部理由）：
+
+- **① 权限门重读 `users` 行，不信任 token**：每个 handler 先过 `AuthedUser`（无 token 由提取器直接 `401`），再 `require_admin` 用 `find_user_by_id` **重新查一遍行**（`admin.rs:74-85`）：行不在 `401`、`disabled = true` `403 forbidden`（**被停用的 admin 同样吃 403，不是放行**）、`role != "admin"` `403 forbidden`。于是「停用某个 admin」在**下一次请求**就生效，不必等 token 过期；反向也没有 `is_admin` 列可供半真半假——`users.role` 是唯一真相（`admin.rs:9-10`）。集成测试钉死这条：`admin_endpoints_reject_anonymous_and_members`（`tests/admin.rs:246-341`，其中 `:311-341` 就是「停用后立刻 403」）。
+- **② 响应是七键白名单投影，哈希材料永不出现在响应里**：`user_view` 手写 `{id, email, displayName, role, disabled, createdAt, emailVerified}`（`admin.rs:102-112`）。**白名单而不是给 `UserRow` derive `Serialize`**：`USER_COLUMNS` 里含 `password_hash`（`admin.rs:57-59`），一旦 derive，PBKDF2 的 salt 与 verifier 会随下一次加字段一起被发出去。列表、建号、改号三个响应全部只走 `user_view`；测试对**裸 body** 断言不含 `pbkdf2`/`password`/`salt`/`hash`（`tests/admin.rs:439-534`，词表在 `:461-463`）。
+- **③ 不锁死自己**：`lockout_reason` 是纯函数（`admin.rs:144-167`），按优先级给三种 `409`，body 恒为 `{"detail":{"code":"admin_lockout","reason":...,"message":...}}`（`admin.rs:169-181`）：`self_disable`（admin 不能停用自己）、`last_admin`（谁都不能降级或停用**最后一个还能登录的** admin）、`self_demote`（admin 不能把自己降成 `member`；只剩一个 admin 时报 `last_admin`，因为它更强）。**并发下也成立**：`update_user` 在**同一个事务**里先 `select id from users where role = 'admin' and disabled = false for update`（`admin.rs:337-344`）拿到行锁，再用这把锁读到的行数判 `active_admin_count`（`admin.rs:345-355`），最后 `update ... returning` 并提交（`admin.rs:357-373`）。两个并发降级不可能都读到「2 个 admin」然后都成功：第二个阻塞在行锁上，醒来时那一行已不是 admin，计数变 1，于是 `last_admin` 409。单测 `self_changes_and_the_last_admin_are_refused`（`admin.rs:433-467`）+ 集成测试 `admin_cannot_lock_itself_out`（`tests/admin.rs:548-645`）。
+
+**两个开关不等价，别写成"两个都能用"**：
+
+- `emailVerificationRequired` **只落库并如实上报，不拦注册**：`/admin/settings` 写的行（`admin.rs:421-423`）与 `/auth/config` 读的是同一行（`auth.rs:122-124,192`），但本 build **没有邮件通道**、`/auth/email-code` 仍在 `501` 表里（`unsupported.rs:62`），`register` 也根本不看这个开关（`auth.rs:232-240` 只看 bootstrap 与 `registration_open`）。因此它今天是「存了、报了、没人执行」的诚实值；配套事实：`email_verified_at` 全仓**只有读没有写**（`migrations/0001_init.sql:8` 建的可空列），所以 `user_view` 的 `emailVerified` 今天恒为 `false`（`tests/admin.rs:363,491`）。**不要说它开启了邮箱验证。**
+- `registrationOpen` 是**真开关**：非 bootstrap 时 `register` 直接 `!registration_open(pool) → 403 registration is closed`（`auth.rs:239-240`）；bootstrap（库里 0 个用户）走 setup token、不受它约束（`auth.rs:232-238`）。所以关掉后 `POST /auth/register` 真的 `403`，`PATCH /admin/settings` 的改动立刻反映在 `/auth/config`（`tests/admin.rs:700-757`）。
+
+### 3.10 WebSocket —— `routes/ws.rs`
 
 | 方法 | 路径 | 说明 | 源码 |
 | --- | --- | --- | --- |
@@ -183,7 +204,7 @@
 | `GET` | `/dashboard/ws` | 总览流：connectors / projects / 会话状态 | `ws.rs:34,292-320`（socket 循环 `398-420`） |
 | `GET` | `/sessions/{session_id}/ws` | 会话事件流：先发 `session.subscribed`，随后增量；15s keepalive | `ws.rs:35,159-291` |
 
-### 3.10 `GET /healthz`（不在 `/api/v2` 下）
+### 3.11 `GET /healthz`（不在 `/api/v2` 下）
 
 ```json
 {"status":"ok","version":"0.1.0"}
@@ -191,13 +212,15 @@
 
 源码：`crates/farwork-hub/src/lib.rs:33,45-48`。
 
-## 4. `501 not_implemented`：**47 条路径**
+## 4. `501 not_implemented`：**45 条路径**
 
-`crates/farwork-hub/src/routes/unsupported.rs:19-78` 用一个宏注册了 47 条路径，全部 `any(not_implemented)`，返回 `501` 且 body 里带 `"METHOD /path is not implemented in this build"`（`unsupported.rs:82-90`）；未注册的其余路径落到 `unknown_path` → `404`（`unsupported.rs:79,92-100`）。
+`crates/farwork-hub/src/routes/unsupported.rs:19-78` 用一个宏注册了 45 条路径（宏体 `unimplemented_paths!` 里的 `"/..."` 字面量逐条数出），全部 `any(not_implemented)`，返回 `501` 且 body 里带 `"METHOD /path is not implemented in this build"`（`unsupported.rs:82-90`）；未注册的其余路径落到 `unknown_path` → `404`（`unsupported.rs:79,92-100`）。
 
 M3 从这张表里**移出了 3 条**并改为真实实现：`/sessions/{id}/runtime/interrupt`（§3.4）、`/sessions/{id}/runtime/notices` 与 `/sessions/{id}/runtime/notices/{notice_id}/respond`（§3.7）。移出这 3 条不等于那组都补齐了：steer / commands / selections / catalogs / sync / takeover 仍在表里。
 
 **分享又移出 2 条，49 → 47**：`/sessions/{id}/shares`（`POST`）与 `/sessions/{id}/shares/{*rest}`（其中 `DELETE .../{share_id}`）已由 `routes/shares.rs` 真实实现（§3.8），所以表里只剩账号级的 `/shares` 与 `/shares/{*rest}`。公开读 `GET /public/shares/{id}` **从来不在本表**——它的前缀是 `/public/...` 而不是 `/shares*`，是这一批新加的一条路径，不是从 501 里移出来的。
+
+**管理台再移出 2 条，47 → 45**：`/admin` 与 `/admin/{*rest}` 已由 `routes/admin.rs` 真实实现（§3.9；3 次 `.route(...)`、5 个 method+path），所以这一整组从表里消失，宏里只剩 45 条字面量。它移走的是**实例管理**这一块，不是 `/announcements*`、`/agents*`、`/pairing*`、`/usage*` 四个通配——那些仍在表里，仍回 `501`。
 
 **文件浏览的真实端点不在本表**：交付的是 connector 命名空间下的 `POST /connectors/{id}/fs/list` 与 `/fs/readText`（§3.5，`routes/fs.rs`）；本表里的 `/sessions/{id}/files*` 是另一套（会话命名空间下的文件接口，写操作归它，尚未实现），仍回 `501`。文件浏览的交付因此没有动过这个数字：它的入口从一开始就是另一组路径（这几轮里真正从这个数字上移走的只有 interrupt / notices / notices respond 三条，以及分享的两条）。
 
@@ -211,7 +234,7 @@ M3 从这张表里**移出了 3 条**并改为真实实现：`/sessions/{id}/run
 | 批量会话维护 | `/sessions/archive`、`/sessions/unarchive`、`/sessions/read` |
 | 设备运行时管理 | `/connectors/{id}/runtimes`、`/connectors/{id}/runtimes/{*rest}`、`/connectors/{id}/protocol/capabilities`、`/connectors/{id}/pairing`、`/runtimes`、`/runtimes/{*rest}`、`/devices`、`/devices/{*rest}` |
 | OAuth / 邮件码 / 移动端扫码登录 | `/auth/oauth/start|callback|finalize`、`/auth/mobile-login/{qr,exchange,refresh,request,status,confirm}`、`/auth/email-code`、`/auth/change-password`、`/auth/me/email|profile|avatar` |
-| 实例管理 / 公告 / agents / usage / 配对 | `/admin`、`/admin/{*rest}`、`/announcements`、`/announcements/{*rest}`、`/agents`、`/agents/{*rest}`、`/pairing`、`/pairing/{*rest}`、`/usage`、`/usage/{*rest}` |
+| 公告 / agents / usage / 配对（**实例管理已实现**，`/admin*` 已从本表移出，见 §3.9） | `/announcements`、`/announcements/{*rest}`、`/agents`、`/agents/{*rest}`、`/pairing`、`/pairing/{*rest}`、`/usage`、`/usage/{*rest}` |
 
 另有一处**带内** `501`：`POST /sessions/{id}/runtime/messages` 携带非空 `attachments` 时返回 `501 attachments are not implemented in this build`（`sessions.rs:971-979`）——拒绝好过静默丢弃附件。
 
@@ -554,7 +577,7 @@ hub 侧的对应行为：`routes/sessions.rs:766-812` —— `after` 不可解�
 
 ## 8. 测试的前置条件（`crates/farwork-hub/tests/`）
 
-`crates/farwork-hub/tests/` 下五个集成测试都跑真实 PostgreSQL：`e2e.rs`（M2 纵向切片）、`connector_ingress.rs`（ingress 上下行）、`fs_bridge.rs`（文件浏览中继）、`terminal_bridge.rs`（设备终端中继）、`shares.rs`（分享快照与公开读）。下面以 `e2e.rs` 为例：
+`crates/farwork-hub/tests/` 下六个集成测试都跑真实 PostgreSQL：`e2e.rs`（M2 纵向切片）、`connector_ingress.rs`（ingress 上下行）、`fs_bridge.rs`（文件浏览中继）、`terminal_bridge.rs`（设备终端中继）、`shares.rs`（分享快照与公开读）、`admin.rs`（管理台：权限门、七键投影、admin_lockout、settings 开关真的生效）。下面以 `e2e.rs` 为例：
 
 - `TEST_DATABASE_URL` **未设置** → 打印 `SKIP farwork-hub integration test: TEST_DATABASE_URL is not set.` 并附上怎么设置，然后 `return`（`e2e.rs:127-134`）。测试仍然是「通过」的——这就是 CI 必须提供数据库的原因。
 - `TEST_DATABASE_URL` 为空串 → 打印 `SKIP farwork-hub integration test: TEST_DATABASE_URL is empty.` 并返回（`e2e.rs:135-138`）。

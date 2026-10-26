@@ -15,7 +15,7 @@ Farwork 是 [anywhere-labs/Agents-Anywhere](https://github.com/anywhere-labs/Age
 - **致谢**：上游以 MIT 许可发布，归属声明见 [NOTICE](./NOTICE)。
 - **非隶属关系**：本项目与上游维护者无隶属、赞助或背书关系，不代表上游立场。
 
-## 当前状态：M3（部分交付）
+## 当前状态：M3（计划项已全部交付）
 
 已交付（真实可用，不是骨架）：
 
@@ -32,15 +32,16 @@ Farwork 是 [anywhere-labs/Agents-Anywhere](https://github.com/anywhere-labs/Age
 - **文件浏览（只读，M3）**：`POST /api/v2/connectors/{id}/fs/list` 与 `/fs/readText` 经 connector 中继读设备上的目录与文本文件；会话页右侧有文件面板（浏览、面包屑、文本预览）。**沙箱**：所有路径必须落在 agent 的 `--workdir` 内（`canonicalize` 后按路径组件判前缀，`--workdir` 不可解析时一律拒绝而不是放开），符号链接逃逸、`../` 上跳、前缀陷阱都回 `403`；单文件上限 1 MiB，超限 `413` 而不是截断。
 - **分享（M3）**：`POST /api/v2/sessions/{id}/shares` 发布一条分享（`scope:"session"` 整条会话、`"message"` 单条），`GET /api/v2/public/shares/{id}` 是**公开页**——**无需登录**，`Authorization` 带什么都一样；`DELETE /api/v2/sessions/{id}/shares/{shareId}` 撤销（软删，撤销后公开页 `404`）。**公开页看到的是发布那一刻的副本**，不是实时视图：分享之后原会话继续发消息，链接里的内容一字不变。副本按白名单组装（`id`/`type`/`status`/`role`/`content`/`orderSeq`/`itemTime`），`connectorId`/`workspacePath`/`sessionId`/`source`/`hash` 在结构上不会出现在里面；空会话分享回 `422 there is no content to share`。语义与源码见 [docs/architecture.md](./docs/architecture.md) §3.8。
 - **设备终端（M3）**：`POST /api/v2/connectors/{id}/terminals` 在设备上开一个 shell，`GET .../terminals/{terminalId}/stream?ticket=...` 用一次性票据接一条 WebSocket PTY 流（`terminal.input` / `terminal.resize` / `terminal.close` ↔ `terminal.opened` / `terminal.data` / `terminal.exit` / `terminal.error`），会话页右侧有 xterm.js 终端面板。**cwd 的沙箱只约束「起始目录」**：起点必须在 `--workdir` 内（越界直接 `permission_denied`，连 `terminal.opened` 都不会有），但 shell 起来之后能去哪由 shell 自己决定——不要把它理解成「终端被关在 workdir 里」。另外 `201` 只表示已落库并已下发，PTY 是否起来看 `terminal.opened`；agent 的拒绝会以 `terminal.error` 回来并落库，晚连上来的浏览器仍能看到原因。
+- **管理台（M3）**：`GET`/`POST /api/v2/admin/users`、`PATCH /api/v2/admin/users/{id}`、`GET`/`PATCH /api/v2/admin/settings`——一句话：**仅 `role=admin` 可见**（权限门每次重读 `users` 行，被停用的 admin 也 `403`），**列表不含哈希**（响应是七键白名单投影，哈希材料永不出现在响应里），**不能把自己锁死**（`self_disable`/`last_admin`/`self_demote` 三种 `409 admin_lockout`，活跃 admin 数在同一事务内 `select … for update` 取，并发降级不可能都成功）。两个开关别混：`registrationOpen` 是**真开关**（关掉后 `register` 403），`emailVerificationRequired` 只落库并如实上报（本 build 无邮件通道，`/auth/email-code` 仍 501），**不拦注册**。语义与行号见 [docs/architecture.md](./docs/architecture.md) §3.9。
 
 **还不能做**（诚实清单）：
 
 - **codex 的成功路径未验证**：assistant 文本增量、工具执行、真实审批往返都还没有跑通过，原因是本机没有 Codex 凭据。已验证的是「codex 起得来、401 如实落到 timeline」和「用 `--runtime echo` 把审批管道跑通」。
 - **`file_change` / `permissions` 两种 notice kind 未在联调中出现**：echo 后端只发 `command_execution`，codex 的这两个审批分支因无凭据从未被触发；页面上的「文件变更」「权限申请」标签只是代码就位，没有联调证据。
 - **审批卡在浏览器里的端到端流程没有留证据**：已验收的是 `pnpm run check`（0 error）/ `pnpm run build` 通过与「hub 不乐观 resolve」的代码层核对，不是「点批准 → 卡片转已解决」的实机记录。
-- **仍是 `501 not_implemented`**（不会伪造成功）：管理台（admin / agents / usage / announcements / pairing）、账号级分享清单 `/shares`，以及会话命名空间下的 `/sessions/{id}/terminal*`、`/sessions/{id}/files*`——设备终端与文件浏览走的是 connector 命名空间那一组，**不等于**会话命名空间里的这两条。文件浏览**只有只读**的 list/readText：写操作、大文件/二进制流式仍未实现；终端**只有交互式 PTY**：没有 scrollback 持久化、没有接管别人已开的终端，`farwork-server`（M1 探针）也还没退场。
+- **仍有 45 条路径是 `501 not_implemented`**（不会伪造成功）：账号级分享清单 `/shares`、会话命名空间下的 `/sessions/{id}/terminal*` 与 `/sessions/{id}/files*`（设备终端与文件浏览走的是 connector 命名空间那一组，**不等于**会话命名空间里的这两条）、设备运行时管理 `/runtimes*` `/devices*` `/connectors/{id}/runtimes*`、OAuth / 邮件码 / 移动端扫码登录，以及 `/announcements*`、`/agents*`、`/pairing*`、`/usage*`——**管理台只交付了「用户目录 + 实例开关」**，这四组仍在表里。文件浏览**只有只读**的 list/readText：写操作、大文件/二进制流式仍未实现；终端**只有交互式 PTY**：没有 scrollback 持久化、没有接管别人已开的终端，`farwork-server`（M1 探针）也还没退场。
 
-当前端点数：`/api/v2` 下 **46 个已实现的 method+path**（**38 条** `route()` 注册，含文件浏览两条、设备终端两条与分享三条，也含 §5 单独记录的 `GET /connector/ws`）+ `GET /healthz`；另有 **47 条路径**在 `routes/unsupported.rs` 里统一回 `501`（文件浏览与设备终端的入口都不在那张表里；分享把 `/sessions/{id}/shares` 与 `/sessions/{id}/shares/{*rest}` 两条从表里移走了，49 → 47）。逐条清单见 [docs/architecture.md](./docs/architecture.md) §3。
+当前端点数：`/api/v2` 下 **51 个已实现的 method+path**（**41 条** `route()` 注册，含文件浏览两条、设备终端两条、分享三条与管理台 3 次注册，也含 §5 单独记录的 `GET /connector/ws`；只数 §3 那几节是 50）+ `GET /healthz`；另有 **45 条路径**在 `routes/unsupported.rs` 里统一回 `501`（文件浏览与设备终端的入口都不在那张表里；分享把 `/sessions/{id}/shares` 与 `/sessions/{id}/shares/{*rest}` 两条从表里移走了 49 → 47，管理台再把 `/admin` 与 `/admin/{*rest}` 两条移走 47 → 45）。逐条清单见 [docs/architecture.md](./docs/architecture.md) §3。
 
 路线图：[docs/roadmap.md](./docs/roadmap.md)。
 
@@ -175,7 +176,7 @@ farwork/
 
 ## 路线图
 
-M1 可行走骨架（已被 M2 取代，保留为终端探针）→ **M2 纵向切片（已交付）** → **M3 connector ingress + agent（部分交付：后端与协议已实测，Web 审批卡、新建会话表单、文件浏览、设备终端已交付；分享、管理台未开始）** → M4 Capacitor Android App（其后 iOS）。
+M1 可行走骨架（已被 M2 取代，保留为终端探针）→ **M2 纵向切片（已交付）** → **M3 connector ingress + agent（计划项已全部交付：后端与协议已实测，Web 审批卡、新建会话表单、文件浏览、设备终端、分享、管理台都已交付并验收）** → M4 Capacitor Android App（其后 iOS）。
 每个里程碑的交付物与验收点见 [docs/roadmap.md](./docs/roadmap.md)。
 
 ## 许可
@@ -188,4 +189,4 @@ Farwork is an open-source, cross-device agent workbench: open a real agent sessi
 
 This repository is an **unofficial** rewrite of [anywhere-labs/Agents-Anywhere](https://github.com/anywhere-labs/Agents-Anywhere) in **Rust + Svelte**. It shares no source code with upstream and only borrows the product shape; upstream is MIT-licensed (see NOTICE). We are not affiliated with or endorsed by the upstream maintainers.
 
-Status: the M2 vertical slice is delivered (login, connectors/projects/sessions, timeline, sending messages, WebSocket deltas, cursor catch-up), and M3 is partially delivered — connector ingress (`/api/v2/connector/ws`, Ingress Protocol v1) plus `farwork-agent`, which drives a local `codex app-server` and relays approvals; `connectors.status` now reflects real presence. Still missing: the web approval card, the new-session form, files, terminal, sharing and the admin console (`501`), and — importantly — the codex success path (assistant streaming, tool execution, a real approval round trip) is unverified because there are no Codex credentials on the test machine. Details in [docs/](./docs). Licensed under MIT.
+Status: the M2 vertical slice is delivered (login, connectors/projects/sessions, timeline, sending messages, WebSocket deltas, cursor catch-up), and M3 is delivered — connector ingress (`/api/v2/connector/ws`, Ingress Protocol v1) plus `farwork-agent`, which drives a local `codex app-server` and relays approvals; `connectors.status` now reflects real presence. M3's planned feature blocks are all delivered, including the file browser, the device terminal, sharing and the admin console (user directory + instance switches, `role=admin` only, no hash material in responses, and no way to lock the instance out of its last admin). Still missing: the remaining 45 `501` paths (`/agents*`, `/usage*`, `/announcements*`, `/pairing*`, `/shares`, the session-namespace `/sessions/{id}/terminal*` and `/files*`, runtimes/devices, OAuth and email-code), and — importantly — the codex success path (assistant streaming, tool execution, a real approval round trip) is unverified because there are no Codex credentials on the test machine. Details in [docs/](./docs). Licensed under MIT.
