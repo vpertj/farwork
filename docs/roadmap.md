@@ -50,7 +50,7 @@ M1 的契约细节保留在 `docs/architecture.md` 附录 A（标注为遗留）
 
 ### 明确未含（当时都是 `501`）
 
-connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终端 · 分享 · 管理台（admin / agents / usage / announcements / pairing）。其中 connector ingress 与审批/中断已由 M3 交付（见下），其余仍未实现。
+connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终端 · 分享 · 管理台（admin / agents / usage / announcements / pairing）。其中 connector ingress、审批/中断与文件浏览已由 M3 交付（见下），终端 / 分享 / 管理台仍未实现。
 
 ## M3 · connector ingress + agent（**部分交付**）
 
@@ -62,6 +62,7 @@ connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终�
 - **`farwork-agent`（新 crate）**：主动出站连 hub；身份落盘在 `$FARWORK_HOME/agent.json`（文件 0600、目录 0700，重启不换 id）；按 `session.start` 拉起 `codex app-server --stdio` 并把 JSON-RPC 翻成 ingress 帧；自带 `--runtime echo` 假后端用于自测。
 - **会话真派发**：`POST /sessions/create-and-start` 会下发 `session.start`（首条消息走 `prompt`）；`POST /sessions/{id}/runtime/messages` 在会话有活跃流时把 `session.message` 推给 agent，响应里的 `runtimeDispatched` 才是真实投递结果。
 - **审批与中断（后端）**：`GET /sessions/{id}/runtime/notices`、`POST /sessions/{id}/notices/{id}/respond`（+ `runtime` 别名）、`POST /sessions/{id}/runtime/interrupt` 落地；新增迁移 `0002_connector_ingress.sql`（`session_streams` 让 `streamId` 跨 hub 重启存活，`session_notices` 让审批跨刷新存活）。
+- **文件浏览（只读）**：新增 ingress 帧 `fs.request` / `fs.response`（hub 侧 `crates/farwork-hub/src/ingress.rs` + 配对表 `crates/farwork-hub/src/fsrelay.rs`，agent 侧 `crates/farwork-agent/src/protocol.rs` + 沙箱 `crates/farwork-agent/src/fsops.rs`），REST 两条 `POST /connectors/{id}/fs/list`、`POST /connectors/{id}/fs/readText`（`crates/farwork-hub/src/routes/fs.rs`），Web 侧会话页文件面板（`apps/web/src/components/FilePanel.svelte`，API 是 `apps/web/src/lib/api/workspace.ts` 的 `listWorkspaceDir` / `readWorkspaceText`）。**沙箱根是 agent 的 `--workdir`**：`canonicalize` 后按路径组件判前缀，越界/符号链接逃逸一律 403，`workdir` 不可解析时直接拒绝（契约见 `docs/architecture.md` §5.5–§5.6）。`501` 表**没有变化**，仍是 49 条：这批入口本来就不在那张表里（表里的 `/sessions/{id}/files*` 是另一组）。
 - **诚实兜底更窄了**：`501` 表从 52 条减到 **49 条**（移出 interrupt / notices / notices respond 三条）；REST 与 ingress 两侧仍然「宁可变窄，不伪造成功」。
 - **Web 审批卡**（`apps/web/src/components/ApprovalCard.svelte`）：三个决定按钮 `approve` / `approve_for_session` / `reject`（`:75-93`）；点击后状态先落在「已下发，等待运行时确认」（`:24-35,101`），卡片变灰**只**取决于服务端 `notice.status === 'resolved'`（`:22,25`）；投递失败可点「重试」（`:96-97`）。
 - **Web 新建会话表单**（`apps/web/src/components/NewSessionPage.svelte`，路由 `#/new-session[/:projectId]`，`apps/web/src/lib/router.ts:26-53`）：一次填 connector + 项目 + runtime + 首条消息；`connectorResult.ok` 为真则跳进会话页（`NewSessionPage.svelte:93`），为假则如实显示「设备未连接：指令未下发」（`:105,213`）+ 返回码（`:222`）+ 已创建会话 id（`:218`）。
@@ -73,7 +74,8 @@ connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终�
 2. **审批管道往返（echo 假后端）**：hub + `farwork-agent --runtime echo`（需 `FARWORK_HUB_DEV_RUNTIMES=echo`，默认关闭，启动会打 WARN）跑通完整一轮：`create-and-start` 下发 → agent 产生 `command_execution` notice（`status: open`）→ 会话状态 `waiting_approval` → `POST .../notices/{id}/respond` 带 `approve` 返回 200 → connector 回报 `notice.resolved{decision:approve}` → 会话回 `idle`；杀掉 agent 后 `connectors.status` 回落 `offline`。
    - 注意这条验证的是**审批管道**，不是真实 codex 审批。echo 后端不执行任何东西，它只是把契约跑一遍（`crates/farwork-agent/src/echo.rs`）。
 3. **Web 交付的静态验收（仓库所有者验收）**：`apps/web` 的 `pnpm run check` 0 error、`pnpm run build` 通过；审批卡不乐观 resolve 在代码层确认——`POST .../notices/{id}/respond` 的分支只返回 `ok` + 仍是 `open` 的 `notice.view()` + `serverTime`（`crates/farwork-hub/src/routes/notices.rs:333-340`），把 `status` 写成 `resolved` 的 SQL 只在 connector 回报的 `resolve_notice` 里（`notices.rs:159-169`）；前端同样只在 `notice.status === 'resolved'` 时变灰（`apps/web/src/components/ApprovalCard.svelte:22,25`）。
-4. **`session.message.clientMessageId` 契约缺陷已修复**：hub 无值时不发该键（`crates/farwork-hub/src/ingress.rs:324-346`，回归测试 `ingress::tests::session_message_frame_omits_an_absent_client_message_id`）、agent 收 `Option<String>` 兼容缺失与 `null`（`crates/farwork-agent/src/protocol.rs:192-200`，回归测试 `protocol::tests::session_message_parses_without_a_client_message_id`）、agent 本地生成 `cmid_<uuid>` 供 `turn/start`（`crates/farwork-agent/src/hub.rs:303-319`）。契约口径见 `docs/architecture.md` §5.4。
+4. **文件浏览 11/11 断言通过（仓库所有者验收）**：`crates/farwork-hub/tests/fs_bridge.rs`（假 connector + 真 PostgreSQL）跑通 `fs/list` 成功、`fs/readText` 成功，并逐条断言越权与异常：根外路径（`/etc/passwd` 这类）→ `403`、`../` 上跳 → `403`、指向根外的符号链接 → `403`、文件缺失 → `404`、相对路径 → `422 invalid_path`、并发两个请求按 `requestId` 配对不串号（`fs_bridge.rs:545-560`）、agent 停掉后 → `503 connector_offline`（`fs_bridge.rs:385-395`）。三条越权用例的判定在 agent 沙箱单测里（`crates/farwork-agent/src/fsops.rs:320-425`，另有一条前缀陷阱 `fsops.rs:381-402`）；REST 侧 `permission_denied → 403` 的映射断言在 `fs_bridge.rs:497-535`（由假 connector 回 `permission_denied`），同一处还断言了 `404 not_found`、`413 too_large`、`502 io_error`，`504 fs_timeout` 在 `fs_bridge.rs:630-650`。
+5. **`session.message.clientMessageId` 契约缺陷已修复**：hub 无值时不发该键（`crates/farwork-hub/src/ingress.rs:324-346`，回归测试 `ingress::tests::session_message_frame_omits_an_absent_client_message_id`）、agent 收 `Option<String>` 兼容缺失与 `null`（`crates/farwork-agent/src/protocol.rs:192-200`，回归测试 `protocol::tests::session_message_parses_without_a_client_message_id`）、agent 本地生成 `cmid_<uuid>` 供 `turn/start`（`crates/farwork-agent/src/hub.rs:303-319`）。契约口径见 `docs/architecture.md` §5.4。
 
 ### 未验证（别当成已支持）
 
@@ -91,22 +93,22 @@ connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终�
 
 顺序的理由：后面每一项都依赖 ingress 提供的真实连接，先做 UI 只会做出假状态。
 
-原「1. Web 审批卡」「2. 新建会话表单」已交付（见上文「已交付」与「已验证」第 3 条）；其中原定验收项——用 `--runtime echo` 点批准直到卡片转已解决——**仍未留证据**，属于下一批要补的验证，不是要重做功能。
+原「1. Web 审批卡」「2. 新建会话表单」已交付（见上文「已交付」与「已验证」第 3 条）；其中原定验收项——用 `--runtime echo` 点批准直到卡片转已解决——**仍未留证据**，属于下一批要补的验证，不是要重做功能。文件浏览已交付并划掉（见下）。**未验证项不因划掉一项而消失**：codex 成功路径、`file_change` / `permissions` 两种 notice kind、审批卡在浏览器里的端到端证据，仍留在上面的「未验证」清单里。
 
-### 1. 文件浏览
+### ~~1. 文件浏览~~ —— **已交付**（只读，见上文「已交付」与「已验证」第 4 条）
 
-- `/sessions/{id}/files*` 经 connector 中继；大文件与二进制流式处理，不整块读入内存；写操作一律过审批闸门。
+交付的入口是 connector 命名空间下的 `POST /connectors/{id}/fs/list` 与 `/fs/readText`，**不是**原计划里的 `/sessions/{id}/files*`（那组仍回 `501`，归写操作）。仍缺的部分：写操作（一律要过审批闸门）、大文件与二进制流式（现在整块读，且有 1 MiB 硬上限）、目录树懒加载。
 
-### 2. 终端
+### 1. 终端
 
 - `/sessions/{id}/terminal*` 隧道；复用 M1 的 PTY + base64 字节帧实现，前端复用 xterm.js。
 - 验收：真终端可交互、resize 生效、设备断连以 `exit code -1` 明确区分；随之让 `farwork-server` 退场。
 
-### 3. 分享
+### 2. 分享
 
 - `/sessions/{id}/shares*` 与 `/shares*`：只读/可写分享链接、过期与撤销。
 
-### 4. 管理台
+### 3. 管理台
 
 - `/admin*`、`/agents*`、`/usage*`、`/announcements*`、`/pairing*`：用户管理、运行时清单、用量、公告、设备配对。
 

@@ -29,15 +29,16 @@ Farwork 是 [anywhere-labs/Agents-Anywhere](https://github.com/anywhere-labs/Age
 - **Web 审批卡**：会话页把待办审批渲染成卡片，三个决定 `approve` / `approve_for_session` / `reject`；点击后先显示「已下发，等待运行时确认」，**不本地改成已批准**——变灰只认服务端 `notice.resolved`；投递失败可重试。
 - **Web 新建会话表单**：`#/new-session`（可带项目 id），一次填 connector + 项目 + runtime + 首条消息；成功即跳进会话页；设备不在线时如实提示「设备未连接：指令未下发」+ 返回码 + 已创建会话 id（不会假装下发成功）。runtime 下拉取自 `SUPPORTED_RUNTIMES`（`apps/web/src/lib/timeline.ts:37`：`codex/claude/opencode/acp/dsh`），与 hub 的 `RUNTIMES`（`crates/farwork-hub/src/routes/sessions.rs:57`）一致。
 - **Web 会话中断与状态原因**：中断按钮只在指令下发后提示「等待运行时回推状态更新」，不本地改状态；会话的 `statusReason`（如 `connector disconnected`）单独一行展示。
+- **文件浏览（只读，M3）**：`POST /api/v2/connectors/{id}/fs/list` 与 `/fs/readText` 经 connector 中继读设备上的目录与文本文件；会话页右侧有文件面板（浏览、面包屑、文本预览）。**沙箱**：所有路径必须落在 agent 的 `--workdir` 内（`canonicalize` 后按路径组件判前缀，`--workdir` 不可解析时一律拒绝而不是放开），符号链接逃逸、`../` 上跳、前缀陷阱都回 `403`；单文件上限 1 MiB，超限 `413` 而不是截断。
 
 **还不能做**（诚实清单）：
 
 - **codex 的成功路径未验证**：assistant 文本增量、工具执行、真实审批往返都还没有跑通过，原因是本机没有 Codex 凭据。已验证的是「codex 起得来、401 如实落到 timeline」和「用 `--runtime echo` 把审批管道跑通」。
 - **`file_change` / `permissions` 两种 notice kind 未在联调中出现**：echo 后端只发 `command_execution`，codex 的这两个审批分支因无凭据从未被触发；页面上的「文件变更」「权限申请」标签只是代码就位，没有联调证据。
 - **审批卡在浏览器里的端到端流程没有留证据**：已验收的是 `pnpm run check`（0 error）/ `pnpm run build` 通过与「hub 不乐观 resolve」的代码层核对，不是「点批准 → 卡片转已解决」的实机记录。
-- **仍是 `501 not_implemented`**（不会伪造成功）：文件浏览、终端、会话分享、管理台（admin / agents / usage / announcements / pairing）。
+- **仍是 `501 not_implemented`**（不会伪造成功）：终端、会话分享、管理台（admin / agents / usage / announcements / pairing）。文件浏览已交付，但**只有只读**的 list/readText：写操作、大文件/二进制流式、`/sessions/{id}/files*` 仍未实现。
 
-当前端点数：`/api/v2` 下 **38 个已实现的 method+path**（31 条 `route()` 注册）+ `GET /healthz`；另有 **49 条路径**在 `routes/unsupported.rs` 里统一回 `501`。逐条清单见 [docs/architecture.md](./docs/architecture.md)。
+当前端点数：`/api/v2` 下 **40 个已实现的 method+path**（**33 条** `route()` 注册，含文件浏览两条）+ `GET /healthz`；另有 **49 条路径**在 `routes/unsupported.rs` 里统一回 `501`（文件浏览的入口不在那张表里，所以计数没变）。逐条清单见 [docs/architecture.md](./docs/architecture.md)。
 
 路线图：[docs/roadmap.md](./docs/roadmap.md)。
 
