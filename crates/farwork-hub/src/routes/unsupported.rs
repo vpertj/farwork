@@ -64,9 +64,9 @@ pub fn router() -> Router<AppState> {
         "/auth/me/email",
         "/auth/me/profile",
         "/auth/me/avatar",
-        // Instance administration, announcements, agents, usage.
-        "/admin",
-        "/admin/{*rest}",
+        // Announcements, agents, usage. Instance administration is implemented
+        // (routes::admin) and is not listed here — that is 2 fewer paths than
+        // the 47 M3 left behind: 45.
         "/announcements",
         "/announcements/{*rest}",
         "/agents",

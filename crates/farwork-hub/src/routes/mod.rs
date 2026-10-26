@@ -1,5 +1,6 @@
 //! HTTP and WebSocket routing for the `/api/v2` namespace.
 
+pub mod admin;
 pub mod auth;
 pub mod connector_ws;
 pub mod connectors;
@@ -19,6 +20,7 @@ use crate::state::AppState;
 
 pub fn api() -> Router<AppState> {
     Router::new()
+        .merge(admin::router())
         .merge(auth::router())
         .merge(connector_ws::router())
         .merge(connectors::router())

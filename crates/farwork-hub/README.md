@@ -158,6 +158,11 @@ create-and-start → 消息写入 + `clientMessageId` 幂等 + `source.clientMes
 snapshot 信封 10 个必填字段 → events 游标补拉 / 超前 / 非法三种分支 →
 501 → ws-ticket 一次性 → WS `session.subscribed` + 实时增量 → dashboard.snapshot。
 
+管理台另有一个文件（`tests/admin.rs`，5 个用例，每个用例自己 truncate + bootstrap 一个
+admin 与一个 member，并用进程内异步锁互斥）：非 admin 403 / 未登录 401 / 建号后能用新密码登录 /
+重复邮箱 409 / 自己停用与降级 409 / 降级最后一个 admin 409 / 列表里 grep 不到任何哈希或盐 /
+PATCH settings 生效且 `/auth/config` 跟着变。
+
 未设置 `TEST_DATABASE_URL` 时：
 
 ```text
@@ -204,16 +209,44 @@ test p0_journey_login_to_websocket_delta ... ok
 | GET | `/api/v2/public/shares/{shareId}` | **免鉴权**（不带 `Authorization` 也 200）：`{share:{id, scope, sessionTitle, createdAt, timeline:{items}}, serverTime}`，只回快照 |
 | WS | `/api/v2/sessions/{id}/ws?ticket=` | `session.subscribed` + `timeline.item_created/updated` + `session.meta.updated` + `session.refetch_required` + `keepalive` |
 | WS | `/api/v2/dashboard/ws?ticket=` | `dashboard.snapshot` + 变更后重发快照 |
+| GET | `/api/v2/admin/users` | 管理台用户目录 `{users, nextCursor, serverTime}`；**仅 role=admin**；`limit` 默认 50、上限 100，游标是 `(createdAt, id)` 的 keyset |
+| POST | `/api/v2/admin/users` | `201 {user, serverTime}`；body `{email, password, role:"admin"\|"member"}`，密码由服务端派生 verifier 落库（与注册同一条 PBKDF2 路径）；重复邮箱 409 |
+| PATCH | `/api/v2/admin/users/{id}` | `200 {user, serverTime}`；body `{role?, disabled?, displayName?}`；会把自己或最后一个 admin 锁在门外时 409 `{code:"admin_lockout", reason, message}` |
+| GET/PATCH | `/api/v2/admin/settings` | `{settings:{registrationOpen, emailVerificationRequired}, serverTime}`；写 `app_settings` 的 `registration_open` / `email_verification_required`，`GET /auth/config` 读同一行 |
 
-### 501 清单（`{"error":"not_implemented","detail":...,"serverTime":...}`）· **47 条**
+### 501 清单（`{"error":"not_implemented","detail":...,"serverTime":...}`）· **45 条**
 
 审批 / steer / interrupt / runtime commands / notices 应答 / runtime selections / catalogs
 / `POST|DELETE /sessions/{id}/takeover` / `POST /sessions/{id}/sync` / 终端
 （`/sessions/{id}/terminal/**`）/ 文件浏览（`/sessions/{id}/files/**`）/ 账号级分享列表
 （`/shares/**`；会话/消息分享的三条端点已实现，见上表）/ 批量 archive|unarchive|read / device runtime 管理
 （`/connectors/{id}/runtimes/**`、`/runtimes/**`、`/devices/**`）/ OAuth（`/auth/oauth/*`）/
-扫码登录（`/auth/mobile-login/*`）/ 邮箱验证码、改密、换头像 / admin、announcements、agents、
-pairing、usage。未知路径返回 404 `{"detail":"no route for ..."}`。
+扫码登录（`/auth/mobile-login/*`）/ 邮箱验证码、改密、换头像 / announcements、agents、
+pairing、usage。管理台（`/admin/**`）已实现，见上表四条，不再在这份清单里。未知路径返回 404
+`{"detail":"no route for ..."}`（包括没有对应路由的 `/admin/xxx`）。
+
+---
+
+### 管理台：权限门与「不把自己锁死」
+
+四条 `/admin/*` 端点全部取 `AuthedUser`（所以**没带 token 是 401**，来自 extractor），再由
+`routes::admin::require_admin` 重读那一行 users：账号必须仍在、未被停用、且 `users.role = 'admin'`，
+否则 **403** `{"detail":{"code":"forbidden","message":...}}`。判定只用 `users.role` 这一个字段，
+**没有** `is_admin` 之类的布尔副本，所以不存在「半个 admin」。
+
+「不锁死自己」的判定只有一个地方：`crates/farwork-hub/src/routes/admin.rs` 的
+`lockout_reason(...)`（纯函数，单测覆盖）。命中任一条即 **409**
+`{"detail":{"code":"admin_lockout","reason":...,"message":...}}`：
+
+| reason | 规则 |
+| --- | --- |
+| `self_disable` | admin 不能把自己 `disabled = true` |
+| `last_admin` | 谁都不能让**最后一个能登录的 admin** 被降级或停用 |
+| `self_demote` | admin 不能把自己降成 `member`（只剩自己时先命中 `last_admin`，那是更强的说法） |
+
+活跃 admin 的计数在同一事务里用 `select id from users where role = 'admin' and disabled = false
+for update` 取，行锁让两个并发的降级不可能都读到 2 然后都成功 —— 这条不变量由 PG 兜底，不是进程内
+的 check-then-write。
 
 ---
 
@@ -301,6 +334,10 @@ snapshot_json / allowed_file_ids_json / created_at / deleted_at`）。`snapshot_
 8. 事件里的 `session.refetch_required` 由 hub 在 WS 订阅者 lag 时发出；HTTP `events` 的
    refetch 分支不额外附带 reason 字段（保持 `ProtocolEventRecoveryResponse` 的字段集合不变，
    reason 只进 tracing 日志）。
+9. **管理台的 `emailVerificationRequired` 只落库、只上报，不拦截注册**：本 build 没有任何邮件
+   投递通道，也没有验证码端点（`/auth/email-code` 仍是 501），所以把它打开不会让注册要求验证
+   邮箱 —— 那会是假成功。`registrationOpen` 是真的行为开关（关掉后 `POST /auth/register` 回
+   403），两者都写 `app_settings`，`GET /auth/config` 与 `GET /admin/settings` 读同一行。
 
 ---
 
@@ -314,4 +351,5 @@ cargo test --workspace
 
 本 crate 单测覆盖：PBKDF2 verifier/JWT 往返与过期、游标解析、contentHash 稳定性、事件信封、
 wire 适配（`source`/`completedAt`/`contentHash` 前缀/`protocolVersion`）、会话分页游标、
-邮箱与显示名规范化、工作区 key 规范化。
+邮箱与显示名规范化、工作区 key 规范化，以及管理台的 `lockout_reason`（自锁三条规则 +
+「另一个 admin 可降级」「只剩一个 admin 时不可降级」两条例外）与 role 校验。

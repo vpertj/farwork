@@ -22,6 +22,7 @@ use crate::state::AppState;
 use crate::timeutil;
 
 pub const SETTING_REGISTRATION_OPEN: &str = "registration_open";
+pub const SETTING_EMAIL_VERIFICATION_REQUIRED: &str = "email_verification_required";
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -64,7 +65,7 @@ pub fn normalize_email(raw: &str) -> ApiResult<String> {
     Ok(value)
 }
 
-fn normalize_display_name(raw: Option<&str>, email: &str) -> String {
+pub fn normalize_display_name(raw: Option<&str>, email: &str) -> String {
     let candidate = raw.map(|value| value.trim()).unwrap_or_default();
     let fallback = email.split('@').next().unwrap_or(email);
     let value = if candidate.is_empty() {
@@ -83,17 +84,43 @@ pub async fn count_users(pool: &PgPool) -> Result<i64, sqlx::Error> {
     Ok(row.get::<i64, _>("total"))
 }
 
-pub async fn registration_open(pool: &PgPool) -> Result<bool, sqlx::Error> {
+/// Boolean instance switch stored in `app_settings` as the string `"true"`/`"false"`.
+pub async fn bool_setting(pool: &PgPool, key: &str, default: bool) -> Result<bool, sqlx::Error> {
     use sqlx::Row as _;
     let row = sqlx::query("select value from app_settings where key = $1")
-        .bind(SETTING_REGISTRATION_OPEN)
+        .bind(key)
         .fetch_optional(pool)
         .await?;
     Ok(row
         .map(|row| row.get::<String, _>("value") == "true")
-        // A fresh instance keeps self-service registration closed until an
-        // explicit admin action; bootstrap still works through the setup token.
-        .unwrap_or(false))
+        .unwrap_or(default))
+}
+
+pub async fn set_bool_setting(pool: &PgPool, key: &str, value: bool) -> Result<(), sqlx::Error> {
+    let now = timeutil::utc_now();
+    sqlx::query(
+        "insert into app_settings (key, value, updated_at) values ($1, $2, $3)
+         on conflict (key) do update set value = excluded.value, updated_at = excluded.updated_at",
+    )
+    .bind(key)
+    .bind(if value { "true" } else { "false" })
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn registration_open(pool: &PgPool) -> Result<bool, sqlx::Error> {
+    // A fresh instance keeps self-service registration closed until an explicit
+    // admin action; bootstrap still works through the setup token.
+    bool_setting(pool, SETTING_REGISTRATION_OPEN, false).await
+}
+
+/// Reported by `/auth/config` and `/admin/settings`. This build has no mailer, so
+/// the flag is stored and reported but cannot gate registration yet — see the
+/// hub README §7.
+pub async fn email_verification_required(pool: &PgPool) -> Result<bool, sqlx::Error> {
+    bool_setting(pool, SETTING_EMAIL_VERIFICATION_REQUIRED, false).await
 }
 
 pub async fn find_user_by_email(
@@ -135,11 +162,18 @@ fn password_hash_from_payload(payload: &AuthRequest) -> ApiResult<Option<String>
         return Ok(Some(hash_password_verifier(verifier, salt)?));
     }
     if let Some(password) = payload.password.as_deref() {
-        let salt = random_salt();
-        let verifier = derive_password_verifier(password, &salt);
-        return Ok(Some(hash_password_verifier(&verifier, &salt)?));
+        return Ok(Some(password_hash_from_plaintext(password)?));
     }
     Ok(None)
+}
+
+/// Server-side derivation for a plaintext password: the same PBKDF2 verifier
+/// the browser computes, with a salt minted here. `POST /admin/users` reuses it,
+/// so an admin-created account logs in through the identical path.
+pub fn password_hash_from_plaintext(password: &str) -> ApiResult<String> {
+    let salt = random_salt();
+    let verifier = derive_password_verifier(password, &salt);
+    hash_password_verifier(&verifier, &salt)
 }
 
 async fn auth_config(State(state): State<AppState>) -> ApiResult<Json<Value>> {
@@ -155,7 +189,7 @@ async fn auth_config(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         None
     };
     Ok(Json(json!({
-        "emailVerificationRequired": false,
+        "emailVerificationRequired": email_verification_required(pool).await?,
         "needsBootstrap": needs_bootstrap,
         "registrationOpen": registration_open,
         "oauthRegistrationOpen": false,
@@ -253,17 +287,7 @@ async fn register(
 }
 
 pub async fn set_registration_open(pool: &PgPool, open: bool) -> Result<(), sqlx::Error> {
-    let now = timeutil::utc_now();
-    sqlx::query(
-        "insert into app_settings (key, value, updated_at) values ($1, $2, $3)
-         on conflict (key) do update set value = excluded.value, updated_at = excluded.updated_at",
-    )
-    .bind(SETTING_REGISTRATION_OPEN)
-    .bind(if open { "true" } else { "false" })
-    .bind(&now)
-    .execute(pool)
-    .await?;
-    Ok(())
+    set_bool_setting(pool, SETTING_REGISTRATION_OPEN, open).await
 }
 
 async fn login(
