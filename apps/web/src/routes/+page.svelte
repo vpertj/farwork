@@ -10,6 +10,7 @@
 	import NewSessionPage from '../components/NewSessionPage.svelte';
 	import PlaceholderPage from '../components/PlaceholderPage.svelte';
 	import SharePage from '../components/SharePage.svelte';
+	import AdminPage from '../components/AdminPage.svelte';
 
 	function currentHash(): string {
 		return typeof window === 'undefined' ? '#/' : window.location.hash || '#/';
@@ -48,7 +49,13 @@
 </script>
 
 <svelte:head>
-	<title>{route.page === 'share' ? 'Farwork · 分享' : 'Farwork · 工作台'}</title>
+	<title>
+		{route.page === 'share'
+			? 'Farwork · 分享'
+			: route.page === 'admin'
+				? 'Farwork · 管理台'
+				: 'Farwork · 工作台'}
+	</title>
 </svelte:head>
 
 {#if route.page === 'share'}
@@ -80,6 +87,12 @@
 			/>
 		{:else if route.page === 'new-session'}
 			<NewSessionPage projectId={route.projectId} {token} />
+		{:else if route.page === 'admin'}
+			<AdminPage
+				{token}
+				currentUserId={auth.user?.userId ?? ''}
+				currentUserRole={auth.user?.role ?? 'member'}
+			/>
 		{/if}
 	</WorkspaceShell>
 {/if}

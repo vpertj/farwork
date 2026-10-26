@@ -657,3 +657,66 @@ export function parsePublicShare(value: unknown): PublicShare | null {
 	};
 }
 
+
+export type AdminRole = 'admin' | 'member';
+
+export const ADMIN_ROLES: readonly AdminRole[] = ['admin', 'member'];
+
+export function isAdminRole(value: unknown): value is AdminRole {
+	return value === 'admin' || value === 'member';
+}
+
+export type AdminUser = {
+	id: string;
+	email: string | null;
+	displayName: string;
+	role: AdminRole;
+	disabled: boolean;
+	createdAt: string;
+};
+
+export function parseAdminUser(value: unknown): AdminUser | null {
+	const raw = asRecord(value);
+	if (!raw) return null;
+	const id = asString(raw.id);
+	if (!id) return null;
+	return {
+		id,
+		email: asNullableString(raw.email),
+		displayName: asString(raw.displayName, id),
+		role: isAdminRole(raw.role) ? raw.role : 'member',
+		disabled: asBoolean(raw.disabled),
+		createdAt: asString(raw.createdAt)
+	};
+}
+
+export type AdminUserPage = {
+	users: AdminUser[];
+	nextCursor: string | null;
+};
+
+export function parseAdminUserPage(value: unknown): AdminUserPage | null {
+	const raw = asRecord(value);
+	if (!raw || !Array.isArray(raw.users)) return null;
+	const cursor = asString(raw.nextCursor).trim();
+	return {
+		users: parseList(raw, 'users', parseAdminUser),
+		nextCursor: cursor.length > 0 ? cursor : null
+	};
+}
+
+export type AdminSettings = {
+	registrationOpen: boolean;
+	emailVerificationRequired: boolean;
+};
+
+// 后端既可能把设置包在 settings 里，也可能直接平铺；两种都收，缺字段按 false 处理。
+export function parseAdminSettings(value: unknown): AdminSettings | null {
+	const raw = asRecord(asRecord(value)?.settings ?? value);
+	if (!raw) return null;
+	return {
+		registrationOpen: asBoolean(raw.registrationOpen),
+		emailVerificationRequired: asBoolean(raw.emailVerificationRequired)
+	};
+}
+

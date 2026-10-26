@@ -38,6 +38,13 @@
 	{/if}
 
 	<nav>
+		{#if auth.user?.role === 'admin'}
+			<a class="admin-link" class:active={route.page === 'admin'} href="#/admin">
+				<span class="glyph" aria-hidden="true">⚙</span>
+				<span>管理台</span>
+			</a>
+		{/if}
+
 		{#if workspace.connectors.length === 0 && !workspace.loading}
 			<div class="empty">
 				<p>暂无设备</p>
@@ -147,6 +154,30 @@
 		display: flex;
 		flex-direction: column;
 		gap: 14px;
+	}
+
+	.admin-link {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 7px 8px;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border);
+		background: oklch(1 0 0 / 3%);
+		color: var(--muted-foreground);
+		font-size: 12.5px;
+		font-weight: 500;
+	}
+
+	.admin-link:hover,
+	.admin-link.active {
+		background: var(--sidebar-accent);
+		color: var(--foreground);
+	}
+
+	.admin-link .glyph {
+		font-size: 12px;
+		color: var(--info);
 	}
 
 	.device {
