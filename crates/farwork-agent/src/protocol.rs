@@ -69,6 +69,10 @@ pub enum NoticeKind {
     CommandExecution,
     FileChange,
     Permissions,
+    /// A generic runtime interaction: a DSH approval or question is neither a
+    /// command execution nor a file change, and calling it one would be a lie the
+    /// browser then renders as a shell prompt.
+    Interaction,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -91,6 +95,62 @@ pub struct ItemEnvelope {
     pub item_time: String,
 }
 
+/// One answerable button.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoticeAction {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+}
+
+/// `notice.options` is an array of actions.
+///
+/// The v1 shape was an array of bare strings, and a hub that only understood that
+/// spelling would drop every DSH approval, whose buttons carry their own ids,
+/// labels and styles. Both spellings therefore stay legal on the wire: new agents
+/// send objects, and a string is still read as `{id: <string>, label: <id>}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum NoticeOption {
+    Action(NoticeAction),
+    /// Legacy `["approve", "reject"]`.
+    Legacy(String),
+}
+
+impl NoticeOption {
+    pub fn action(id: impl Into<String>, label: impl Into<String>, style: Option<&str>) -> Self {
+        Self::Action(NoticeAction {
+            id: id.into(),
+            label: label.into(),
+            style: style.map(str::to_string),
+        })
+    }
+
+    /// The pre-v1.4 shape: an id with no label. Kept so the agent can still speak
+    /// it (and so the hub's tolerance has something to be tolerant about).
+    pub fn plain(id: impl Into<String>) -> Self {
+        Self::Legacy(id.into())
+    }
+
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Action(action) => action.id.as_str(),
+            Self::Legacy(id) => id.as_str(),
+        }
+    }
+
+    /// The closed decision vocabulary as action objects: what codex-style
+    /// approvals have always offered, now with labels.
+    pub fn decision_options() -> Vec<Self> {
+        vec![
+            Self::action("approve", "Approve", Some("primary")),
+            Self::action("approve_for_session", "Approve for this session", None),
+            Self::action("reject", "Reject", Some("danger")),
+        ]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NoticeEnvelope {
     pub id: String,
@@ -98,7 +158,15 @@ pub struct NoticeEnvelope {
     pub status: String,
     pub title: String,
     pub body: Value,
-    pub options: Vec<String>,
+    /// `approval`, `question`, or whatever the runtime calls its interaction.
+    /// Absent for notices that are not interactions at all.
+    #[serde(
+        default,
+        rename = "interactionType",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub interaction_type: Option<String>,
+    pub options: Vec<NoticeOption>,
 }
 
 impl NoticeEnvelope {
@@ -348,11 +416,17 @@ pub enum ClientFrame {
         stream_id: String,
         notice: NoticeEnvelope,
     },
+    /// How the notice closed. `decision` is the closed vocabulary; a runtime whose
+    /// buttons are named differently reports `actionId` instead, and neither is
+    /// invented when the agent did not choose the answer (e.g. another client did).
     #[serde(rename = "notice.resolved")]
     NoticeResolved {
         #[serde(rename = "noticeId")]
         notice_id: String,
-        decision: Decision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision: Option<Decision>,
+        #[serde(default, rename = "actionId", skip_serializing_if = "Option::is_none")]
+        action_id: Option<String>,
     },
     #[serde(rename = "fs.response")]
     FsResponse(FsResponse),
@@ -464,11 +538,19 @@ pub enum ServerFrame {
         )]
         permission_mode: Option<String>,
     },
+    /// The hub's answer to a notice. `actionId` is the runtime's own button id and
+    /// wins when present; `decision` is kept for the closed vocabulary that codex
+    /// and echo speak. `input` carries a question notice's structured answer.
     #[serde(rename = "notice.respond")]
     NoticeRespond {
         #[serde(rename = "noticeId")]
         notice_id: String,
-        decision: Decision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision: Option<Decision>,
+        #[serde(default, rename = "actionId", skip_serializing_if = "Option::is_none")]
+        action_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<Value>,
     },
     #[serde(rename = "fs.request")]
     FsRequest {

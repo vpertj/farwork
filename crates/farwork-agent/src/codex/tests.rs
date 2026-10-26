@@ -79,14 +79,19 @@ fn states(outs: &[CodexOut]) -> Vec<SessionState> {
         .collect()
 }
 
-fn resolved(outs: &[CodexOut]) -> Vec<(String, Decision)> {
+fn resolved(outs: &[CodexOut]) -> Vec<(String, Option<Decision>)> {
     frames(outs)
         .into_iter()
         .filter_map(|frame| match frame {
             ClientFrame::NoticeResolved {
                 notice_id,
                 decision,
-            } => Some((notice_id, decision)),
+                action_id,
+            } => {
+                // codex never answers with a runtime action id.
+                assert!(action_id.is_none());
+                Some((notice_id, decision))
+            }
             _ => None,
         })
         .collect()
@@ -390,8 +395,18 @@ fn command_approval_becomes_a_notice_and_answers_in_codex_vocabulary() {
         "title: {}",
         raised[0].title
     );
+    // Approval buttons are objects now, with the same ids as before: the closed
+    // decision mapping and the browser's actionId path both keep working.
     assert_eq!(
         raised[0].options,
+        crate::protocol::NoticeOption::decision_options()
+    );
+    assert_eq!(
+        raised[0]
+            .options
+            .iter()
+            .map(|option| option.id().to_string())
+            .collect::<Vec<_>>(),
         vec![
             String::from("approve"),
             String::from("approve_for_session"),
@@ -413,7 +428,7 @@ fn command_approval_becomes_a_notice_and_answers_in_codex_vocabulary() {
     );
     assert_eq!(
         resolved(&outs),
-        vec![(notice_id, Decision::ApproveForSession)]
+        vec![(notice_id, Some(Decision::ApproveForSession))]
     );
     assert_eq!(states(&outs), vec![SessionState::Running]);
     assert_eq!(mapper.pending_notices(), 0);
@@ -562,7 +577,7 @@ fn interrupt_sends_turn_interrupt_and_rejects_open_notices() {
     assert_eq!(outbound[0]["method"], json!("turn/interrupt"));
     assert_eq!(outbound[0]["params"]["threadId"], json!("th_1"));
     assert_eq!(outbound[0]["params"]["turnId"], json!("tu_1"));
-    assert_eq!(resolved(&outs), vec![(notice_id, Decision::Reject)]);
+    assert_eq!(resolved(&outs), vec![(notice_id, Some(Decision::Reject))]);
 }
 
 #[test]
@@ -589,7 +604,7 @@ fn turn_completion_reports_idle_and_resolves_leftover_notices() {
         "method": "turn/completed",
         "params": {"threadId": "th_1", "turn": {"id": "tu_1", "status": "completed", "items": []}}
     }));
-    assert_eq!(resolved(&outs), vec![(notice_id, Decision::Reject)]);
+    assert_eq!(resolved(&outs), vec![(notice_id, Some(Decision::Reject))]);
     assert_eq!(states(&outs), vec![SessionState::Idle]);
 }
 
@@ -656,7 +671,7 @@ fn server_request_resolved_notification_closes_the_notice() {
         "method": "serverRequest/resolved",
         "params": {"requestId": 8, "threadId": "th_1"}
     }));
-    assert_eq!(resolved(&outs), vec![(notice_id, Decision::Reject)]);
+    assert_eq!(resolved(&outs), vec![(notice_id, Some(Decision::Reject))]);
     assert_eq!(mapper.pending_notices(), 0);
 }
 

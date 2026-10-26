@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -463,12 +463,37 @@ pub fn terminal_close_frame(terminal_id: &str) -> Value {
     json!({ "type": "terminal.close", "terminalId": terminal_id })
 }
 
-pub fn notice_respond_frame(notice_id: &str, decision: &str) -> Value {
-    json!({
-        "type": "notice.respond",
-        "noticeId": notice_id,
-        "decision": decision,
-    })
+/// `notice.respond`.
+///
+/// `actionId` is the runtime's own button id and is what a DSH approval needs;
+/// `decision` stays for the closed vocabulary codex and echo speak. Absent keys are
+/// omitted rather than serialized as null, so "this answer has no decision" stays
+/// expressible instead of looking like an empty one.
+pub fn notice_respond_frame(
+    notice_id: &str,
+    decision: Option<&str>,
+    action_id: Option<&str>,
+    input: Option<&Value>,
+) -> Value {
+    let mut frame = json!({ "type": "notice.respond", "noticeId": notice_id });
+    if let Some(map) = frame.as_object_mut() {
+        if let Some(decision) = decision {
+            map.insert(
+                String::from("decision"),
+                Value::String(decision.to_string()),
+            );
+        }
+        if let Some(action_id) = action_id {
+            map.insert(
+                String::from("actionId"),
+                Value::String(action_id.to_string()),
+            );
+        }
+        if let Some(input) = input {
+            map.insert(String::from("input"), input.clone());
+        }
+    }
+    frame
 }
 
 // ----------------------------------------------------------- inbound frames
@@ -542,13 +567,20 @@ pub enum ConnectorFrame {
         stream_id: String,
         notice: IngressNotice,
     },
+    /// How the notice closed. `decision` is the closed vocabulary; `actionId` is a
+    /// runtime's own button id. Both are optional: an agent that did not choose the
+    /// answer (another client did, or the runtime withdrew the prompt) reports
+    /// neither, and inventing one would misreport who decided what.
     #[serde(rename = "notice.resolved")]
     NoticeResolved {
         #[serde(default, rename = "streamId")]
         stream_id: Option<String>,
         #[serde(rename = "noticeId")]
         notice_id: String,
-        decision: String,
+        #[serde(default)]
+        decision: Option<String>,
+        #[serde(default, rename = "actionId")]
+        action_id: Option<String>,
     },
     #[serde(rename = "fs.response")]
     FsResponse(IngressFsResponse),
@@ -731,6 +763,77 @@ impl IngressItem {
     }
 }
 
+/// One answerable notice button.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct NoticeAction {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub style: Option<String>,
+}
+
+/// `notice.upsert.notice.options` entries.
+///
+/// v1.3 sent bare strings. A runtime such as DSH names every button with its own
+/// id, label and style, and an approval whose choices are all the string "approve"
+/// cannot carry that. Both shapes therefore stay legal: a string is read as an
+/// action whose id is that word and whose label is the product's default, which is
+/// exactly what the old card rendered.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum NoticeOption {
+    Action(NoticeAction),
+    /// Legacy `["approve", "reject"]`.
+    Legacy(String),
+}
+
+impl NoticeOption {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Action(action) => action.id.as_str(),
+            Self::Legacy(id) => id.as_str(),
+        }
+    }
+
+    /// The canonical object form stored in `session_notices.options_json` and
+    /// returned by the REST surface.
+    pub fn to_wire(&self) -> Value {
+        match self {
+            Self::Action(action) => {
+                let label = if action.label.trim().is_empty() {
+                    default_label(&action.id)
+                } else {
+                    action.label.clone()
+                };
+                let mut value = json!({ "id": action.id, "label": label });
+                if let Some(style) = &action.style {
+                    if let Some(map) = value.as_object_mut() {
+                        map.insert(String::from("style"), Value::String(style.clone()));
+                    }
+                }
+                value
+            }
+            Self::Legacy(id) => json!({ "id": id, "label": default_label(id) }),
+        }
+    }
+}
+
+/// The label a legacy string option gets when it is upgraded to an object: an id
+/// with no label renders as an empty button in the browser.
+pub fn default_label(id: &str) -> String {
+    match id {
+        "approve" | "allow" | "allow-once" => String::from("批准"),
+        "approve_for_session" | "approve-for-session" | "allow-always" => {
+            String::from("本会话内批准")
+        }
+        "reject" | "deny" => String::from("拒绝"),
+        "cancel" => String::from("取消"),
+        "submit" => String::from("提交"),
+        other => other.to_string(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct IngressNotice {
     pub id: String,
@@ -741,8 +844,31 @@ pub struct IngressNotice {
     pub title: Option<String>,
     #[serde(default)]
     pub body: Option<Value>,
+    /// `approval`, `question`, or whatever the runtime calls its interaction.
+    #[serde(default, rename = "interactionType")]
+    pub interaction_type: Option<String>,
     #[serde(default)]
-    pub options: Option<Vec<String>>,
+    pub options: Option<Vec<NoticeOption>>,
+}
+
+impl IngressNotice {
+    /// Options in canonical object form, legacy strings upgraded: the browser then
+    /// never has to know which generation of agent wrote the row.
+    pub fn options_wire(&self) -> Vec<Value> {
+        self.options
+            .iter()
+            .flatten()
+            .map(NoticeOption::to_wire)
+            .collect()
+    }
+
+    pub fn option_ids(&self) -> Vec<String> {
+        self.options
+            .iter()
+            .flatten()
+            .map(|option| option.id().to_string())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -800,10 +926,25 @@ mod tests {
         assert_eq!(frame["type"], "session.message");
         assert_eq!(frame["clientMessageId"], "cm_1");
 
-        let frame = notice_respond_frame("ntc_1", "approve");
+        let frame = notice_respond_frame("ntc_1", Some("approve"), None, None);
         assert_eq!(frame["type"], "notice.respond");
         assert_eq!(frame["noticeId"], "ntc_1");
         assert_eq!(frame["decision"], "approve");
+
+        // A runtime action answer carries the action id and no fabricated decision;
+        // a question answer carries its structured input.
+        let frame = notice_respond_frame(
+            "ntc_2",
+            None,
+            Some("allow-once"),
+            Some(&json!({ "answers": { "plan": "ship it" } })),
+        );
+        assert_eq!(frame["actionId"], "allow-once");
+        assert_eq!(frame["input"]["answers"]["plan"], "ship it");
+        assert!(
+            frame.get("decision").is_none(),
+            "an action id is not a decision: {frame}"
+        );
 
         let frame = welcome_frame("0.1.0");
         assert_eq!(frame["type"], "welcome");
@@ -1103,6 +1244,128 @@ mod tests {
         assert!(!is_valid_terminal_size(80, 0));
         assert!(!is_valid_terminal_size(MAX_TERMINAL_DIMENSION + 1, 24));
         assert!(!is_valid_terminal_size(80, MAX_TERMINAL_DIMENSION + 1));
+    }
+
+    #[test]
+    fn notice_options_parse_from_both_generations_and_normalize_to_objects() {
+        // v1.3: bare strings.
+        let legacy: IngressNotice = serde_json::from_value(json!({
+            "id": "ntc_1", "kind": "command_execution",
+            "options": ["approve", "approve_for_session", "reject"],
+        }))
+        .expect("legacy options");
+        assert_eq!(
+            legacy.option_ids(),
+            vec!["approve", "approve_for_session", "reject"]
+        );
+        assert_eq!(
+            legacy.options_wire(),
+            vec![
+                json!({ "id": "approve", "label": "批准" }),
+                json!({ "id": "approve_for_session", "label": "本会话内批准" }),
+                json!({ "id": "reject", "label": "拒绝" }),
+            ]
+        );
+
+        // v1.4: objects, with a runtime's own ids and labels.
+        let current: IngressNotice = serde_json::from_value(json!({
+            "id": "ntc_2", "kind": "interaction", "interactionType": "approval",
+            "options": [
+                { "id": "allow-once", "label": "允许一次", "style": "primary" },
+                { "id": "reject", "label": "拒绝", "style": "secondary" },
+            ],
+        }))
+        .expect("object options");
+        assert_eq!(current.interaction_type.as_deref(), Some("approval"));
+        assert_eq!(current.option_ids(), vec!["allow-once", "reject"]);
+        assert_eq!(
+            current.options_wire(),
+            vec![
+                json!({ "id": "allow-once", "label": "允许一次", "style": "primary" }),
+                json!({ "id": "reject", "label": "拒绝", "style": "secondary" }),
+            ]
+        );
+
+        // A mixed array parses: one old string, one object.
+        let mixed: IngressNotice = serde_json::from_value(json!({
+            "id": "ntc_3", "kind": "interaction",
+            "options": ["approve", { "id": "deny", "label": "不许" }],
+        }))
+        .expect("mixed options");
+        assert_eq!(
+            mixed.options_wire(),
+            vec![
+                json!({ "id": "approve", "label": "批准" }),
+                json!({ "id": "deny", "label": "不许" }),
+            ]
+        );
+
+        // An object without a label still yields a usable button.
+        let unlabeled: IngressNotice = serde_json::from_value(json!({
+            "id": "ntc_4", "kind": "interaction", "options": [{ "id": "allow-once" }],
+        }))
+        .expect("unlabeled option");
+        assert_eq!(
+            unlabeled.options_wire(),
+            vec![json!({ "id": "allow-once", "label": "批准" })]
+        );
+
+        // Absent options stay absent, not invented.
+        let none: IngressNotice =
+            serde_json::from_value(json!({"id": "n", "kind": "file_change"})).expect("no options");
+        assert!(none.options_wire().is_empty());
+        assert!(none.option_ids().is_empty());
+    }
+
+    #[test]
+    fn notice_resolved_accepts_a_decision_or_a_runtime_action_or_neither() {
+        match serde_json::from_value::<ConnectorFrame>(json!({
+            "type": "notice.resolved", "noticeId": "ntc_1", "decision": "reject",
+        }))
+        .expect("decision form")
+        {
+            ConnectorFrame::NoticeResolved {
+                decision,
+                action_id,
+                ..
+            } => {
+                assert_eq!(decision.as_deref(), Some("reject"));
+                assert_eq!(action_id, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        match serde_json::from_value::<ConnectorFrame>(json!({
+            "type": "notice.resolved", "noticeId": "ntc_1", "actionId": "allow-once",
+        }))
+        .expect("action form")
+        {
+            ConnectorFrame::NoticeResolved {
+                decision,
+                action_id,
+                ..
+            } => {
+                assert_eq!(decision, None);
+                assert_eq!(action_id.as_deref(), Some("allow-once"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // A notice closed by somebody else carries no answer at all, and that has
+        // to parse: it is the honest shape.
+        match serde_json::from_value::<ConnectorFrame>(json!({
+            "type": "notice.resolved", "noticeId": "ntc_1",
+        }))
+        .expect("bare form")
+        {
+            ConnectorFrame::NoticeResolved {
+                decision,
+                action_id,
+                ..
+            } => {
+                assert_eq!(decision, None);
+                assert_eq!(action_id, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]

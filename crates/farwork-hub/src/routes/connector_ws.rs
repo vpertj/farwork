@@ -488,21 +488,34 @@ async fn apply_frame(
             stream_id: _,
             notice_id,
             decision,
+            action_id,
         } => {
-            if !ingress::is_known_decision(&decision) {
-                return Err(format!(
-                    "unknown decision {decision:?}; expected one of {:?}",
-                    ingress::DECISIONS
-                ));
+            // A resolution may name a decision, a runtime action id, or neither
+            // (the runtime closed the prompt itself). Only the decision form is a
+            // closed set.
+            if let Some(decision) = decision.as_deref() {
+                if !ingress::is_known_decision(decision) {
+                    return Err(format!(
+                        "unknown decision {decision:?}; expected one of {:?}",
+                        ingress::DECISIONS
+                    ));
+                }
             }
             // The contract's \`notice.resolved\` carries no streamId, so the notice id
             // is resolved against the sessions this connector owns.
-            let resolved =
-                crate::routes::notices::resolve_notice(state, &connector.id, &notice_id, &decision)
-                    .await
-                    .map_err(err)?;
+            let resolved = crate::routes::notices::resolve_notice(
+                state,
+                &connector.id,
+                &notice_id,
+                decision.as_deref(),
+                action_id.as_deref(),
+            )
+            .await
+            .map_err(err)?;
             let Some((session_id, notice)) = resolved else {
-                return Err(format!("unknown notice {notice_id:?} for this connector"));
+                return Err(format!(
+                    "unknown or already resolved notice {notice_id:?} for this connector"
+                ));
             };
             crate::routes::notices::publish_notice_updated(
                 state,

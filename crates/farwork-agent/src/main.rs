@@ -4,7 +4,8 @@
 use std::process::ExitCode;
 
 use anyhow::{anyhow, Result};
-use farwork_agent::cli;
+use farwork_agent::cli::{self, RuntimeKind};
+use farwork_agent::dsh;
 use farwork_agent::hub::{Connector, HubOptions};
 use farwork_agent::identity;
 use farwork_agent::protocol::AgentInfo;
@@ -64,12 +65,25 @@ async fn run() -> Result<()> {
         ));
     }
 
+    // The DSH bridge is located once, at startup. Starting as `--runtime dsh`
+    // without one is a configuration error the operator must see before the
+    // connector goes online: a session would otherwise be accepted and have
+    // nothing to drive.
+    let dsh_endpoint = match cli.runtime {
+        RuntimeKind::Dsh => Some(
+            dsh::discovery::resolve(cli.dsh_endpoint.as_deref(), &env_lookup)
+                .map_err(|error| anyhow!("{error}"))?,
+        ),
+        _ => None,
+    };
+
     tracing::info!(
         agent_id = %identity.agent_id,
         identity_file = %identity_path.display(),
         hub = %cli.hub,
         runtime = cli.runtime.as_str(),
         workdir = %workdir.display(),
+        dsh_endpoint = ?dsh_endpoint.as_ref().map(|endpoint| endpoint.address()),
         "configured"
     );
 
@@ -85,6 +99,7 @@ async fn run() -> Result<()> {
         workdir,
         codex_bin: cli.codex_bin,
         shell: cli.shell,
+        dsh_endpoint,
         once: cli.once,
     };
     Connector::new(options, identity).run().await

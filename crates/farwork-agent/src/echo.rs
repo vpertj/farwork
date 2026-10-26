@@ -15,7 +15,7 @@ use crate::codex::session::{ExitReport, SessionCmd};
 use crate::ids;
 use crate::protocol::{
     CapabilityFlags, CatalogItem, CatalogSet, ClientFrame, CommandEntry, Decision, ItemEnvelope,
-    ItemStatus, ItemType, NoticeEnvelope, NoticeKind, Role, SessionState,
+    ItemStatus, ItemType, NoticeEnvelope, NoticeKind, NoticeOption, Role, SessionState,
 };
 use crate::timeutil;
 
@@ -121,11 +121,8 @@ impl EchoSession {
                     "sample": true,
                     "reason": "echo never executes anything; this notice only exercises the round trip",
                 }),
-                options: vec![
-                    String::from("approve"),
-                    String::from("approve_for_session"),
-                    String::from("reject"),
-                ],
+                interaction_type: Some(String::from("approval")),
+                options: NoticeOption::decision_options(),
             },
         });
         self.state(SessionState::WaitingApproval);
@@ -136,14 +133,16 @@ impl EchoSession {
                 Ok(None) => {
                     self.send(ClientFrame::NoticeResolved {
                         notice_id,
-                        decision: Decision::Reject,
+                        decision: Some(Decision::Reject),
+                        action_id: None,
                     });
                     return self.exit(1, "hub command channel closed");
                 }
                 Err(_) => {
                     self.send(ClientFrame::NoticeResolved {
                         notice_id,
-                        decision: Decision::Reject,
+                        decision: Some(Decision::Reject),
+                        action_id: None,
                     });
                     self.send(ClientFrame::Error {
                         message: String::from("echo runtime: no decision before the timeout"),
@@ -156,10 +155,25 @@ impl EchoSession {
                 SessionCmd::NoticeDecision {
                     notice_id: answered,
                     decision,
+                    action_id,
+                    input: _,
                 } if answered == notice_id => {
+                    // echo only speaks the closed decision vocabulary: an answer
+                    // that names some other action is reported, not guessed at.
+                    let Some(decision) = decision else {
+                        self.send(ClientFrame::Error {
+                            message: format!(
+                                "echo runtime: no decision for action {:?}",
+                                action_id.unwrap_or_default()
+                            ),
+                            stream_id: Some(self.stream_id.clone()),
+                        });
+                        continue;
+                    };
                     self.send(ClientFrame::NoticeResolved {
                         notice_id,
-                        decision,
+                        decision: Some(decision),
+                        action_id: None,
                     });
                     self.message(format!("echo: decision recorded as {decision:?}"));
                     self.state(SessionState::Idle);
@@ -168,7 +182,8 @@ impl EchoSession {
                 SessionCmd::Interrupt => {
                     self.send(ClientFrame::NoticeResolved {
                         notice_id,
-                        decision: Decision::Reject,
+                        decision: Some(Decision::Reject),
+                        action_id: None,
                     });
                     self.state(SessionState::Idle);
                     return self.exit(130, "interrupted");
@@ -341,7 +356,9 @@ mod tests {
         cmd_tx
             .send(SessionCmd::NoticeDecision {
                 notice_id: notice_id.clone(),
-                decision: Decision::Approve,
+                decision: Some(Decision::Approve),
+                action_id: None,
+                input: None,
             })
             .unwrap();
         let closing = next_frames(&mut out_rx, 4).await;
@@ -471,7 +488,11 @@ mod tests {
         let closing = next_frames(&mut out_rx, 3).await;
         assert!(matches!(
             &closing[0],
-            ClientFrame::NoticeResolved { notice_id: id, decision: Decision::Reject } if id == &notice_id
+            ClientFrame::NoticeResolved {
+                notice_id: id,
+                decision: Some(Decision::Reject),
+                action_id: None,
+            } if id == &notice_id
         ));
         assert!(matches!(
             closing[2],

@@ -45,6 +45,7 @@ pub struct NoticeRow {
     pub body_json: String,
     pub options_json: String,
     pub decision: Option<String>,
+    pub interaction_type: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -60,11 +61,27 @@ impl NoticeRow {
             "status": self.status,
             "title": self.title,
             "body": parse_json(&self.body_json, Value::Null),
-            "options": parse_options(&self.options_json),
+            // Passthrough, not a re-typing: rows written before the object form
+            // still hold strings, and the browser reads both.
+            "options": parse_json(&self.options_json, json!([])),
+            "interactionType": self.interaction_type,
             "decision": self.decision,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         })
+    }
+
+    /// The action ids this notice offered. Legacy string rows parse as the old
+    /// shape, so an answer can be checked against either generation.
+    pub fn option_ids(&self) -> Vec<String> {
+        serde_json::from_str::<Vec<ingress::NoticeOption>>(&self.options_json)
+            .map(|options| {
+                options
+                    .into_iter()
+                    .map(|option| option.id().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -72,12 +89,8 @@ fn parse_json(raw: &str, fallback: Value) -> Value {
     serde_json::from_str(raw).unwrap_or(fallback)
 }
 
-fn parse_options(raw: &str) -> Vec<String> {
-    serde_json::from_str(raw).unwrap_or_default()
-}
-
 const NOTICE_COLUMNS: &str = "id, kind, status, title, body_json, options_json, decision,
-     created_at, updated_at";
+     interaction_type, created_at, updated_at";
 
 pub async fn fetch_notices(pool: &PgPool, session_id: &str) -> ApiResult<Vec<NoticeRow>> {
     Ok(sqlx::query_as::<_, NoticeRow>(&format!(
@@ -125,19 +138,27 @@ pub async fn store_notice(
     let title = notice.title.as_deref().unwrap_or_default();
     let body = serde_json::to_string(&notice.body.clone().unwrap_or(Value::Null))
         .map_err(|error| ApiError::internal(error.to_string()))?;
-    let options = serde_json::to_string(&notice.options.clone().unwrap_or_default())
+    // Stored in canonical object form: a legacy string option is upgraded here, so
+    // the browser sees one shape regardless of which agent generation wrote it.
+    let options = serde_json::to_string(&notice.options_wire())
         .map_err(|error| ApiError::internal(error.to_string()))?;
+    let interaction_type = notice
+        .interaction_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     sqlx::query(
         "insert into session_notices
             (session_id, id, kind, status, title, body_json, options_json, decision,
-             created_at, updated_at)
-         values ($1, $2, $3, $4, $5, $6, $7, null, $8, $8)
+             interaction_type, created_at, updated_at)
+         values ($1, $2, $3, $4, $5, $6, $7, null, $8, $9, $9)
          on conflict (session_id, id) do update
             set kind = excluded.kind,
                 status = excluded.status,
                 title = excluded.title,
                 body_json = excluded.body_json,
                 options_json = excluded.options_json,
+                interaction_type = excluded.interaction_type,
                 updated_at = excluded.updated_at",
     )
     .bind(session_id)
@@ -147,6 +168,7 @@ pub async fn store_notice(
     .bind(title)
     .bind(&body)
     .bind(&options)
+    .bind(interaction_type)
     .bind(&now)
     .execute(state.pool())
     .await?;
@@ -161,26 +183,72 @@ pub async fn resolve_notice(
     state: &AppState,
     connector_id: &str,
     notice_id: &str,
-    decision: &str,
+    decision: Option<&str>,
+    action_id: Option<&str>,
 ) -> ApiResult<Option<(String, NoticeRow)>> {
     use sqlx::Row as _;
+    // The row is read before the write: it holds the actions this notice actually
+    // offered, which is what an actionId has to be checked against.
     let row = sqlx::query(
-        "update session_notices
-            set status = 'resolved', decision = $3, updated_at = $4
-          where id = $2
-            and session_id in (select id from sessions where connector_id = $1)
-      returning session_id",
+        "select n.session_id from session_notices n
+           join sessions s on s.id = n.session_id
+          where n.id = $2 and s.connector_id = $1",
     )
     .bind(connector_id)
     .bind(notice_id)
-    .bind(decision)
-    .bind(timeutil::utc_now())
     .fetch_optional(state.pool())
     .await?;
     let Some(row) = row else {
         return Ok(None);
     };
     let session_id: String = row.get("session_id");
+    let notice = fetch_notice(state.pool(), &session_id, notice_id)
+        .await?
+        .ok_or_else(|| ApiError::internal("notice vanished before resolve"))?;
+
+    let recorded: Option<String> = match (decision, action_id) {
+        (Some(decision), _) => {
+            if !ingress::is_known_decision(decision) {
+                return Err(ApiError::unprocessable(format!(
+                    "decision must be one of {:?}",
+                    ingress::DECISIONS
+                )));
+            }
+            Some(decision.to_string())
+        }
+        (None, Some(action_id)) => {
+            if !notice.option_ids().iter().any(|id| id == action_id) {
+                return Err(ApiError::unprocessable(json!({
+                    "code": "unknown_action",
+                    "message": format!(
+                        "actionId {action_id:?} is not offered by this notice; expected one of {:?}",
+                        notice.option_ids()
+                    ),
+                })));
+            }
+            Some(action_id.to_string())
+        }
+        // Closed by the runtime or by another client: recorded as closed with no
+        // answer, rather than inventing someone else's decision.
+        (None, None) => None,
+    };
+
+    let updated = sqlx::query(
+        "update session_notices
+            set status = 'resolved', decision = $3, updated_at = $4
+          where id = $2 and session_id = $1 and status = 'open'
+      returning session_id",
+    )
+    .bind(&session_id)
+    .bind(notice_id)
+    .bind(recorded.as_deref())
+    .bind(timeutil::utc_now())
+    .fetch_optional(state.pool())
+    .await?;
+    if updated.is_none() {
+        // Already resolved: never overwrite a real answer with a later one.
+        return Ok(None);
+    }
     let notice = fetch_notice(state.pool(), &session_id, notice_id)
         .await?
         .ok_or_else(|| ApiError::internal("notice vanished after resolve"))?;
@@ -272,8 +340,18 @@ async fn list_notices(
 
 #[derive(Debug, Deserialize)]
 pub struct NoticeRespondRequest {
+    /// The closed vocabulary (`approve` / `approve_for_session` / `reject`).
     #[serde(default)]
-    pub decision: String,
+    pub decision: Option<String>,
+    /// The runtime's own button id, which is how a DSH approval is answered.
+    #[serde(default, rename = "actionId")]
+    pub action_id: Option<String>,
+    /// A question notice's structured answer; relayed verbatim as `inputData`.
+    /// `inputData` is the field the browser sends, `input` is the agent-side
+    /// spelling of the same value: both are accepted so neither side has to be
+    /// renamed for the other.
+    #[serde(default, alias = "inputData")]
+    pub input: Option<Value>,
 }
 
 async fn respond_notice(
@@ -294,13 +372,48 @@ async fn respond_notice(
             "session is read-only until takeover is enabled",
         ));
     }
-    let decision = payload.decision.trim();
-    if !ingress::is_known_decision(decision) {
-        return Err(ApiError::unprocessable(format!(
-            "decision must be one of {:?}",
-            ingress::DECISIONS
-        )));
-    }
+    let decision = payload
+        .decision
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let action_id = payload
+        .action_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    // The browser sends `actionId` and mirrors it into `decision` (so a hub that
+    // only knows the old vocabulary still understands the answer). Agreement is
+    // therefore the normal case, and only a *disagreement* is ambiguous. A pair
+    // whose value is not a known decision is an action, not an error.
+    let (decision, action_id) = match (decision, action_id) {
+        (None, None) => {
+            return Err(ApiError::unprocessable(json!({
+                "code": "empty_answer",
+                "message": "decision or actionId is required",
+            })))
+        }
+        (Some(decision), Some(action_id)) if decision != action_id => {
+            return Err(ApiError::unprocessable(json!({
+                "code": "ambiguous_answer",
+                "message": format!(
+                    "decision {decision:?} and actionId {action_id:?} disagree; send one answer"
+                ),
+            })))
+        }
+        (Some(value), Some(_)) if ingress::is_known_decision(value) => (Some(value), None),
+        (Some(value), Some(_)) => (None, Some(value)),
+        (Some(decision), None) => {
+            if !ingress::is_known_decision(decision) {
+                return Err(ApiError::unprocessable(format!(
+                    "decision must be one of {:?}",
+                    ingress::DECISIONS
+                )));
+            }
+            (Some(decision), None)
+        }
+        (None, Some(action_id)) => (None, Some(action_id)),
+    };
 
     let notice = fetch_notice(state.pool(), &session_id, &notice_id)
         .await?
@@ -317,7 +430,23 @@ async fn respond_notice(
         })));
     }
 
-    let frame = ingress::notice_respond_frame(&notice.id, decision);
+    // An actionId has to be one this notice actually offered: a stale browser tab
+    // must not smuggle in a button the runtime never published, and a typo has to
+    // be a 422 rather than silently dropping the agent's prompt.
+    if let Some(action_id) = action_id {
+        let offered = notice.option_ids();
+        if !offered.iter().any(|id| id == action_id) {
+            return Err(ApiError::unprocessable(json!({
+                "code": "unknown_action",
+                "message": format!(
+                    "actionId {action_id:?} is not offered by this notice; expected one of {offered:?}"
+                ),
+            })));
+        }
+    }
+
+    let frame =
+        ingress::notice_respond_frame(&notice.id, decision, action_id, payload.input.as_ref());
     let delivered = state
         .connectors()
         .get(&session.connector_id)

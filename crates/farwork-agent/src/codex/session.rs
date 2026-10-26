@@ -30,9 +30,14 @@ pub enum SessionCmd {
         model: Option<String>,
         permission_mode: Option<String>,
     },
+    /// `notice.respond`. `decision` is the closed vocabulary codex speaks;
+    /// `action_id` is a runtime's own button id (DSH), and `input` is a question
+    /// notice's structured answer. At most one of decision/action_id is set.
     NoticeDecision {
         notice_id: String,
-        decision: Decision,
+        decision: Option<Decision>,
+        action_id: Option<String>,
+        input: Option<serde_json::Value>,
     },
 }
 
@@ -137,9 +142,31 @@ impl CodexSession {
                                 stream_id: Some(self.mapper.stream_id().to_string()),
                             })]
                         }
-                        SessionCmd::NoticeDecision { notice_id, decision } => {
-                            self.mapper.on_notice_decision(&notice_id, decision)
-                        }
+                        SessionCmd::NoticeDecision {
+                            notice_id,
+                            decision,
+                            action_id,
+                            input,
+                        } => match decision {
+                            Some(decision) => self.mapper.on_notice_decision(&notice_id, decision),
+                            None => {
+                                // This runtime answers with approve/approve_for_session/
+                                // reject only; inventing a decision for some other
+                                // action id would report a choice nobody made.
+                                tracing::warn!(
+                                    %notice_id,
+                                    action = action_id.as_deref().unwrap_or("-"),
+                                    has_input = input.is_some(),
+                                    "codex app-server cannot apply this notice action"
+                                );
+                                vec![CodexOut::Hub(ClientFrame::Error {
+                                    message: String::from(
+                                        "this runtime answers an approval with approve, approve_for_session or reject only; the action was not applied",
+                                    ),
+                                    stream_id: Some(self.mapper.stream_id().to_string()),
+                                })]
+                            }
+                        },
                     };
                     if let Some(report) = self.dispatch(&mut outs).await {
                         return report;

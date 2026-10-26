@@ -13,6 +13,7 @@
 pub mod backoff;
 pub mod cli;
 pub mod codex;
+pub mod dsh;
 pub mod echo;
 pub mod fsops;
 pub mod hub;

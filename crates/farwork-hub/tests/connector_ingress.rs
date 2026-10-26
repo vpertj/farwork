@@ -604,7 +604,11 @@ async fn connector_ingress_end_to_end() {
     assert_eq!(list[0]["status"], "open");
     assert_eq!(list[0]["title"], "Run cargo test?");
     assert_eq!(list[0]["body"]["command"], "cargo test");
-    assert_eq!(list[0]["options"][0], "approve");
+    // Legacy string options are upgraded on ingest, so the browser always reads
+    // objects. The id is unchanged; the label is the product default.
+    assert_eq!(list[0]["options"][0]["id"], "approve");
+    assert_eq!(list[0]["options"][0]["label"], "批准");
+    assert_eq!(list[0]["options"][2]["id"], "reject");
     assert!(list[0]["createdAt"].as_str().is_some());
 
     // An invalid decision is refused, and an unknown notice is a conflict.
@@ -710,6 +714,128 @@ async fn connector_ingress_end_to_end() {
     assert_eq!(status, StatusCode::CONFLICT, "resolved notice: {late}");
     assert_eq!(late["detail"]["code"], "notice_already_resolved");
 
+    // --- a runtime interaction: object options answered by action id -------
+    connector
+        .send(json!({
+            "type": "notice.upsert",
+            "streamId": stream_id,
+            "notice": {
+                "id": "ntc_2",
+                "kind": "interaction",
+                "status": "open",
+                "title": "请求批准：shell",
+                "interactionType": "approval",
+                "body": { "toolName": "shell" },
+                "options": [
+                    { "id": "allow-once", "label": "允许一次", "style": "primary" },
+                    { "id": "reject", "label": "拒绝", "style": "secondary" },
+                ],
+            },
+        }))
+        .await;
+    let _ = browser.expect_type("runtime.notice.updated").await;
+
+    let (status, list) = call(
+        &app,
+        Method::GET,
+        &format!("/api/v2/sessions/{session_id}/runtime/notices"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "notices: {list}");
+    let notice = list["notices"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|notice| notice["id"] == "ntc_2")
+        .expect("ntc_2");
+    assert_eq!(notice["interactionType"], "approval");
+    assert_eq!(notice["kind"], "interaction");
+    assert_eq!(notice["options"][0]["id"], "allow-once");
+    assert_eq!(notice["options"][0]["label"], "允许一次");
+    assert_eq!(notice["options"][0]["style"], "primary");
+
+    // An action the notice never offered is refused, not silently accepted.
+    let (status, wrong_action) = call(
+        &app,
+        Method::POST,
+        &format!("/api/v2/sessions/{session_id}/notices/ntc_2/respond"),
+        Some(&token),
+        Some(json!({ "actionId": "allow-always" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unknown action: {wrong_action}"
+    );
+    assert_eq!(wrong_action["detail"]["code"], "unknown_action");
+
+    // Neither a decision nor an action is not an answer.
+    let (status, empty) = call(
+        &app,
+        Method::POST,
+        &format!("/api/v2/sessions/{session_id}/notices/ntc_2/respond"),
+        Some(&token),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "empty: {empty}");
+    assert_eq!(empty["detail"]["code"], "empty_answer");
+
+    // Two answers that disagree are ambiguous, not "the last one wins".
+    let (status, disagree) = call(
+        &app,
+        Method::POST,
+        &format!("/api/v2/sessions/{session_id}/notices/ntc_2/respond"),
+        Some(&token),
+        Some(json!({ "actionId": "allow-once", "decision": "reject" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "disagreeing answers: {disagree}"
+    );
+    assert_eq!(disagree["detail"]["code"], "ambiguous_answer");
+
+    // What the web client actually sends: the action id mirrored into decision so
+    // an older hub still understands it.
+    let (status, responded) = call(
+        &app,
+        Method::POST,
+        &format!("/api/v2/sessions/{session_id}/notices/ntc_2/respond"),
+        Some(&token),
+        // `inputData` is the browser's field name for a question answer; it has to
+        // survive the hop, so this call carries one even though an approval ignores
+        // it.
+        Some(json!({ "actionId": "allow-once", "decision": "allow-once",
+            "inputData": { "answers": { "plan": "ship it" } } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "respond: {responded}");
+    let respond_frame = connector.expect_type("notice.respond").await;
+    assert_eq!(respond_frame["noticeId"], "ntc_2");
+    assert_eq!(respond_frame["actionId"], "allow-once");
+    assert!(
+        respond_frame.get("decision").is_none(),
+        "an action-id answer must not carry a fabricated decision: {respond_frame}"
+    );
+    assert_eq!(respond_frame["input"]["answers"]["plan"], "ship it");
+
+    connector
+        .send(json!({
+            "type": "notice.resolved",
+            "noticeId": "ntc_2",
+            "actionId": "allow-once",
+        }))
+        .await;
+    let resolved = browser.expect_type("runtime.notice.updated").await;
+    assert_eq!(resolved["payload"]["notice"]["status"], "resolved");
+    assert_eq!(resolved["payload"]["notice"]["decision"], "allow-once");
+    let _ = browser.expect_type("runtime.notice.snapshot").await;
+
     // --- interrupt --------------------------------------------------------
     let (status, interrupted) = call(
         &app,
@@ -739,8 +865,18 @@ async fn connector_ingress_end_to_end() {
         items.iter().any(|item| item["id"] == "itm_agent_1"),
         "snapshot is missing the connector item: {snapshot}"
     );
-    assert_eq!(snapshot["notices"].as_array().expect("notices").len(), 1);
-    assert_eq!(snapshot["notices"][0]["status"], "resolved");
+    let snapshot_notices = snapshot["notices"].as_array().expect("notices");
+    assert_eq!(
+        snapshot_notices.len(),
+        2,
+        "both notices survive: {snapshot}"
+    );
+    assert!(snapshot_notices
+        .iter()
+        .all(|notice| notice["status"] == "resolved"));
+    assert!(snapshot_notices
+        .iter()
+        .any(|notice| notice["id"] == "ntc_2" && notice["interactionType"] == "approval"));
     assert_eq!(snapshot["state"]["status"], "running");
 
     // --- session.exit closes the stream ----------------------------------

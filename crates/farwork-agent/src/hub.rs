@@ -23,6 +23,7 @@ use crate::backoff::Backoff;
 use crate::cli::{connector_ws_url, RuntimeKind};
 use crate::codex::mapper::{MapperConfig, SessionSeed};
 use crate::codex::{CodexSession, SessionCmd, StdioTransport};
+use crate::dsh::{self, DshOptions, DshSession};
 use crate::echo::EchoSession;
 use crate::fsops::{self, Sandbox};
 use crate::identity::AgentIdentity;
@@ -46,6 +47,9 @@ pub struct HubOptions {
     pub codex_bin: String,
     /// `--shell`, the default shell for `terminal.open`.
     pub shell: Option<String>,
+    /// The DSH bridge, resolved once at startup. `None` means every `runtime: "dsh"`
+    /// session is refused with an explicit error instead of hanging.
+    pub dsh_endpoint: Option<crate::dsh::Endpoint>,
     pub once: bool,
 }
 
@@ -331,6 +335,14 @@ impl Connector {
                             tracing::info!(code = report.code, reason = %report.reason, "echo session finished");
                         })
                     }
+                    RuntimeKind::Dsh => self.spawn_dsh(
+                        stream_id.clone(),
+                        session_id,
+                        cwd,
+                        prompt,
+                        out.clone(),
+                        cmd_rx,
+                    ),
                 };
                 sessions.insert(stream_id, Worker { cmd: cmd_tx, task });
             }
@@ -392,6 +404,8 @@ impl Connector {
             ServerFrame::NoticeRespond {
                 notice_id,
                 decision,
+                action_id,
+                input,
             } => {
                 // notice.respond carries no streamId: find the worker holding it.
                 let mut delivered = false;
@@ -401,6 +415,8 @@ impl Connector {
                         .send(SessionCmd::NoticeDecision {
                             notice_id: notice_id.clone(),
                             decision,
+                            action_id: action_id.clone(),
+                            input: input.clone(),
                         })
                         .is_ok()
                     {
@@ -574,6 +590,52 @@ impl Connector {
             );
         })
     }
+
+    fn spawn_dsh(
+        &self,
+        stream_id: String,
+        session_id: String,
+        cwd: String,
+        prompt: String,
+        out: UnboundedSender<ClientFrame>,
+        cmd_rx: tokio::sync::mpsc::UnboundedReceiver<SessionCmd>,
+    ) -> JoinHandle<()> {
+        let endpoint = self.opts.dsh_endpoint.clone();
+        let connector_id = self.identity.agent_id.clone();
+        let client_version = self.opts.agent.version.clone();
+        tokio::spawn(async move {
+            let Some(endpoint) = endpoint else {
+                // Refused, not faked: without an endpoint there is no DSH to drive.
+                tracing::error!(%stream_id, "runtime dsh requested but this agent has no bridge endpoint");
+                let _ = out.send(ClientFrame::Error {
+                    message: String::from(
+                        "this agent was started without a DSH bridge endpoint; runtime \"dsh\" sessions cannot run here",
+                    ),
+                    stream_id: Some(stream_id.clone()),
+                });
+                let _ = out.send(ClientFrame::SessionExit { stream_id, code: 3 });
+                return;
+            };
+            let options = DshOptions {
+                endpoint,
+                session_namespace: dsh::session_namespace(&connector_id),
+                connector_id,
+                stream_id: stream_id.clone(),
+                hub_session_id: session_id,
+                cwd,
+                prompt,
+                client_version,
+            };
+            let session = DshSession::new(options, out, cmd_rx);
+            let report = session.run().await;
+            tracing::info!(
+                %stream_id,
+                code = report.code,
+                reason = %report.reason,
+                "dsh session finished"
+            );
+        })
+    }
 }
 
 /// Tokens are credentials: never log the query string verbatim.
@@ -610,6 +672,7 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             codex_bin: String::from("codex"),
             shell: None,
+            dsh_endpoint: None,
             once: true,
         }
     }
@@ -1113,9 +1176,13 @@ mod tests {
             ParsedServerFrame::Frame(ServerFrame::NoticeRespond {
                 notice_id,
                 decision,
+                action_id,
+                input,
             }) => {
                 assert_eq!(notice_id, "ntc_1");
-                assert_eq!(decision, Decision::ApproveForSession);
+                assert_eq!(decision, Some(Decision::ApproveForSession));
+                assert_eq!(action_id, None);
+                assert_eq!(input, None);
             }
             other => panic!("unexpected: {other:?}"),
         }

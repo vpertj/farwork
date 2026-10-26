@@ -13,6 +13,9 @@ pub const DEFAULT_CODEX_BIN: &str = "codex";
 pub enum RuntimeKind {
     Codex,
     Echo,
+    /// The DeepSeek Harness bridge: a loopback JSON-RPC endpoint this agent
+    /// attaches to instead of spawning a child process.
+    Dsh,
 }
 
 impl RuntimeKind {
@@ -20,6 +23,7 @@ impl RuntimeKind {
         match self {
             Self::Codex => "codex",
             Self::Echo => "echo",
+            Self::Dsh => "dsh",
         }
     }
 
@@ -27,6 +31,7 @@ impl RuntimeKind {
         match value {
             "codex" => Some(Self::Codex),
             "echo" => Some(Self::Echo),
+            "dsh" => Some(Self::Dsh),
             _ => None,
         }
     }
@@ -41,6 +46,9 @@ pub struct Cli {
     pub runtime: RuntimeKind,
     pub once: bool,
     pub codex_bin: String,
+    /// `--dsh-endpoint`: an explicit bridge endpoint file, instead of the one the
+    /// bridge publishes.
+    pub dsh_endpoint: Option<PathBuf>,
     /// Shell override for device terminals, instead of $SHELL.
     pub shell: Option<String>,
     pub show_help: bool,
@@ -57,6 +65,7 @@ impl Default for Cli {
             runtime: RuntimeKind::Codex,
             once: false,
             codex_bin: String::from(DEFAULT_CODEX_BIN),
+            dsh_endpoint: None,
             shell: None,
             show_help: false,
             show_version: false,
@@ -70,7 +79,7 @@ pub enum CliError {
     UnknownArgument(String),
     #[error("missing value for {0}")]
     MissingValue(String),
-    #[error("unknown runtime {0:?} (expected codex or echo)")]
+    #[error("unknown runtime {0:?} (expected codex, echo or dsh)")]
     UnknownRuntime(String),
     #[error("{0} is set but empty")]
     EmptyEnv(&'static str),
@@ -88,7 +97,8 @@ OPTIONS:
                          (or env FARWORK_CONNECTOR_TOKEN)
     --name <name>        Device display name (default: host name)
     --workdir <path>     Default working directory for sessions
-    --runtime <kind>     codex | echo (default: codex)
+    --runtime <kind>     codex | echo | dsh (default: codex)
+    --dsh-endpoint <p>   DSH bridge endpoint.json (default: the published one)
     --shell <path>       Shell for device terminals (default: $SHELL)
     --once               Connect once, then exit instead of reconnecting
     -h, --help           Print this help
@@ -121,6 +131,7 @@ pub fn parse(
                 cli.runtime = RuntimeKind::parse(&raw).ok_or(CliError::UnknownRuntime(raw))?;
             }
             "--codex-bin" => codex_bin = Some(value("--codex-bin")?),
+            "--dsh-endpoint" => cli.dsh_endpoint = Some(PathBuf::from(value("--dsh-endpoint")?)),
             "--shell" => cli.shell = Some(value("--shell")?),
             "--once" => cli.once = true,
             "-h" | "--help" => cli.show_help = true,
@@ -300,6 +311,23 @@ mod tests {
         assert_eq!(
             parse(args(&["--hub"]), &no_env),
             Err(CliError::MissingValue(String::from("--hub")))
+        );
+    }
+
+    #[test]
+    fn the_dsh_runtime_and_its_endpoint_flag_are_recognised() {
+        let cli = parse(
+            args(&["--runtime", "dsh", "--dsh-endpoint", "/tmp/endpoint.json"]),
+            &no_env,
+        )
+        .unwrap();
+        assert_eq!(cli.runtime, RuntimeKind::Dsh);
+        assert_eq!(cli.runtime.as_str(), "dsh");
+        assert_eq!(cli.dsh_endpoint, Some(PathBuf::from("/tmp/endpoint.json")));
+        // codex stays the default: dsh is opt-in.
+        assert_eq!(
+            parse(Vec::new(), &no_env).unwrap().runtime,
+            RuntimeKind::Codex
         );
     }
 

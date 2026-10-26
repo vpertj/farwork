@@ -24,8 +24,8 @@ use serde_json::{json, Value};
 
 use crate::ids;
 use crate::protocol::{
-    ClientFrame, Decision, ItemEnvelope, ItemStatus, ItemType, NoticeEnvelope, NoticeKind, Role,
-    SessionState,
+    ClientFrame, Decision, ItemEnvelope, ItemStatus, ItemType, NoticeEnvelope, NoticeKind,
+    NoticeOption, Role, SessionState,
 };
 use crate::rpc::{self, RpcId, RpcMessage};
 use crate::timeutil;
@@ -265,7 +265,8 @@ impl CodexMapper {
         )));
         outs.push(CodexOut::Hub(ClientFrame::NoticeResolved {
             notice_id: notice_id.to_owned(),
-            decision,
+            decision: Some(decision),
+            action_id: None,
         }));
         if let Some(frame) = self.set_state(SessionState::Running) {
             outs.push(frame);
@@ -294,7 +295,8 @@ impl CodexMapper {
             )));
             outs.push(CodexOut::Hub(ClientFrame::NoticeResolved {
                 notice_id: pending.notice_id,
-                decision: Decision::Reject,
+                decision: Some(Decision::Reject),
+                action_id: None,
             }));
         }
         outs.push(self.error_frame(String::from(
@@ -314,7 +316,8 @@ impl CodexMapper {
         for pending in self.pending.drain(..) {
             outs.push(CodexOut::Hub(ClientFrame::NoticeResolved {
                 notice_id: pending.notice_id,
-                decision: Decision::Reject,
+                decision: Some(Decision::Reject),
+                action_id: None,
             }));
         }
         outs
@@ -685,11 +688,10 @@ impl CodexMapper {
             status: String::from(NoticeEnvelope::OPEN),
             title,
             body,
-            options: vec![
-                String::from("approve"),
-                String::from("approve_for_session"),
-                String::from("reject"),
-            ],
+            // codex's own vocabulary, now as labeled buttons: the ids are
+            // unchanged so the closed decision mapping keeps working.
+            interaction_type: None,
+            options: NoticeOption::decision_options(),
         };
         let mut outs = Vec::new();
         if let Some(item_key) = item_id.as_deref() {
@@ -843,7 +845,8 @@ impl CodexMapper {
             .map(|pending| {
                 CodexOut::Hub(ClientFrame::NoticeResolved {
                     notice_id: pending.notice_id,
-                    decision,
+                    decision: Some(decision),
+                    action_id: None,
                 })
             })
             .collect()
@@ -860,7 +863,8 @@ impl CodexMapper {
         let pending = self.pending.remove(index);
         let mut outs = vec![CodexOut::Hub(ClientFrame::NoticeResolved {
             notice_id: pending.notice_id,
-            decision: Decision::Reject,
+            decision: Some(Decision::Reject),
+            action_id: None,
         })];
         if let Some(frame) = self.set_state(SessionState::Running) {
             outs.push(frame);
