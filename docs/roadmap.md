@@ -63,6 +63,7 @@ connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终�
 - **会话真派发**：`POST /sessions/create-and-start` 会下发 `session.start`（首条消息走 `prompt`）；`POST /sessions/{id}/runtime/messages` 在会话有活跃流时把 `session.message` 推给 agent，响应里的 `runtimeDispatched` 才是真实投递结果。
 - **审批与中断（后端）**：`GET /sessions/{id}/runtime/notices`、`POST /sessions/{id}/notices/{id}/respond`（+ `runtime` 别名）、`POST /sessions/{id}/runtime/interrupt` 落地；新增迁移 `0002_connector_ingress.sql`（`session_streams` 让 `streamId` 跨 hub 重启存活，`session_notices` 让审批跨刷新存活）。
 - **文件浏览（只读）**：新增 ingress 帧 `fs.request` / `fs.response`（hub 侧 `crates/farwork-hub/src/ingress.rs` + 配对表 `crates/farwork-hub/src/fsrelay.rs`，agent 侧 `crates/farwork-agent/src/protocol.rs` + 沙箱 `crates/farwork-agent/src/fsops.rs`），REST 两条 `POST /connectors/{id}/fs/list`、`POST /connectors/{id}/fs/readText`（`crates/farwork-hub/src/routes/fs.rs`），Web 侧会话页文件面板（`apps/web/src/components/FilePanel.svelte`，API 是 `apps/web/src/lib/api/workspace.ts` 的 `listWorkspaceDir` / `readWorkspaceText`）。**沙箱根是 agent 的 `--workdir`**：`canonicalize` 后按路径组件判前缀，越界/符号链接逃逸一律 403，`workdir` 不可解析时直接拒绝（契约见 `docs/architecture.md` §5.5–§5.6）。`501` 表**没有变化**，仍是 49 条：这批入口本来就不在那张表里（表里的 `/sessions/{id}/files*` 是另一组）。
+- **设备终端（M3）**：新增 ingress 帧 `terminal.open` / `terminal.opened` / `terminal.data` / `terminal.resize` / `terminal.exit` / `terminal.error` / `terminal.close`（hub 侧 `crates/farwork-hub/src/ingress.rs:385-432,510-540`、中继 `crates/farwork-hub/src/termrelay.rs`、agent 侧 `crates/farwork-agent/src/protocol.rs:289-321,384-415` + PTY 宿主 `crates/farwork-agent/src/term.rs`），REST 两条 `POST /api/v2/connectors/{id}/terminals`（`crates/farwork-hub/src/routes/terminals.rs:45,85-173`，201 恰好五个键）与 `GET /api/v2/connectors/{id}/terminals/{terminalId}/stream`（同文件 `:46-49,224-383`，浏览器侧 `terminal.input`/`terminal.resize`/`terminal.close` ↔ `terminal.opened`/`terminal.data`/`terminal.exit`/`terminal.error`），迁移 `0003_terminals.sql`（`terminals` 表：`closed_at` 区分「已结束」与「从未存在」，`error_code`/`error_message` 让 agent 的拒绝原因活过它被报告的那一刻），Web 侧会话页终端面板（`apps/web/src/components/TerminalPanel.svelte`、`apps/web/src/lib/terminal.ts`、`apps/web/src/lib/api/workspace.ts:191-238`；xterm.js）。**入口是 connector 命名空间**，因此 `501` 表仍是 **49** 条：表里的 `/sessions/{id}/terminal*` 是会话命名空间的另一组，仍回 `501`。契约见 `docs/architecture.md` §5.11–§5.12。
 - **诚实兜底更窄了**：`501` 表从 52 条减到 **49 条**（移出 interrupt / notices / notices respond 三条）；REST 与 ingress 两侧仍然「宁可变窄，不伪造成功」。
 - **Web 审批卡**（`apps/web/src/components/ApprovalCard.svelte`）：三个决定按钮 `approve` / `approve_for_session` / `reject`（`:75-93`）；点击后状态先落在「已下发，等待运行时确认」（`:24-35,101`），卡片变灰**只**取决于服务端 `notice.status === 'resolved'`（`:22,25`）；投递失败可点「重试」（`:96-97`）。
 - **Web 新建会话表单**（`apps/web/src/components/NewSessionPage.svelte`，路由 `#/new-session[/:projectId]`，`apps/web/src/lib/router.ts:26-53`）：一次填 connector + 项目 + runtime + 首条消息；`connectorResult.ok` 为真则跳进会话页（`NewSessionPage.svelte:93`），为假则如实显示「设备未连接：指令未下发」（`:105,213`）+ 返回码（`:222`）+ 已创建会话 id（`:218`）。
@@ -75,7 +76,20 @@ connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终�
    - 注意这条验证的是**审批管道**，不是真实 codex 审批。echo 后端不执行任何东西，它只是把契约跑一遍（`crates/farwork-agent/src/echo.rs`）。
 3. **Web 交付的静态验收（仓库所有者验收）**：`apps/web` 的 `pnpm run check` 0 error、`pnpm run build` 通过；审批卡不乐观 resolve 在代码层确认——`POST .../notices/{id}/respond` 的分支只返回 `ok` + 仍是 `open` 的 `notice.view()` + `serverTime`（`crates/farwork-hub/src/routes/notices.rs:333-340`），把 `status` 写成 `resolved` 的 SQL 只在 connector 回报的 `resolve_notice` 里（`notices.rs:159-169`）；前端同样只在 `notice.status === 'resolved'` 时变灰（`apps/web/src/components/ApprovalCard.svelte:22,25`）。
 4. **文件浏览 11/11 断言通过（仓库所有者验收）**：`crates/farwork-hub/tests/fs_bridge.rs`（假 connector + 真 PostgreSQL）跑通 `fs/list` 成功、`fs/readText` 成功，并逐条断言越权与异常：根外路径（`/etc/passwd` 这类）→ `403`、`../` 上跳 → `403`、指向根外的符号链接 → `403`、文件缺失 → `404`、相对路径 → `422 invalid_path`、并发两个请求按 `requestId` 配对不串号（`fs_bridge.rs:545-560`）、agent 停掉后 → `503 connector_offline`（`fs_bridge.rs:385-395`）。三条越权用例的判定在 agent 沙箱单测里（`crates/farwork-agent/src/fsops.rs:320-425`，另有一条前缀陷阱 `fsops.rs:381-402`）；REST 侧 `permission_denied → 403` 的映射断言在 `fs_bridge.rs:497-535`（由假 connector 回 `permission_denied`），同一处还断言了 `404 not_found`、`413 too_large`、`502 io_error`，`504 fs_timeout` 在 `fs_bridge.rs:630-650`。
-5. **`session.message.clientMessageId` 契约缺陷已修复**：hub 无值时不发该键（`crates/farwork-hub/src/ingress.rs:324-346`，回归测试 `ingress::tests::session_message_frame_omits_an_absent_client_message_id`）、agent 收 `Option<String>` 兼容缺失与 `null`（`crates/farwork-agent/src/protocol.rs:192-200`，回归测试 `protocol::tests::session_message_parses_without_a_client_message_id`）、agent 本地生成 `cmid_<uuid>` 供 `turn/start`（`crates/farwork-agent/src/hub.rs:303-319`）。契约口径见 `docs/architecture.md` §5.4。
+5. **设备终端 11/11 验收通过（仓库所有者验收）**：hub + `farwork-agent` 真二进制跑通整条终端链路，逐项过：
+   1. **整行匹配输出**：键入 `echo …` / `uname` 后回读的整行与预期逐字节相同（不是「看起来像」）；base64 与字节语义在协议层另由集成测试断言两次往返且非 UTF-8 字节（`0x00`/`0xff`）原样存活（`crates/farwork-hub/tests/terminal_bridge.rs:509-550`）。
+   2. **resize 生效**：`terminal.resize{cols,rows}` 到达设备并被 PTY 采纳，回执证明帧真的走完来回（`terminal_bridge.rs:566-588`；agent 侧 `crates/farwork-agent/src/term.rs:310-314`，PTY resize 单测 `term.rs:638` 起）。
+   3. **exit 收尾**：`terminal.close` → `terminal.exit`，回读 `code`，socket 在 exit 帧后立即结束、行被标 `closed_at`（`terminal_bridge.rs:590-604`）。
+   4. **cwd 越界 → `permission_denied` 且不发 `terminal.opened`**：`cwd` 落在 `--workdir` 外时设备回 `terminal.error{code:"permission_denied"}`（带设备原话），流上**没有** `terminal.opened`；原因写进表，晚取票的浏览器仍能看到（`terminal_bridge.rs:669-706`；判定 `crates/farwork-agent/src/term.rs:275-287`、`crates/farwork-agent/src/fsops.rs:73-92`）。
+   5. **票据重放被拒**：同一张 `{terminalId}` 票用第二次 → `401`（读即删，`crates/farwork-hub/src/routes/ws.rs:87-114`；`terminal_bridge.rs:606-614`）。
+   6. **票据跨终端被拒**：A 终端的票去连 B 终端 → `401`（scope 逐字比较，`ws.rs:104-108`；`terminal_bridge.rs:616-627`）。
+   7. **未知 / 已删除的 terminalId**：socket 允许 upgrade，先发 `terminal.error{code:"terminal_not_found"}` 再关，不是裸握手失败（`crates/farwork-hub/src/routes/terminals.rs:253-265`；`terminal_bridge.rs:642-667`）。
+   8. **杀掉 agent 后 `connectors.status` 回落 `offline`**（手工验收，真二进制），且未关终端被推 `terminal.error{code:"connector_offline"}` 并关行（同一收敛逻辑 `terminals.rs:592-614`；`crates/farwork-hub/src/routes/connector_ws.rs:176-193`；集成测试用断开假 connector 覆盖：`terminal_bridge.rs:732-762`）。
+   9. **失败不冒充成功**：connector 离线时接流 → `503`、开终端 → `503 code=connector_offline`、未知 connector → `404 code=connector_not_found`、`cols=0` → `422 code=invalid_size`、相对 `cwd` → `422 code=invalid_path`（`crates/farwork-hub/src/routes/terminals.rs:91-115,205-222,245-251`；`terminal_bridge.rs:384-414,770-783`）。
+   10. **没有残留 PTY**：浏览器断开时 hub 补发 `terminal.close`、agent 侧 `close_all` 收掉全部 shell，进程退出后无孤儿 shell（`terminals.rs:369-381`；`term.rs:250-260,756`）。
+   11. **201 不冒充成功**：响应终端对象恰好五个键、无 `status`；`201` 仅表示已落库 + 已下发（`terminals.rs:73-83,156-165`；`terminal_bridge.rs:439-446`）。
+   口径以 `docs/architecture.md` §5.11–§5.12 为准。上表来自仓库所有者的真二进制手工验收（hub + 真 `farwork-agent`）；协议层与拒绝路径另有集成测试 `crates/farwork-hub/tests/terminal_bridge.rs`（假 connector + 真 PostgreSQL）逐条断言，行号见各条。**未覆盖的**：浏览器页面里手动敲字的手工记录没有留存（面板本身的构建验收同第 3 条）。
+6. **`session.message.clientMessageId` 契约缺陷已修复**：hub 无值时不发该键（`crates/farwork-hub/src/ingress.rs:324-346`，回归测试 `ingress::tests::session_message_frame_omits_an_absent_client_message_id`）、agent 收 `Option<String>` 兼容缺失与 `null`（`crates/farwork-agent/src/protocol.rs:192-200`，回归测试 `protocol::tests::session_message_parses_without_a_client_message_id`）、agent 本地生成 `cmid_<uuid>` 供 `turn/start`（`crates/farwork-agent/src/hub.rs:303-319`）。契约口径见 `docs/architecture.md` §5.4。
 
 ### 未验证（别当成已支持）
 
@@ -93,22 +107,25 @@ connector ingress · 真 agent 执行 · 审批与中断 · 文件浏览 · 终�
 
 顺序的理由：后面每一项都依赖 ingress 提供的真实连接，先做 UI 只会做出假状态。
 
-原「1. Web 审批卡」「2. 新建会话表单」已交付（见上文「已交付」与「已验证」第 3 条）；其中原定验收项——用 `--runtime echo` 点批准直到卡片转已解决——**仍未留证据**，属于下一批要补的验证，不是要重做功能。文件浏览已交付并划掉（见下）。**未验证项不因划掉一项而消失**：codex 成功路径、`file_change` / `permissions` 两种 notice kind、审批卡在浏览器里的端到端证据，仍留在上面的「未验证」清单里。
+原「1. Web 审批卡」「2. 新建会话表单」已交付（见上文「已交付」与「已验证」第 3 条）；其中原定验收项——用 `--runtime echo` 点批准直到卡片转已解决——**仍未留证据**，属于下一批要补的验证，不是要重做功能。文件浏览与设备终端都已交付并划掉（见下），剩下的顺序是**分享 → 管理台**。**未验证项不因划掉一项而消失**：codex 成功路径、`file_change` / `permissions` 两种 notice kind、审批卡在浏览器里的端到端证据，仍留在上面的「未验证」清单里。
 
 ### ~~1. 文件浏览~~ —— **已交付**（只读，见上文「已交付」与「已验证」第 4 条）
 
 交付的入口是 connector 命名空间下的 `POST /connectors/{id}/fs/list` 与 `/fs/readText`，**不是**原计划里的 `/sessions/{id}/files*`（那组仍回 `501`，归写操作）。仍缺的部分：写操作（一律要过审批闸门）、大文件与二进制流式（现在整块读，且有 1 MiB 硬上限）、目录树懒加载。
 
-### 1. 终端
+### ~~1. 终端~~ —— **已交付**（见上文「已交付」与「已验证」第 5 条）
 
-- `/sessions/{id}/terminal*` 隧道；复用 M1 的 PTY + base64 字节帧实现，前端复用 xterm.js。
-- 验收：真终端可交互、resize 生效、设备断连以 `exit code -1` 明确区分；随之让 `farwork-server` 退场。
+交付的入口是 connector 命名空间下的 `POST /connectors/{id}/terminals` 与 `GET /connectors/{id}/terminals/{terminalId}/stream`，**不是**原计划里的 `/sessions/{id}/terminal*`（那组仍回 `501`）；帧见 `docs/architecture.md` §5.11–§5.12。与计划相比的两处修正：
 
-### 2. 分享
+- **设备断连不再用 `exit code -1`**：exit 是设备上报的**真实退出码**（`code` 键恒在，信号终止时为 `null`），设备掉线走 `terminal.error{code:"connector_offline"}`。M1 那套「server 替在途流补发 `code=-1`」（附录 A.4）会把「设备没了」伪装成「进程退出了」，两类事实必须分开表达。
+- **cwd 沙箱只约束起始目录**：起点必须在 agent 的 `--workdir` 内（与文件浏览同一套判定），但 shell 起来之后是它自己的能力。**不要**对外承诺「终端被关在 workdir 里」。
+- 仍缺的部分：`farwork-server` 尚未退场（它仍是 M1 探针）；终端不持久化 scrollback、没有多路复用/接管别人已开的终端。
+
+### 1. 分享
 
 - `/sessions/{id}/shares*` 与 `/shares*`：只读/可写分享链接、过期与撤销。
 
-### 3. 管理台
+### 2. 管理台
 
 - `/admin*`、`/agents*`、`/usage*`、`/announcements*`、`/pairing*`：用户管理、运行时清单、用量、公告、设备配对。
 
